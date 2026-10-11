@@ -1,9 +1,10 @@
 import sys
 import os
 
-sys.path.insert(0, '/home/shilzikx/public_html/shilohliving')
+APP_ROOT = os.path.dirname(os.path.abspath(__file__))
+sys.path.insert(0, APP_ROOT)
 
 from dotenv import load_dotenv
-load_dotenv('/home/shilzikx/public_html/shilohliving/.env')
+load_dotenv(os.path.join(APP_ROOT, '.env'))
 
 from app import app as application

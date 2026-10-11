@@ -72,6 +72,7 @@ SMTP_PORT     = int(os.environ.get('SMTP_PORT', 465))
 SMTP_USER     = os.environ.get('SMTP_USER', 'noreply@shilohliving.app')
 SMTP_PASSWORD = os.environ.get('SMTP_PASSWORD', '')
 SUPPORT_EMAIL = os.environ.get('SUPPORT_EMAIL', 'support@shilohliving.app')
+APP_URL       = os.environ.get('APP_URL', 'https://hub.shilohliving.app').rstrip('/')
 
 db_config = {
     'host':      os.environ.get('DB_HOST', '127.0.0.1'),
@@ -164,7 +165,7 @@ def email_new_ticket(ticket_id, title, opener_name, opener_email, category):
         <p><strong>From:</strong> {opener_name} ({opener_email})</p>
         <p><strong>Category:</strong> {category}</p>
         <p><strong>Title:</strong> {title}</p>
-        <p><a href="https://shilohliving.app">View in Admin Dashboard →</a></p>
+        <p><a href="{APP_URL}">View in Admin Dashboard →</a></p>
         """
     )
 
@@ -179,7 +180,7 @@ def email_ticket_reply(to_email, to_name, ticket_id, title, reply_body, from_nam
         <hr/>
         <p>{reply_body}</p>
         <hr/>
-        <p><a href="https://shilohliving.app">View full conversation →</a></p>
+        <p><a href="{APP_URL}">View full conversation →</a></p>
         """
     )
 
@@ -386,7 +387,7 @@ def join_landlord():
     if ll_user:
         send_email_if_opted_in(lp['user_id'], 'email_new_tenant_joined', ll_user['email'],
             f'New Tenant Joined: {g.current_user["full_name"]}',
-            f'<h2>New Tenant Joined</h2><p>{g.current_user["full_name"]} has joined using your landlord code.</p><p><a href="https://shilohliving.app">View in dashboard</a></p>')
+            f'<h2>New Tenant Joined</h2><p>{g.current_user["full_name"]} has joined using your landlord code.</p><p><a href="{APP_URL}">View in dashboard</a></p>')
     return ok({'message': f'Successfully joined {landlord_name["full_name"] if landlord_name else "landlord"}'})
 
 
@@ -599,7 +600,7 @@ def create_announcement():
             <hr/>
             <p>{body}</p>
             <hr/>
-            <p><a href="https://shilohliving.app">View in your dashboard →</a></p>
+            <p><a href="{APP_URL}">View in your dashboard →</a></p>
             """
         )
 
@@ -754,7 +755,7 @@ def reply_to_thread(tid):
             <p><strong>From:</strong> {u['full_name']}</p>
             <p><strong>Subject:</strong> {thread['subject']}</p>
             <hr/><p>{body}</p><hr/>
-            <p><a href="https://shilohliving.app">View conversation →</a></p>
+            <p><a href="{APP_URL}">View conversation →</a></p>
             """
         )
 
@@ -874,7 +875,7 @@ def reply_ticket(tid):
                 <hr/>
                 <p>{body}</p>
                 <hr/>
-                <p><a href="https://shilohliving.app">View full conversation →</a></p>
+                <p><a href="{APP_URL}">View full conversation →</a></p>
                 """
             )
         push_notification(ticket['opened_by'], 'Support replied to your ticket',
@@ -1120,7 +1121,7 @@ def upload_contract_doc(cid):
             '<p>Hi ' + tenant_user['full_name'] + ',</p>'
             '<p>Your landlord has uploaded your signed rental contract.</p>'
             '<p>Please log in to your dashboard to view and acknowledge it.</p>'
-            '<p><a href="https://shilohliving.app">Go to Dashboard →</a></p>'
+            '<p><a href="' + APP_URL + '">Go to Dashboard →</a></p>'
         )
 
     log_action('UPLOAD_CONTRACT_DOC', 'contracts', cid)
@@ -1142,7 +1143,7 @@ def acknowledge_contract(cid):
             ci["landlord_user_id"], "email_contract_acknowledged",
             ci["landlord_email"],
             "Contract Acknowledged by Tenant",
-            f'<h2>Contract Acknowledged</h2><p>{g.current_user["full_name"]} acknowledged the contract for Unit {ci["unit_number"]}.</p><p><a href="https://shilohliving.app">View in dashboard</a></p>'
+            f'<h2>Contract Acknowledged</h2><p>{g.current_user["full_name"]} acknowledged the contract for Unit {ci["unit_number"]}.</p><p><a href="{APP_URL}">View in dashboard</a></p>'
         )
     return ok(msg='Contract acknowledged')
 
@@ -1312,7 +1313,7 @@ def create_bill():
             <p><strong>Description:</strong> {description}</p>
             <p><strong>Amount:</strong> {amount}</p>
             <p><strong>Due Date:</strong> {due_date}</p>
-            <p><a href="https://shilohliving.app">View and Pay →</a></p>
+            <p><a href="{APP_URL}">View and Pay →</a></p>
             """
         )
 
@@ -1398,7 +1399,7 @@ def submit_payment():
                 b['landlord_user_id'], 'email_payment_submitted',
                 ll_user['email'],
                 f'Payment Submitted by {g.current_user["full_name"]}',
-                f'<h2>New Payment Submitted</h2><p>{g.current_user["full_name"]} submitted a payment of {amount_paid}.</p>' + proof_link + '<p><a href="https://shilohliving.app">Review in dashboard</a></p>'
+                f'<h2>New Payment Submitted</h2><p>{g.current_user["full_name"]} submitted a payment of {amount_paid}.</p>' + proof_link + '<p><a href="' + APP_URL + '">Review in dashboard</a></p>'
             )
 
     return ok({'payment_id':pid},status=201)
@@ -1451,7 +1452,7 @@ def approve_payment(pid):
             <h2>Payment Approved ✓</h2>
             <p>Hi {tenant_user['full_name']},</p>
             <p>Your payment has been reviewed and <strong>approved</strong>.</p>
-            <p><a href="https://shilohliving.app">View your dashboard →</a></p>
+            <p><a href="{APP_URL}">View your dashboard →</a></p>
             """
         )
 
@@ -1486,7 +1487,7 @@ def reject_payment(pid):
             <p>Your payment submission was <strong>rejected</strong>.</p>
             {f'<p><strong>Reason:</strong> {notes}</p>' if notes else ''}
             <p>Please resubmit with the correct proof of payment.</p>
-            <p><a href="https://shilohliving.app">Go to dashboard →</a></p>
+            <p><a href="{APP_URL}">Go to dashboard →</a></p>
             """
         )
 
@@ -1826,7 +1827,7 @@ def send_verification_email(user_id, email, full_name):
     execute("DELETE FROM email_verifications WHERE user_id=%s", (user_id,))
     execute("INSERT INTO email_verifications (user_id, token, new_email, expires_at) VALUES (%s,%s,%s,%s)",
             (user_id, token, email, expires))
-    link = f"https://shilohliving.app/?type=verify&token={token}"
+    link = f"{APP_URL}/?type=verify&token={token}"
     send_email(email, "Verify your Shiloh Living email",
         f"""
         <h2>Welcome to Shiloh Living!</h2>
@@ -1881,7 +1882,7 @@ def forgot_password():
         execute("DELETE FROM password_resets WHERE user_id=%s", (user['id'],))
         execute("INSERT INTO password_resets (user_id, token, expires_at) VALUES (%s,%s,%s)",
                 (user['id'], token, expires))
-        link = "https://shilohliving.app/?type=reset&token=" + token
+        link = APP_URL + "/?type=reset&token=" + token
         body = (
             "<h2>Password Reset Request</h2>"
             "<p>Hi " + user['full_name'] + ",</p>"
@@ -1961,7 +1962,7 @@ def landlord_qr_code():
     if not lp:
         return err('Landlord profile not found', 404)
     code = lp['landlord_code']
-    register_url = f"https://shilohliving.app/?register=tenant&code={code}"
+    register_url = f"{APP_URL}/?register=tenant&code={code}"
     if not QR_AVAILABLE:
         return ok({'register_url': register_url, 'landlord_code': code, 'qr_base64': None})
     img = qrcode.make(register_url)
@@ -2062,7 +2063,7 @@ def reply_support_chat(cid):
         if chat_user:
             send_email_if_opted_in(chat['user_id'], 'email_ticket_reply', chat_user['email'],
                 f'Support replied: {chat["subject"]}',
-                f'<h2>Support Reply</h2><p>{body}</p><p><a href="https://shilohliving.app">View conversation →</a></p>')
+                f'<h2>Support Reply</h2><p>{body}</p><p><a href="{APP_URL}">View conversation →</a></p>')
     else:
         admins = query("SELECT id FROM users WHERE role='admin'")
         for a in admins:
