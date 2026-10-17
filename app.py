@@ -1,71 +1,36 @@
-print("APP RELOADED")
 """
-Shiloh Living — Rental Management Platform v4
-New: contract uploads (Cloudinary), contract terms, announcements,
-     email notification preferences, Cloudinary proof-of-payment,
-     JWT token bug fix
+Shiloh Living — Rental Management Platform
+Flask JSON API under /api/* plus the single-page frontend (templates/index.html).
 """
-import os, re, secrets, string, smtplib, base64, io, uuid
+import os, re, secrets, smtplib, io, json, html, logging
+from concurrent.futures import ThreadPoolExecutor
 from datetime import datetime, timedelta, date
 from functools import wraps
 from email.mime.text import MIMEText
 from email.mime.multipart import MIMEMultipart
 
-try:
-    import qrcode
-    from qrcode.image.svg import SvgPathImage
-    QR_AVAILABLE = True
-except ImportError:
-    QR_AVAILABLE = False
+import qrcode
+from qrcode.image.pure import PyPNGImage
 
 from dotenv import load_dotenv
 load_dotenv(os.path.join(os.path.dirname(__file__), '.env'))
 
-from flask import Flask, request, jsonify, send_from_directory, g
-import decimal, json as _json
-
-class SafeJSONEncoder(_json.JSONEncoder):
-    def default(self, obj):
-        if isinstance(obj, decimal.Decimal):
-            return float(obj)
-        if isinstance(obj, (datetime, date)):
-            return obj.isoformat()
-        if isinstance(obj, bytes):
-            return obj.decode('utf-8', errors='replace')
-        return super().default(obj)
-
+from flask import Flask, request, jsonify, send_from_directory, g, Response
 from flask_cors import CORS
 import mysql.connector
 from mysql.connector import pooling
 import bcrypt
+import jwt as pyjwt
 
-try:
-    import jwt as pyjwt
-except ImportError:
-    import PyJWT as pyjwt
+log = logging.getLogger('shiloh')
+logging.basicConfig(level=logging.INFO)
 
-app = Flask(__name__, template_folder=os.path.join(os.path.dirname(__file__), 'templates'))
-app.json_encoder = SafeJSONEncoder
-CORS(app, resources={r"/api/*": {"origins": "*"}})
+BASE_DIR = os.path.dirname(os.path.abspath(__file__))
+app = Flask(__name__, template_folder=os.path.join(BASE_DIR, 'templates'))
 
-# ── Global error handlers — always return JSON, never HTML ────
-@app.errorhandler(404)
-def not_found(e):
-    if request.path.startswith('/api/'):
-        return jsonify({'status':'error','message':'API endpoint not found'}), 404
-    return send_from_directory(os.path.join(os.path.dirname(__file__), 'templates'), 'index.html')
-
-@app.errorhandler(405)
-def method_not_allowed(e):
-    return jsonify({'status':'error','message':'Method not allowed'}), 405
-
-@app.errorhandler(500)
-def server_error(e):
-    import traceback
-    tb = traceback.format_exc()
-    return jsonify({'status': 'error', 'message': str(e), 'traceback': tb}), 500
-
-SECRET_KEY    = os.environ.get('SECRET_KEY', 'change-me-in-production')
+SECRET_KEY    = os.environ.get('SECRET_KEY', '')
+if len(SECRET_KEY) < 32 or SECRET_KEY == 'change-me-in-production':
+    raise RuntimeError('Set SECRET_KEY in .env to a long random value (32+ characters).')
 JWT_EXPIRES   = int(os.environ.get('JWT_EXPIRES_HOURS', 24))
 SMTP_HOST     = os.environ.get('SMTP_HOST', 'mail.shilohliving.app')
 SMTP_PORT     = int(os.environ.get('SMTP_PORT', 465))
@@ -73,6 +38,36 @@ SMTP_USER     = os.environ.get('SMTP_USER', 'noreply@shilohliving.app')
 SMTP_PASSWORD = os.environ.get('SMTP_PASSWORD', '')
 SUPPORT_EMAIL = os.environ.get('SUPPORT_EMAIL', 'support@shilohliving.app')
 APP_URL       = os.environ.get('APP_URL', 'https://hub.shilohliving.app').rstrip('/')
+# Uploads (contract docs, payment proofs, repair receipts) must come from this Cloudinary account
+CLOUDINARY_URL_PREFIX = 'https://res.cloudinary.com/' + os.environ.get('CLOUDINARY_CLOUD', 'dyyi3mtm0') + '/'
+# Web Push (phone notifications). Without both keys nothing is pushed; the in-app bell still works.
+VAPID_PUBLIC_KEY  = os.environ.get('VAPID_PUBLIC_KEY', '')
+VAPID_PRIVATE_KEY = os.environ.get('VAPID_PRIVATE_KEY', '')
+VAPID_SUBJECT     = os.environ.get('VAPID_SUBJECT', 'mailto:' + SUPPORT_EMAIL)
+
+# The SPA is served from the same origin; only the app's own URL may call the API cross-site.
+CORS(app, resources={r"/api/*": {"origins": [APP_URL]}})
+
+
+# ── Global error handlers — always return JSON, never HTML ────
+@app.errorhandler(404)
+def not_found(e):
+    if request.path.startswith('/api/'):
+        return jsonify({'status':'error','message':'API endpoint not found'}), 404
+    return send_from_directory(os.path.join(BASE_DIR, 'templates'), 'index.html')
+
+@app.errorhandler(405)
+def method_not_allowed(e):
+    return jsonify({'status':'error','message':'Method not allowed'}), 405
+
+@app.errorhandler(Exception)
+def server_error(e):
+    from werkzeug.exceptions import HTTPException
+    if isinstance(e, HTTPException):
+        return jsonify({'status': 'error', 'message': e.description}), e.code
+    # Details go to the server log only - never to the browser (they include SQL and data)
+    log.exception('Unhandled error on %s %s', request.method, request.path)
+    return jsonify({'status': 'error', 'message': 'Something went wrong. Please try again.'}), 500
 
 db_config = {
     'host':      os.environ.get('DB_HOST', '127.0.0.1'),
@@ -85,9 +80,9 @@ db_config = {
 }
 
 try:
-    pool = pooling.MySQLConnectionPool(pool_name='shiloh_pool', pool_size=5, **db_config)
+    pool = pooling.MySQLConnectionPool(pool_name='shiloh_pool', pool_size=8, **db_config)
 except Exception as e:
-    print(f"[ERROR] DB pool failed: {e}")
+    log.error("DB pool failed: %s", e)
     pool = None
 
 
@@ -112,8 +107,6 @@ def execute(sql, params=None):
         cur.execute(sql, params or ())
         conn.commit()
         return cur.lastrowid, cur.rowcount
-    except Exception as e:
-        raise Exception(f"SQL ERROR → {sql} | PARAMS → {params} | ERROR → {str(e)}")
     finally:
         conn.close()
 
@@ -126,11 +119,25 @@ def ok(data=None, msg=None, status=200):
 def err(msg, status=400):
     return jsonify({'status': 'error', 'message': msg}), status
 
+def h(value):
+    """HTML-escape anything people typed before it goes into an email."""
+    return html.escape(str(value if value is not None else ''))
+
+def is_upload_url(url):
+    return isinstance(url, str) and url.startswith(CLOUDINARY_URL_PREFIX)
+
+def positive_amount(value):
+    try:
+        v = float(value)
+    except (TypeError, ValueError):
+        return None
+    return v if v > 0 else None
+
 
 # ── Email ─────────────────────────────────────────────────────
 def send_email(to_email, subject, html_body):
     if not SMTP_PASSWORD:
-        print(f"[EMAIL SKIP] No SMTP password set. Would send to {to_email}: {subject}")
+        log.info("Email skipped (no SMTP password): %s", subject)
         return
     try:
         msg = MIMEMultipart('alternative')
@@ -141,9 +148,8 @@ def send_email(to_email, subject, html_body):
         with smtplib.SMTP_SSL(SMTP_HOST, SMTP_PORT) as server:
             server.login(SMTP_USER, SMTP_PASSWORD)
             server.sendmail(SMTP_USER, to_email, msg.as_string())
-        print(f"[EMAIL OK] Sent to {to_email}: {subject}")
     except Exception as e:
-        print(f"[EMAIL ERR] {e}")
+        log.warning("Email to %s failed: %s", to_email, e)
 
 def get_notif_pref(user_id, pref_key):
     pref = query("SELECT * FROM notification_preferences WHERE user_id=%s", (user_id,), fetchone=True)
@@ -162,25 +168,10 @@ def email_new_ticket(ticket_id, title, opener_name, opener_email, category):
         f"""
         <h2>New Support Ticket</h2>
         <p><strong>Ticket #:</strong> {ticket_id}</p>
-        <p><strong>From:</strong> {opener_name} ({opener_email})</p>
-        <p><strong>Category:</strong> {category}</p>
-        <p><strong>Title:</strong> {title}</p>
+        <p><strong>From:</strong> {h(opener_name)} ({h(opener_email)})</p>
+        <p><strong>Category:</strong> {h(category)}</p>
+        <p><strong>Title:</strong> {h(title)}</p>
         <p><a href="{APP_URL}">View in Admin Dashboard →</a></p>
-        """
-    )
-
-def email_ticket_reply(to_email, to_name, ticket_id, title, reply_body, from_name):
-    send_email(
-        to_email,
-        f'[Ticket #{ticket_id}] New reply: {title}',
-        f"""
-        <h2>New Reply on Your Support Ticket</h2>
-        <p><strong>Ticket:</strong> {title}</p>
-        <p><strong>From:</strong> {from_name}</p>
-        <hr/>
-        <p>{reply_body}</p>
-        <hr/>
-        <p><a href="{APP_URL}">View full conversation →</a></p>
         """
     )
 
@@ -221,13 +212,58 @@ def decode_token(token):
     token = token.strip()
     return pyjwt.decode(token, SECRET_KEY, algorithms=['HS256'])
 
-def gen_landlord_code():
-    chars = string.ascii_uppercase + string.digits
+# No 0/O/1/I so codes read aloud or typed from a printout don't get mixed up
+CODE_CHARS = 'ABCDEFGHJKLMNPQRSTUVWXYZ23456789'
+
+def _gen_code(prefix, exists_sql):
     for _ in range(50):
-        code = 'L' + ''.join(secrets.choice(chars) for _ in range(7))
-        if not query("SELECT id FROM landlord_profiles WHERE landlord_code=%s", (code,), fetchone=True):
+        code = prefix + ''.join(secrets.choice(CODE_CHARS) for _ in range(7))
+        if not query(exists_sql, (code,), fetchone=True):
             return code
-    raise Exception("Could not generate landlord code")
+    raise Exception("Could not generate a join code")
+
+def gen_landlord_code():
+    return _gen_code('L', "SELECT id FROM landlord_profiles WHERE landlord_code=%s")
+
+def gen_property_code():
+    return _gen_code('P', "SELECT id FROM properties WHERE join_code=%s")
+
+def resolve_join_code(code):
+    """A landlord code (L...) or a property code (P...) -> (landlord_profile, property or None)."""
+    code = (code or '').strip().upper()
+    if not re.match(r'^[A-Z0-9]{8}$', code):
+        return None, None
+    if code.startswith('P'):
+        prop = query("SELECT id, name, address, landlord_id FROM properties WHERE join_code=%s AND is_active=1",
+                     (code,), fetchone=True)
+        if not prop:
+            return None, None
+        return query("SELECT * FROM landlord_profiles WHERE id=%s", (prop['landlord_id'],), fetchone=True), prop
+    return query("SELECT * FROM landlord_profiles WHERE landlord_code=%s", (code,), fetchone=True), None
+
+def link_tenant_to_landlord(tp_id, lp, prop, tenant_name):
+    """Joins (or re-joins) a tenant to a landlord, remembering the property they asked for.
+    Returns False if they were already an active tenant there (and asked for no new property)."""
+    existing = query("SELECT id, is_active, property_id FROM tenant_landlords WHERE tenant_id=%s AND landlord_id=%s",
+                     (tp_id, lp['id']), fetchone=True)
+    pid = prop['id'] if prop else None
+    if existing:
+        if existing['is_active'] and (not pid or existing['property_id'] == pid):
+            return False
+        execute("UPDATE tenant_landlords SET is_active=1, property_id=COALESCE(%s, property_id) WHERE id=%s",
+                (pid, existing['id']))
+    else:
+        execute("INSERT INTO tenant_landlords (tenant_id, landlord_id, property_id) VALUES (%s,%s,%s)",
+                (tp_id, lp['id'], pid))
+    where = f' for {prop["name"]}' if prop else ''
+    push_notification(lp['user_id'], 'New Tenant Joined', f'{tenant_name} joined{where}.', 'system')
+    ll_user = query("SELECT email FROM users WHERE id=%s", (lp['user_id'],), fetchone=True)
+    if ll_user:
+        send_email_if_opted_in(lp['user_id'], 'email_new_tenant_joined', ll_user['email'],
+            f'New Tenant Joined: {tenant_name}',
+            f'<h2>New Tenant Joined</h2><p>{h(tenant_name)} has joined{h(where)}.</p>'
+            f'<p><a href="{APP_URL}">View in dashboard</a></p>')
+    return True
 
 def require_auth(*roles):
     def decorator(f):
@@ -243,14 +279,13 @@ def require_auth(*roles):
                 payload = decode_token(raw_token)
             except pyjwt.ExpiredSignatureError:
                 return err('Token expired', 401)
-            except Exception as e:
-                print(f"[JWT ERR] {e} | token='{raw_token[:30]}...'")
+            except Exception:
                 return err('Invalid token', 401)
-            if roles and payload.get('role') not in roles:
-                return err('Access denied', 403)
             user = query("SELECT * FROM users WHERE id=%s AND is_active=1", (payload['sub'],), fetchone=True)
             if not user:
                 return err('User not found', 401)
+            if roles and user['role'] not in roles:
+                return err('Access denied', 403)
             g.current_user = user
             return f(*args, **kwargs)
         return wrapper
@@ -269,32 +304,99 @@ def log_action(action, table_name=None, record_id=None, description=None):
                 (user_id, action, table_name, record_id, description, request.remote_addr))
     except: pass
 
-def push_notification(user_id, title, body, notif_type='system'):
-    # Map unknown types to 'system' to avoid ENUM errors
-    valid_types = {'bill', 'payment', 'message', 'reminder', 'system', 'announcement', 'contract', 'support'}
-    if notif_type not in valid_types:
+NOTIF_TYPES = {'bill', 'payment', 'message', 'reminder', 'system', 'announcement', 'contract', 'support'}
+# Which page a notification opens (in the bell and from a phone notification), by role
+NOTIF_PAGES = {
+    'landlord': {'bill': 'bills', 'payment': 'payments', 'message': 'messages', 'contract': 'contracts',
+                 'announcement': 'announcements', 'support': 'support', 'system': 'tenants', 'reminder': 'reminders'},
+    'tenant':   {'bill': 't-bills', 'payment': 't-bills', 'message': 't-messages', 'contract': 't-contract',
+                 'announcement': 't-announcements', 'support': 't-support', 'system': 't-dashboard'},
+    'admin':    {'support': 'admin-chat', 'system': 'admin-tickets'},
+}
+
+def push_notification(user_id, title, body, notif_type='system', page=None):
+    """Saves a bell notification and sends it to the person's phones (Web Push).
+    Never raises: a notification failing must not fail the request that caused it."""
+    if notif_type not in NOTIF_TYPES:
         notif_type = 'system'
+    title = (title or '')[:255]
+    body = body or ''
     try:
-        execute("INSERT INTO notifications (user_id,title,body,type) VALUES (%s,%s,%s,%s)",
-                (user_id, title, body, notif_type))
+        if page is None:
+            u = query("SELECT role FROM users WHERE id=%s", (user_id,), fetchone=True)
+            page = NOTIF_PAGES.get(u['role'] if u else '', {}).get(notif_type)
+        nid, _ = execute("INSERT INTO notifications (user_id,title,body,type,link) VALUES (%s,%s,%s,%s,%s)",
+                         (user_id, title, body, notif_type, page))
     except Exception as e:
-        # Fallback: insert with 'system' type if ENUM rejects the value
-        try:
-            execute("INSERT INTO notifications (user_id,title,body,type) VALUES (%s,%s,%s,'system')",
-                    (user_id, title, body))
-        except: pass
+        log.warning("Notification for user %s failed: %s", user_id, e)
+        return
+    send_push(user_id, {'id': nid, 'title': title, 'body': body[:200], 'page': page})
+
+
+# ── Web Push ──────────────────────────────────────────────────
+# Sending happens on a small background pool so a slow push service never delays a page.
+_push_pool = ThreadPoolExecutor(max_workers=4, thread_name_prefix='push')
+
+def push_enabled():
+    return bool(VAPID_PUBLIC_KEY and VAPID_PRIVATE_KEY)
+
+def _deliver_push(sub, payload):
+    """Returns True if the push service says this subscription is gone for good."""
+    from pywebpush import webpush, WebPushException
+    try:
+        webpush(subscription_info={'endpoint': sub['endpoint'],
+                                   'keys': {'p256dh': sub['p256dh_key'], 'auth': sub['auth_key']}},
+                data=payload, vapid_private_key=VAPID_PRIVATE_KEY,
+                vapid_claims={'sub': VAPID_SUBJECT}, timeout=5, ttl=86400)
+    except WebPushException as e:
+        status = getattr(e.response, 'status_code', None)
+        if status in (404, 410):
+            return True
+        log.warning("Web push failed (%s)", status or type(e).__name__)
+    except Exception as e:
+        log.warning("Web push failed (%s)", type(e).__name__)
+    return False
+
+def _deliver_all(subs, payload):
+    for sub in subs:
+        if _deliver_push(sub, payload):
+            try:
+                execute("DELETE FROM push_subscriptions WHERE id=%s", (sub['id'],))
+            except Exception:
+                pass
+
+def send_push(user_id, data, wait=False):
+    """Pushes `data` (title/body/page/id) to every device the user turned notifications on for.
+    Returns how many devices it was sent to."""
+    if not push_enabled():
+        return 0
+    try:
+        subs = query("SELECT id, endpoint, p256dh_key, auth_key FROM push_subscriptions WHERE user_id=%s",
+                     (user_id,))
+    except Exception as e:
+        log.warning("Push lookup failed: %s", e)
+        return 0
+    if not subs:
+        return 0
+    payload = json.dumps(data)
+    if wait:
+        _deliver_all(subs, payload)
+    else:
+        _push_pool.submit(_deliver_all, subs, payload)
+    return len(subs)
 
 
 # ── Frontend ──────────────────────────────────────────────────
 @app.route('/')
 def index_page():
-    return send_from_directory(os.path.join(os.path.dirname(__file__), 'templates'), 'index.html')
+    return send_from_directory(os.path.join(BASE_DIR, 'templates'), 'index.html')
 
 @app.route('/<path:path>')
 def frontend(path=''):
+    # Any app path (/join/CODE, ...) gets the single-page app
     if path.startswith('api/'):
-        return err(f'Not found', 404)
-    return send_from_directory(os.path.join(os.path.dirname(__file__), 'templates'), 'index.html')
+        return err('Not found', 404)
+    return send_from_directory(os.path.join(BASE_DIR, 'templates'), 'index.html')
 
 @app.route('/api/health')
 def health():
@@ -302,7 +404,8 @@ def health():
         query("SELECT 1", fetchone=True)
         return ok({'db': 'connected', 'server': 'Shiloh Living API v4'})
     except Exception as e:
-        return err(f'DB error: {str(e)}', 500)
+        log.error("Health check DB error: %s", e)
+        return err('Database unavailable', 500)
 
 
 # ════════════════════════════════════════════════════════════
@@ -332,10 +435,13 @@ def register():
     if query("SELECT id FROM users WHERE email=%s", (email,), fetchone=True):
         return err('Email already registered', 409)
 
-    landlord_profile = None
-    if role == 'tenant' and lcode:
-        landlord_profile = query("SELECT * FROM landlord_profiles WHERE landlord_code=%s", (lcode,), fetchone=True)
-        if not landlord_profile: return err('Invalid landlord code — check with your landlord', 404)
+    if len(full_name) > 150: return err('Name is too long')
+    # Anyone can open a landlord account; tenants only join through a landlord's code or link
+    landlord_profile, join_prop = None, None
+    if role == 'tenant':
+        if not lcode: return err('Tenants need a join code from their landlord to sign up')
+        landlord_profile, join_prop = resolve_join_code(lcode)
+        if not landlord_profile: return err('Invalid landlord or property code — check with your landlord', 404)
 
     uid, _ = execute(
         "INSERT INTO users (email,password_hash,full_name,phone,role,email_verified) VALUES (%s,%s,%s,%s,%s,0)",
@@ -349,12 +455,7 @@ def register():
     elif role == 'tenant':
         tp_id, _ = execute("INSERT INTO tenant_profiles (user_id) VALUES (%s)", (uid,))
         if landlord_profile:
-            execute("INSERT INTO tenant_landlords (tenant_id,landlord_id) VALUES (%s,%s)",
-                    (tp_id, landlord_profile['id']))
-            lp_user = query("SELECT id FROM users WHERE id=%s", (landlord_profile['user_id'],), fetchone=True)
-            if lp_user:
-                push_notification(lp_user['id'], 'New Tenant Registered',
-                                  f'{full_name} joined using your landlord code.', 'system')
+            link_tenant_to_landlord(tp_id, landlord_profile, join_prop, full_name)
 
     send_verification_email(uid, email, full_name)
     token = make_token(uid, role)
@@ -362,34 +463,70 @@ def register():
     return ok({'token': token, 'user': user, 'email_verification_sent': True}, status=201)
 
 
+@app.route('/api/join/<code>', methods=['GET'])
+def join_code_info(code):
+    """Public: who a join link/code is for, so the sign-up page can say "You're joining ..."."""
+    lp, prop = resolve_join_code(code)
+    lu = lp and query("SELECT full_name FROM users WHERE id=%s AND is_active=1", (lp['user_id'],), fetchone=True)
+    if not lu: return err('This join code is not valid. Check it with your landlord.', 404)
+    return ok({'code': code.strip().upper(), 'landlord_name': lu['full_name'],
+               'business_name': lp.get('business_name') or '',
+               'property_name': prop['name'] if prop else None})
+
+
+@app.route('/api/join/<code>/qr.png', methods=['GET'])
+def join_code_qr(code):
+    """Public: a QR code of the join link /join/CODE, for landlords to share or print."""
+    lp, _ = resolve_join_code(code)
+    if not lp: return err('Not found', 404)
+    img = qrcode.make(f"{APP_URL}/join/{code.strip().upper()}", image_factory=PyPNGImage,
+                      box_size=12, border=2, error_correction=qrcode.constants.ERROR_CORRECT_M)
+    buf = io.BytesIO()
+    img.save(buf)
+    # Plain bytes, not send_file(): LiteSpeed's WSGI can't stream an in-memory buffer
+    return Response(buf.getvalue(), mimetype='image/png', headers={'Cache-Control': 'public, max-age=300'})
+
+
 @app.route('/api/auth/join-landlord', methods=['POST'])
 @require_auth('tenant')
 def join_landlord():
     data  = request.get_json() or {}
-    lcode = (data.get('landlord_code') or '').strip().upper()
-    if not lcode: return err('Landlord code is required')
+    lcode = (data.get('landlord_code') or data.get('code') or '').strip().upper()
+    if not lcode: return err('Landlord or property code is required')
 
-    lp = query("SELECT * FROM landlord_profiles WHERE landlord_code=%s", (lcode,), fetchone=True)
-    if not lp: return err('Invalid landlord code', 404)
+    lp, prop = resolve_join_code(lcode)
+    if not lp: return err('Invalid landlord or property code', 404)
 
     tp = get_tenant_profile(g.current_user['id'])
     if not tp: return err('Tenant profile not found', 404)
 
-    existing = query("SELECT id FROM tenant_landlords WHERE tenant_id=%s AND landlord_id=%s",
-                     (tp['id'], lp['id']), fetchone=True)
-    if existing: return err('You have already joined this landlord', 409)
+    if not link_tenant_to_landlord(tp['id'], lp, prop, g.current_user['full_name']):
+        return err('You have already joined this landlord', 409)
+    landlord = query("SELECT full_name FROM users WHERE id=%s", (lp['user_id'],), fetchone=True)
+    name = landlord['full_name'] if landlord else 'landlord'
+    if prop: name = f"{prop['name']} ({name})"
+    return ok({'message': f'Successfully joined {name}'})
 
-    execute("INSERT INTO tenant_landlords (tenant_id,landlord_id) VALUES (%s,%s)", (tp['id'], lp['id']))
-    landlord_name = query("SELECT full_name FROM users WHERE id=%s", (lp['user_id'],), fetchone=True)
-    push_notification(lp['user_id'], 'New Tenant Joined',
-                      f'{g.current_user["full_name"]} joined using your landlord code.', 'system')
-    ll_user = query("SELECT email, full_name FROM users WHERE id=%s", (lp['user_id'],), fetchone=True)
-    if ll_user:
-        send_email_if_opted_in(lp['user_id'], 'email_new_tenant_joined', ll_user['email'],
-            f'New Tenant Joined: {g.current_user["full_name"]}',
-            f'<h2>New Tenant Joined</h2><p>{g.current_user["full_name"]} has joined using your landlord code.</p><p><a href="{APP_URL}">View in dashboard</a></p>')
-    return ok({'message': f'Successfully joined {landlord_name["full_name"] if landlord_name else "landlord"}'})
 
+LOGIN_MAX_FAILS_PER_EMAIL = 8
+LOGIN_MAX_FAILS_PER_IP = 30
+
+def too_many_failures(email):
+    try:
+        recent = query("""SELECT SUM(email=%s) AS by_email, SUM(ip_address=%s) AS by_ip FROM login_failures
+                          WHERE created_at > NOW() - INTERVAL 15 MINUTE AND (email=%s OR ip_address=%s)""",
+                       (email, request.remote_addr, email, request.remote_addr), fetchone=True) or {}
+        return (int(recent.get('by_email') or 0) >= LOGIN_MAX_FAILS_PER_EMAIL
+                or int(recent.get('by_ip') or 0) >= LOGIN_MAX_FAILS_PER_IP)
+    except Exception:
+        return False
+
+def record_failure(email):
+    try:
+        execute("INSERT INTO login_failures (email, ip_address) VALUES (%s,%s)", (email[:255], request.remote_addr))
+        execute("DELETE FROM login_failures WHERE created_at < NOW() - INTERVAL 1 DAY")
+    except Exception:
+        pass
 
 @app.route('/api/auth/login', methods=['POST'])
 def login():
@@ -397,13 +534,17 @@ def login():
     email    = (data.get('email') or '').strip().lower()
     password = data.get('password', '')
     if not email or not password: return err('Email and password required')
+    if too_many_failures(email):
+        return err('Too many failed sign-in attempts. Please wait 15 minutes, or reset your password.', 429)
     user = query("SELECT * FROM users WHERE email=%s", (email,), fetchone=True)
     if not user or not check_password(password, user['password_hash']):
+        record_failure(email)
         return err('Invalid email or password', 401)
     if not user['is_active']: return err('Account suspended', 403)
     if not bool(user.get('email_verified', 0)):
         return err('Please verify your email before logging in. Check your inbox for the verification link.', 403)
     execute("UPDATE users SET last_login_at=NOW() WHERE id=%s", (user['id'],))
+    execute("DELETE FROM login_failures WHERE email=%s", (email,))
     token = make_token(user['id'], user['role'])
     return ok({'token': token, 'user': {'id': user['id'], 'email': user['email'],
                'full_name': user['full_name'], 'role': user['role'],
@@ -421,7 +562,7 @@ def me():
         tp = get_tenant_profile(u['id'])
         if tp:
             landlords = query("""
-                SELECT lp.landlord_code, lu.full_name AS landlord_name, lu.email AS landlord_email
+                SELECT lu.id AS landlord_user_id, COALESCE(NULLIF(lp.business_name,''), lu.full_name) AS landlord_name
                 FROM tenant_landlords tl
                 JOIN landlord_profiles lp ON lp.id = tl.landlord_id
                 JOIN users lu ON lu.id = lp.user_id
@@ -495,6 +636,50 @@ def mark_notif_read(nid):
     return ok()
 
 
+@app.route('/api/push/key')
+def push_key():
+    """The public key a browser needs to turn on phone notifications (null = push is off)."""
+    return ok({'public_key': VAPID_PUBLIC_KEY or None})
+
+@app.route('/api/push/subscribe', methods=['POST'])
+@require_auth()
+def push_subscribe():
+    """Stores this device's push subscription. A device belongs to whoever signed in on it last."""
+    data = request.get_json() or {}
+    endpoint = (data.get('endpoint') or '').strip()
+    keys = data.get('keys') or {}
+    p256dh, auth = (keys.get('p256dh') or '').strip(), (keys.get('auth') or '').strip()
+    if not endpoint.startswith('https://') or len(endpoint) > 500 or not p256dh or not auth \
+            or len(p256dh) > 255 or len(auth) > 255:
+        return err('Invalid push subscription')
+    execute("""INSERT INTO push_subscriptions (user_id, endpoint, p256dh_key, auth_key) VALUES (%s,%s,%s,%s)
+               ON DUPLICATE KEY UPDATE user_id=VALUES(user_id), p256dh_key=VALUES(p256dh_key),
+                                       auth_key=VALUES(auth_key)""",
+            (g.current_user['id'], endpoint, p256dh, auth))
+    return ok(msg='Notifications are on for this device')
+
+@app.route('/api/push/unsubscribe', methods=['POST'])
+@require_auth()
+def push_unsubscribe():
+    endpoint = ((request.get_json() or {}).get('endpoint') or '').strip()
+    if endpoint:
+        execute("DELETE FROM push_subscriptions WHERE endpoint=%s AND user_id=%s",
+                (endpoint[:500], g.current_user['id']))
+    return ok()
+
+@app.route('/api/push/test', methods=['POST'])
+@require_auth()
+def push_test():
+    """Settings' "Send a test": pushes to the signed-in person's own devices (not saved in the bell)."""
+    if not push_enabled():
+        return err('Phone notifications are not set up on this server yet.', 503)
+    sent = send_push(g.current_user['id'], {'title': 'Shiloh Living', 'page': None,
+                                            'body': 'Notifications are working on this device.'}, wait=True)
+    if not sent:
+        return err('This device is not set up for notifications. Turn them on first.', 404)
+    return ok(msg='Test notification sent')
+
+
 # ════════════════════════════════════════════════════════════
 # ANNOUNCEMENTS
 # ════════════════════════════════════════════════════════════
@@ -516,24 +701,32 @@ def list_announcements():
         """, (lp['id'],))
     else:
         tp = get_tenant_profile(u['id'])
-        announcements = query("""
-            SELECT DISTINCT a.*, u.full_name AS landlord_name,
+        announcements = query(f"""
+            SELECT a.*, u.full_name AS landlord_name,
                    (SELECT read_at FROM announcement_reads
                     WHERE announcement_id=a.id AND tenant_user_id=%s LIMIT 1) AS read_at
-            FROM announcements a
-            JOIN landlord_profiles lp ON lp.id = a.landlord_id
-            JOIN users u ON u.id = lp.user_id
-            JOIN tenant_landlords tl ON tl.landlord_id = lp.id
-            LEFT JOIN announcement_properties ap ON ap.announcement_id = a.id
-            LEFT JOIN contracts c ON c.tenant_id = tl.tenant_id
-            LEFT JOIN units un ON un.id = c.unit_id
-            WHERE tl.tenant_id = %s AND tl.is_active = 1
-              AND a.is_active = 1
-              AND (a.target_all = 1 OR ap.property_id = un.property_id)
-              AND (a.expires_at IS NULL OR a.expires_at >= CURDATE())
+            {TENANT_ANNOUNCEMENTS_FROM}
             ORDER BY a.created_at DESC
-        """, (u['id'], tp['id']))
+        """, (u['id'], tp['id'], tp['id']))
     return ok(announcements)
+
+
+# Announcements a tenant can see: from landlords they've joined, still live, and either for all
+# properties or for a property they rent in (or asked to join). Params: (tenant_profile_id, tenant_profile_id)
+TENANT_ANNOUNCEMENTS_FROM = """
+    FROM announcements a
+    JOIN landlord_profiles lp ON lp.id = a.landlord_id
+    JOIN users u ON u.id = lp.user_id
+    JOIN tenant_landlords tl ON tl.landlord_id = lp.id AND tl.tenant_id = %s AND tl.is_active = 1
+    WHERE a.is_active = 1
+      AND (a.expires_at IS NULL OR a.expires_at >= CURDATE())
+      AND (a.target_all = 1 OR EXISTS (
+            SELECT 1 FROM announcement_properties ap
+            WHERE ap.announcement_id = a.id
+              AND (ap.property_id = tl.property_id OR ap.property_id IN (
+                    SELECT un.property_id FROM contracts c JOIN units un ON un.id = c.unit_id
+                    WHERE c.tenant_id = %s AND c.status IN ('active','move_out_pending')))))
+"""
 
 
 @app.route('/api/announcements', methods=['POST'])
@@ -544,26 +737,29 @@ def create_announcement():
     subject    = (data.get('subject') or '').strip()
     body       = (data.get('body') or '').strip()
     target_all = 1 if data.get('target_all') else 0
-    property_ids = data.get('property_ids', [])
     expires_at = data.get('expires_at')
+    try:
+        property_ids = [int(p) for p in (data.get('property_ids') or [])]
+    except (TypeError, ValueError):
+        return err('Invalid property selection')
 
     if not subject or not body:
         return err('Subject and body are required')
-    if not target_all and not property_ids:
-        return err('Select at least one property or choose "All Properties"')
+    if len(subject) > 255:
+        return err('Subject is too long')
+    if not target_all:
+        own = query("SELECT id FROM properties WHERE landlord_id=%s AND is_active=1", (lp['id'],))
+        property_ids = [p for p in property_ids if p in {r['id'] for r in own}]
+        if not property_ids:
+            return err('Select at least one property or choose "All Properties"')
 
     ann_id, _ = execute(
         "INSERT INTO announcements (landlord_id, subject, body, target_all, expires_at) VALUES (%s,%s,%s,%s,%s)",
         (lp['id'], subject, body, target_all, expires_at or None)
     )
-
-    if not target_all and property_ids:
-        for pid in property_ids:
-            p = query("SELECT id FROM properties WHERE id=%s AND landlord_id=%s AND is_active=1",
-                      (pid, lp['id']), fetchone=True)
-            if p:
-                execute("INSERT IGNORE INTO announcement_properties (announcement_id, property_id) VALUES (%s,%s)",
-                        (ann_id, pid))
+    for pid in property_ids if not target_all else []:
+        execute("INSERT IGNORE INTO announcement_properties (announcement_id, property_id) VALUES (%s,%s)",
+                (ann_id, pid))
 
     if target_all:
         tenants = query("""
@@ -574,31 +770,32 @@ def create_announcement():
             WHERE tl.landlord_id = %s AND tl.is_active = 1
         """, (lp['id'],))
     else:
-        tenants = query("""
+        marks = ','.join(['%s'] * len(property_ids))
+        tenants = query(f"""
             SELECT DISTINCT u.id AS user_id, u.email, u.full_name
             FROM tenant_landlords tl
             JOIN tenant_profiles tp ON tp.id = tl.tenant_id
             JOIN users u ON u.id = tp.user_id
-            JOIN contracts c ON c.tenant_id = tp.id AND c.status = 'active'
-            JOIN units un ON un.id = c.unit_id
             WHERE tl.landlord_id = %s AND tl.is_active = 1
-              AND un.property_id IN ({})
-        """.format(','.join(['%s'] * len(property_ids))),
-            (lp['id'], *property_ids))
+              AND (tl.property_id IN ({marks}) OR EXISTS (
+                    SELECT 1 FROM contracts c JOIN units un ON un.id = c.unit_id
+                    WHERE c.tenant_id = tp.id AND c.status IN ('active','move_out_pending')
+                      AND un.property_id IN ({marks})))
+        """, (lp['id'], *property_ids, *property_ids))
 
     landlord_name = g.current_user['full_name']
     for t in tenants:
-        push_notification(t['user_id'], f'Announcement: {subject}', body[:80], 'announcement')
+        push_notification(t['user_id'], f'Announcement: {subject}', body[:120], 'announcement')
         send_email_if_opted_in(
             t['user_id'], 'email_new_announcement',
             t['email'],
             f'Announcement from {landlord_name}: {subject}',
             f"""
             <h2>New Announcement</h2>
-            <p><strong>From:</strong> {landlord_name}</p>
-            <p><strong>Subject:</strong> {subject}</p>
+            <p><strong>From:</strong> {h(landlord_name)}</p>
+            <p><strong>Subject:</strong> {h(subject)}</p>
             <hr/>
-            <p>{body}</p>
+            <p style="white-space:pre-wrap">{h(body)}</p>
             <hr/>
             <p><a href="{APP_URL}">View in your dashboard →</a></p>
             """
@@ -655,7 +852,7 @@ def list_threads():
             """, (u['id'],))
         return ok(threads)
     except Exception as e:
-        print(f"[THREADS ERR] {e}")
+        log.warning("Thread list failed: %s", e)
         return ok([])
 
 
@@ -668,39 +865,54 @@ def create_thread():
     body        = (data.get('body') or '').strip()
     contract_id = data.get('contract_id')
     if not subject or not body: return err('Subject and message are required')
+    if len(subject) > 255: return err('Subject is too long')
 
+    # Tenants may only message landlords they've joined, and landlords only their own tenants.
     if u['role'] == 'tenant':
         tp = get_tenant_profile(u['id'])
         if contract_id:
-            c = query("""SELECT lu.id AS landlord_user_id FROM contracts c
-                         JOIN tenant_profiles tp2 ON tp2.id=c.tenant_id
-                         JOIN tenant_landlords tl ON tl.tenant_id=tp2.id
-                         JOIN landlord_profiles lp ON lp.id=tl.landlord_id
-                         JOIN users lu ON lu.id=lp.user_id
+            c = query("""SELECT lp.user_id AS landlord_user_id FROM contracts c
+                         JOIN units un ON un.id=c.unit_id JOIN properties p ON p.id=un.property_id
+                         JOIN landlord_profiles lp ON lp.id=p.landlord_id
                          WHERE c.id=%s AND c.tenant_id=%s""", (contract_id, tp['id']), fetchone=True)
             if not c: return err('Contract not found', 404)
             landlord_user_id = c['landlord_user_id']
         else:
             landlord_user_id = data.get('landlord_user_id')
             if not landlord_user_id: return err('landlord_user_id or contract_id required')
-
-        tid, _ = execute(
-            "INSERT INTO message_threads (subject,started_by,landlord_id,tenant_id,contract_id,is_read_landlord) VALUES (%s,%s,%s,%s,%s,0)",
-            (subject, u['id'], landlord_user_id, u['id'], contract_id)
-        )
-        push_notification(landlord_user_id, f'New message: {subject}', body[:80], 'message')
-
-    elif u['role'] == 'landlord':
+            if not query("""SELECT 1 FROM tenant_landlords tl JOIN landlord_profiles lp ON lp.id=tl.landlord_id
+                            WHERE tl.tenant_id=%s AND tl.is_active=1 AND lp.user_id=%s""",
+                         (tp['id'], landlord_user_id), fetchone=True):
+                return err('You can only message landlords you have joined', 403)
+        landlord_id, tenant_id, other_id = landlord_user_id, u['id'], landlord_user_id
+    else:
+        lp = get_landlord_profile(u['id'])
         tenant_user_id = data.get('tenant_user_id')
         if not tenant_user_id: return err('tenant_user_id is required')
-        tid, _ = execute(
-            "INSERT INTO message_threads (subject,started_by,landlord_id,tenant_id,contract_id,is_read_tenant) VALUES (%s,%s,%s,%s,%s,0)",
-            (subject, u['id'], u['id'], tenant_user_id, contract_id)
-        )
-        push_notification(tenant_user_id, f'New message from landlord: {subject}', body[:80], 'message')
+        if not query("""SELECT 1 FROM tenant_landlords tl JOIN tenant_profiles tp ON tp.id=tl.tenant_id
+                        WHERE tl.landlord_id=%s AND tp.user_id=%s""", (lp['id'], tenant_user_id), fetchone=True):
+            return err('Tenant not found or not your tenant', 403)
+        if contract_id and not query("""SELECT 1 FROM contracts c JOIN units un ON un.id=c.unit_id
+                                        JOIN properties p ON p.id=un.property_id
+                                        WHERE c.id=%s AND p.landlord_id=%s""", (contract_id, lp['id']), fetchone=True):
+            contract_id = None
+        landlord_id, tenant_id, other_id = u['id'], tenant_user_id, tenant_user_id
 
+    tid, _ = execute(
+        "INSERT INTO message_threads (subject,started_by,landlord_id,tenant_id,contract_id,is_read_landlord,is_read_tenant) VALUES (%s,%s,%s,%s,%s,%s,%s)",
+        (subject, u['id'], landlord_id, tenant_id, contract_id,
+         1 if u['role'] == 'landlord' else 0, 1 if u['role'] == 'tenant' else 0)
+    )
     execute("INSERT INTO message_replies (thread_id,sender_id,body) VALUES (%s,%s,%s)",
             (tid, u['id'], body))
+    push_notification(other_id, f'New message from {u["full_name"]}: {subject}', body[:120], 'message')
+    other_user = query("SELECT email, role FROM users WHERE id=%s", (other_id,), fetchone=True)
+    if other_user:
+        pref_key = 'email_tenant_message' if other_user['role'] == 'landlord' else 'email_new_message'
+        send_email_if_opted_in(other_id, pref_key, other_user['email'], f'New message: {subject}',
+            f"""<h2>New Message</h2><p><strong>From:</strong> {h(u['full_name'])}</p>
+            <p><strong>Subject:</strong> {h(subject)}</p><hr/><p style="white-space:pre-wrap">{h(body)}</p><hr/>
+            <p><a href="{APP_URL}">View conversation →</a></p>""")
     return ok({'thread_id': tid}, status=201)
 
 
@@ -712,6 +924,9 @@ def get_thread(tid):
     if not thread: return err('Thread not found', 404)
     if u['id'] not in (thread['landlord_id'], thread['tenant_id']):
         return err('Access denied', 403)
+    other = query("SELECT full_name FROM users WHERE id=%s",
+                  (thread['tenant_id'] if u['id'] == thread['landlord_id'] else thread['landlord_id'],), fetchone=True)
+    thread['other_name'] = other['full_name'] if other else ''
     replies = query("""
         SELECT mr.*, u.full_name AS sender_name, u.role AS sender_role
         FROM message_replies mr JOIN users u ON u.id=mr.sender_id
@@ -741,7 +956,7 @@ def reply_to_thread(tid):
             (tid, u['id'], body))
 
     other_id = thread['tenant_id'] if u['id'] == thread['landlord_id'] else thread['landlord_id']
-    push_notification(other_id, f'New reply: {thread["subject"]}', body[:80], 'message')
+    push_notification(other_id, f'{u["full_name"]}: {thread["subject"]}', body[:120], 'message')
 
     other_user = query("SELECT email, full_name, role FROM users WHERE id=%s", (other_id,), fetchone=True)
     if other_user:
@@ -752,9 +967,9 @@ def reply_to_thread(tid):
             f'New reply: {thread["subject"]}',
             f"""
             <h2>New Message</h2>
-            <p><strong>From:</strong> {u['full_name']}</p>
-            <p><strong>Subject:</strong> {thread['subject']}</p>
-            <hr/><p>{body}</p><hr/>
+            <p><strong>From:</strong> {h(u['full_name'])}</p>
+            <p><strong>Subject:</strong> {h(thread['subject'])}</p>
+            <hr/><p style="white-space:pre-wrap">{h(body)}</p><hr/>
             <p><a href="{APP_URL}">View conversation →</a></p>
             """
         )
@@ -812,14 +1027,18 @@ def create_ticket():
     body     = (data.get('body') or '').strip()
     priority = data.get('priority', 'normal')
     if not title or not body: return err('Title and message are required')
+    if category not in ('billing', 'technical', 'account', 'contract', 'other'): category = 'other'
+    if priority not in ('low', 'normal', 'high'): priority = 'normal'
 
     tid, _ = execute(
         "INSERT INTO support_tickets (opened_by,title,category,priority) VALUES (%s,%s,%s,%s)",
-        (u['id'], title, category, priority)
+        (u['id'], title[:255], category, priority)
     )
     execute("INSERT INTO ticket_replies (ticket_id,sender_id,body) VALUES (%s,%s,%s)",
             (tid, u['id'], body))
     email_new_ticket(tid, title, u['full_name'], u['email'], category)
+    for a in query("SELECT id FROM users WHERE role='admin' AND is_active=1"):
+        push_notification(a['id'], f'New ticket #{tid}: {title}', f'From {u["full_name"]}', 'system')
     log_action('CREATE_TICKET', 'support_tickets', tid, title)
     return ok({'ticket_id': tid}, status=201)
 
@@ -863,27 +1082,28 @@ def reply_ticket(tid):
     if u['role'] == 'admin':
         opener = query("SELECT email,full_name FROM users WHERE id=%s", (ticket['opened_by'],), fetchone=True)
         if opener:
-            # FIX: correct call signature for send_email_if_opted_in
             send_email_if_opted_in(
                 ticket['opened_by'], 'email_ticket_reply',
                 opener['email'],
                 f'[Ticket #{tid}] New reply: {ticket["title"]}',
                 f"""
                 <h2>New Reply on Your Support Ticket</h2>
-                <p><strong>Ticket:</strong> {ticket['title']}</p>
+                <p><strong>Ticket:</strong> {h(ticket['title'])}</p>
                 <p><strong>From:</strong> Support Team</p>
                 <hr/>
-                <p>{body}</p>
+                <p style="white-space:pre-wrap">{h(body)}</p>
                 <hr/>
                 <p><a href="{APP_URL}">View full conversation →</a></p>
                 """
             )
         push_notification(ticket['opened_by'], 'Support replied to your ticket',
-                          f'Ticket: {ticket["title"]}', 'system')
+                          f'Ticket: {ticket["title"]}', 'support')
     else:
         send_email(SUPPORT_EMAIL,
                    f'[Ticket #{tid} Reply] {ticket["title"]}',
-                   f'<p><strong>{u["full_name"]}</strong> replied:</p><p>{body}</p>')
+                   f'<p><strong>{h(u["full_name"])}</strong> replied:</p><p style="white-space:pre-wrap">{h(body)}</p>')
+        for a in query("SELECT id FROM users WHERE role='admin' AND is_active=1"):
+            push_notification(a['id'], f'Ticket #{tid} reply from {u["full_name"]}', body[:120], 'system')
 
     return ok(msg='Reply sent')
 
@@ -899,9 +1119,9 @@ def resolve_ticket(tid):
         if opener:
             send_email(opener['email'],
                        f'[Ticket #{tid}] Resolved: {ticket["title"]}',
-                       f'<p>Hi {opener["full_name"]},</p><p>Your support ticket <strong>"{ticket["title"]}"</strong> has been marked as resolved.</p><p>If you need further help, please open a new ticket.</p>')
+                       f'<p>Hi {h(opener["full_name"])},</p><p>Your support ticket <strong>"{h(ticket["title"])}"</strong> has been marked as resolved.</p><p>If you need further help, please open a new ticket.</p>')
         push_notification(ticket['opened_by'], 'Support ticket resolved',
-                          f'Your ticket "{ticket["title"]}" has been resolved.', 'system')
+                          f'Your ticket "{ticket["title"]}" has been resolved.', 'support')
     log_action('RESOLVE_TICKET', 'support_tickets', tid)
     return ok(msg='Ticket resolved')
 
@@ -948,6 +1168,21 @@ def delete_property(pid):
     execute("UPDATE properties SET is_active=0 WHERE id=%s AND landlord_id=%s",(pid,lp['id']))
     return ok(msg='Deleted')
 
+@app.route('/api/properties/<int:pid>/join-code', methods=['POST'])
+@require_auth('landlord')
+def property_join_code(pid):
+    """The property's own join code (made on first use). {"regenerate": true} replaces it, so an
+    old link or printed QR stops working; tenants who already joined are not affected."""
+    lp = get_landlord_profile(g.current_user['id'])
+    p = query("SELECT id, name, join_code FROM properties WHERE id=%s AND landlord_id=%s AND is_active=1",
+              (pid, lp['id']), fetchone=True)
+    if not p: return err('Not found', 404)
+    code = p['join_code']
+    if not code or (request.get_json(silent=True) or {}).get('regenerate'):
+        code = gen_property_code()
+        execute("UPDATE properties SET join_code=%s WHERE id=%s", (code, pid))
+    return ok({'code': code, 'property_name': p['name'], 'join_url': f'{APP_URL}/join/{code}'})
+
 
 # ════════════════════════════════════════════════════════════
 # UNITS
@@ -963,7 +1198,7 @@ def list_units():
         units=query("SELECT * FROM units WHERE property_id=%s ORDER BY unit_number",(pid,))
     else:
         units=query("""SELECT u.*,p.name AS property_name FROM units u JOIN properties p ON p.id=u.property_id
-            WHERE p.landlord_id=%s ORDER BY p.name,u.unit_number""",(lp['id'],))
+            WHERE p.landlord_id=%s AND p.is_active=1 ORDER BY p.name,u.unit_number""",(lp['id'],))
     return ok(units)
 
 @app.route('/api/units', methods=['POST'])
@@ -1050,6 +1285,10 @@ def create_contract():
         return err('unit_id, tenant_id, start_date, monthly_rent are required')
     if not is_open_term and not end_date:
         return err('end_date is required when not an open term contract')
+    if positive_amount(monthly_rent) is None:
+        return err('Monthly rent must be more than 0')
+    if is_open_term:
+        end_date = None
 
     p = query("SELECT pr.landlord_id FROM units u JOIN properties pr ON pr.id=u.property_id WHERE u.id=%s", (unit_id,), fetchone=True)
     if not p or p['landlord_id'] != lp['id']: return err('Unit not found or not yours', 403)
@@ -1069,8 +1308,9 @@ def create_contract():
              contract_signed_date or None, move_in_date or None)
         )
     except Exception as e:
-        if 'already has an active contract' in str(e): return err(str(e), 409)
-        return err(f'Could not create: {str(e)}', 500)
+        if 'already has an active contract' in str(e):
+            return err('This unit already has an active contract.', 409)
+        raise
 
     tenant_user = query("SELECT u.id, u.email, u.full_name FROM users u JOIN tenant_profiles tp ON tp.user_id=u.id WHERE tp.id=%s", (tenant_id,), fetchone=True)
     if tenant_user:
@@ -1091,6 +1331,8 @@ def upload_contract_doc(cid):
 
     if not doc_url:
         return err('contract_doc_url is required')
+    if not is_upload_url(doc_url):
+        return err('Invalid document URL. Please upload via the file picker.')
 
     c = query("""
         SELECT c.id, c.tenant_id FROM contracts c
@@ -1118,7 +1360,7 @@ def upload_contract_doc(cid):
             tenant_user['email'],
             'Your Signed Contract is Ready',
             '<h2>Signed Contract Uploaded</h2>'
-            '<p>Hi ' + tenant_user['full_name'] + ',</p>'
+            '<p>Hi ' + h(tenant_user['full_name']) + ',</p>'
             '<p>Your landlord has uploaded your signed rental contract.</p>'
             '<p>Please log in to your dashboard to view and acknowledge it.</p>'
             '<p><a href="' + APP_URL + '">Go to Dashboard →</a></p>'
@@ -1143,7 +1385,7 @@ def acknowledge_contract(cid):
             ci["landlord_user_id"], "email_contract_acknowledged",
             ci["landlord_email"],
             "Contract Acknowledged by Tenant",
-            f'<h2>Contract Acknowledged</h2><p>{g.current_user["full_name"]} acknowledged the contract for Unit {ci["unit_number"]}.</p><p><a href="{APP_URL}">View in dashboard</a></p>'
+            f'<h2>Contract Acknowledged</h2><p>{h(g.current_user["full_name"])} acknowledged the contract for Unit {h(ci["unit_number"])}.</p><p><a href="{APP_URL}">View in dashboard</a></p>'
         )
     return ok(msg='Contract acknowledged')
 
@@ -1202,12 +1444,16 @@ def update_move_out(cid):
     allowed = ['deposit_consumed','deposit_consumed_amount','repair_status',
                'repair_notes','repair_proof_url','deposit_status','deposit_ready_at']
     fields  = {k:v for k,v in data.items() if k in allowed}
+    if fields.get('repair_proof_url') and not is_upload_url(fields['repair_proof_url']):
+        return err('Invalid proof URL. Please upload via the file picker.')
+    before = query("SELECT deposit_status FROM move_out_checklists WHERE contract_id=%s", (cid,), fetchone=True)
     if fields:
         set_cl = ', '.join(f"{k}=%s" for k in fields)
         execute(f"UPDATE move_out_checklists SET {set_cl}, updated_at=NOW() WHERE contract_id=%s",
                 (*fields.values(), cid))
 
-    if data.get('deposit_status') == 'ready':
+    # Tell the tenant once, when the deposit first becomes ready (not on every later save)
+    if data.get('deposit_status') == 'ready' and (before or {}).get('deposit_status') != 'ready':
         tenant_user = query("""SELECT u.id, u.email, u.full_name FROM users u
             JOIN tenant_profiles tp ON tp.user_id=u.id WHERE tp.id=%s""",
             (c['tenant_id'],), fetchone=True)
@@ -1259,6 +1505,11 @@ def extend_contract(cid):
 # BILLS
 # ════════════════════════════════════════════════════════════
 
+# The latest payment that wasn't rejected, per bill (one row per bill, never duplicates)
+LATEST_PAYMENT_JOIN = """
+    LEFT JOIN payments py ON py.id = (SELECT MAX(p2.id) FROM payments p2
+                                      WHERE p2.bill_id = b.id AND p2.status != 'rejected')"""
+
 @app.route('/api/bills', methods=['GET'])
 @require_auth('landlord','tenant')
 def list_bills():
@@ -1266,72 +1517,88 @@ def list_bills():
     if u['role']=='landlord':
         lp=get_landlord_profile(u['id'])
         if contract_id:
-            bills=query("""SELECT b.*,py.id AS payment_id,py.status AS payment_status,py.amount_paid FROM bills b
-                LEFT JOIN payments py ON py.bill_id=b.id JOIN contracts c ON c.id=b.contract_id
+            bills=query(f"""SELECT b.*,py.id AS payment_id,py.status AS payment_status,py.amount_paid FROM bills b
+                {LATEST_PAYMENT_JOIN} JOIN contracts c ON c.id=b.contract_id
                 JOIN units un ON un.id=c.unit_id JOIN properties p ON p.id=un.property_id
                 WHERE b.contract_id=%s AND p.landlord_id=%s ORDER BY b.due_date DESC""",(contract_id,lp['id']))
         else:
             bills=query("""SELECT b.*,u.full_name AS tenant_name,un.unit_number,p.name AS property_name FROM bills b
                 JOIN contracts c ON c.id=b.contract_id JOIN tenant_profiles tp ON tp.id=c.tenant_id
                 JOIN users u ON u.id=tp.user_id JOIN units un ON un.id=c.unit_id JOIN properties p ON p.id=un.property_id
-                WHERE p.landlord_id=%s ORDER BY b.due_date DESC LIMIT 100""",(lp['id'],))
+                WHERE p.landlord_id=%s ORDER BY b.due_date DESC LIMIT 200""",(lp['id'],))
     else:
         tp=get_tenant_profile(u['id'])
-        bills=query("""SELECT b.*,py.id AS payment_id,py.status AS payment_status,py.amount_paid FROM bills b
-            LEFT JOIN payments py ON py.bill_id=b.id AND py.status!='rejected'
-            JOIN contracts c ON c.id=b.contract_id WHERE c.tenant_id=%s ORDER BY b.due_date DESC""",(tp['id'],))
+        bills=query(f"""SELECT b.*,py.id AS payment_id,py.status AS payment_status,py.amount_paid,
+                   un.unit_number,p.name AS property_name,lu.full_name AS landlord_name FROM bills b
+            {LATEST_PAYMENT_JOIN}
+            JOIN contracts c ON c.id=b.contract_id JOIN units un ON un.id=c.unit_id
+            JOIN properties p ON p.id=un.property_id JOIN landlord_profiles lp ON lp.id=p.landlord_id
+            JOIN users lu ON lu.id=lp.user_id
+            WHERE c.tenant_id=%s ORDER BY b.due_date DESC""",(tp['id'],))
     return ok(bills)
+
+def notify_new_bill(contract_id, description, amount, due_date):
+    tenant_user = query("""SELECT u.id, u.email, u.full_name FROM contracts c
+        JOIN tenant_profiles tp ON tp.id=c.tenant_id JOIN users u ON u.id=tp.user_id WHERE c.id=%s""",
+        (contract_id,), fetchone=True)
+    if not tenant_user:
+        return
+    amount_txt = f'₱{float(amount):,.2f}'
+    push_notification(tenant_user['id'], f'New Bill: {description}', f'{amount_txt} due {due_date}', 'bill')
+    send_email_if_opted_in(
+        tenant_user['id'], 'email_new_bill', tenant_user['email'], f'New Bill: {description}',
+        f"""
+        <h2>New Bill</h2>
+        <p>Hi {h(tenant_user['full_name'])},</p>
+        <p><strong>Description:</strong> {h(description)}</p>
+        <p><strong>Amount:</strong> {h(amount_txt)}</p>
+        <p><strong>Due Date:</strong> {h(due_date)}</p>
+        <p><a href="{APP_URL}">View and Pay →</a></p>
+        """)
 
 @app.route('/api/bills', methods=['POST'])
 @require_auth('landlord')
 def create_bill():
     lp=get_landlord_profile(g.current_user['id']); data=request.get_json() or {}
     contract_id=data.get('contract_id'); description=(data.get('description') or '').strip()
-    amount=data.get('amount'); due_date=data.get('due_date')
-    bill_type=data.get('bill_type','rent'); bill_month=data.get('bill_month'); bill_year=data.get('bill_year')
-    if not all([contract_id,description,amount,due_date]): return err('All fields required')
+    amount=positive_amount(data.get('amount')); due_date=data.get('due_date')
+    bill_type=data.get('bill_type','rent'); bill_month=data.get('bill_month') or None; bill_year=data.get('bill_year') or None
+    if not all([contract_id,description,due_date]): return err('All fields required')
+    if amount is None: return err('Amount must be more than 0')
+    if bill_type not in ('rent','water','electricity','other'): bill_type='other'
     c=query("""SELECT c.id, c.tenant_id FROM contracts c JOIN units un ON un.id=c.unit_id JOIN properties p ON p.id=un.property_id
                WHERE c.id=%s AND p.landlord_id=%s""",(contract_id,lp['id']),fetchone=True)
     if not c: return err('Contract not found',404)
     bid,_=execute("INSERT INTO bills (contract_id,description,bill_type,bill_month,bill_year,amount,due_date) VALUES (%s,%s,%s,%s,%s,%s,%s)",
-                  (contract_id,description,bill_type,bill_month,bill_year,amount,due_date))
-
-    tenant_user = query(
-        "SELECT u.id, u.email, u.full_name FROM users u JOIN tenant_profiles tp ON tp.user_id=u.id WHERE tp.id=%s",
-        (c['tenant_id'],), fetchone=True
-    )
-    if tenant_user:
-        push_notification(tenant_user['id'], f'New Bill: {description}',
-                          f'Amount due: {amount} by {due_date}', 'bill')
-        send_email_if_opted_in(
-            tenant_user['id'], 'email_new_bill',
-            tenant_user['email'],
-            f'New Bill: {description}',
-            f"""
-            <h2>New Bill</h2>
-            <p>Hi {tenant_user['full_name']},</p>
-            <p><strong>Description:</strong> {description}</p>
-            <p><strong>Amount:</strong> {amount}</p>
-            <p><strong>Due Date:</strong> {due_date}</p>
-            <p><a href="{APP_URL}">View and Pay →</a></p>
-            """
-        )
-
+                  (contract_id,description[:255],bill_type,bill_month,bill_year,amount,due_date))
+    notify_new_bill(contract_id, description, amount, due_date)
     return ok({'bill_id':bid},status=201)
 
 @app.route('/api/bills/generate-monthly', methods=['POST'])
-@require_auth('landlord','admin')
+@require_auth('landlord')
 def generate_monthly_bills():
-    conn=get_conn()
-    try:
-        cur=conn.cursor()
-        cur.callproc('sp_generate_monthly_bills')
-        result=[]
-        for r in cur.stored_results(): result=r.fetchall()
-        conn.commit()
-        count=result[0][0] if result else 0
-        return ok({'bills_generated':count})
-    finally: conn.close()
+    """This month's rent bill for each of the landlord's active contracts (open-term included)
+    that doesn't have one yet. Due on the 7th, or today if that's already past."""
+    lp=get_landlord_profile(g.current_user['id'])
+    today=date.today()
+    contracts=query("""SELECT c.id, c.monthly_rent FROM contracts c
+        JOIN units un ON un.id=c.unit_id JOIN properties p ON p.id=un.property_id
+        WHERE p.landlord_id=%s AND c.status='active' AND c.start_date <= CURDATE()
+          AND (c.end_date IS NULL OR c.end_date >= CURDATE())
+          AND NOT EXISTS (SELECT 1 FROM bills b WHERE b.contract_id=c.id AND b.bill_type='rent'
+                          AND ((b.bill_month=%s AND b.bill_year=%s)
+                               OR (b.bill_month IS NULL AND b.description LIKE 'Monthly Rent%%'
+                                   AND YEAR(b.created_at)=%s AND MONTH(b.created_at)=%s)))""",
+        (lp['id'], today.month, today.year, today.year, today.month))
+    due=max(today, today.replace(day=7)).isoformat()
+    description=f"Monthly Rent — {today.strftime('%B %Y')}"
+    for c in contracts:
+        execute("""INSERT INTO bills (contract_id,description,bill_type,bill_month,bill_year,amount,due_date)
+                   VALUES (%s,%s,'rent',%s,%s,%s,%s)""",
+                (c['id'], description, today.month, today.year, c['monthly_rent'], due))
+        notify_new_bill(c['id'], description, c['monthly_rent'], due)
+    log_action('GENERATE_MONTHLY_BILLS', 'bills', None, f'{len(contracts)} bills')
+    return ok({'bills_generated':len(contracts)})
 
 
 # ════════════════════════════════════════════════════════════
@@ -1349,57 +1616,39 @@ def submit_payment():
     proof_url    = data.get('proof_url', '')
     proof_public_id = data.get('proof_public_id', '')
 
-    if not bill_id or not amount_paid: return err('bill_id and amount_paid required')
+    amount_paid = positive_amount(amount_paid)
+    if not bill_id or amount_paid is None: return err('bill_id and an amount more than 0 are required')
     if not proof_url: return err('Proof of payment is required')
-    if proof_url and not proof_url.startswith('https://res.cloudinary.com'):
+    if not is_upload_url(proof_url):
         return err('Invalid proof URL. Please upload via the file picker.')
-    b=query("""SELECT b.id, c.tenant_id,
+    b=query("""SELECT b.id, b.status, b.description, c.tenant_id,
                       (SELECT lp.user_id FROM units u JOIN properties p ON p.id=u.property_id
                        JOIN landlord_profiles lp ON lp.id=p.landlord_id WHERE u.id=c.unit_id) AS landlord_user_id
                FROM bills b JOIN contracts c ON c.id=b.contract_id
                WHERE b.id=%s AND c.tenant_id=%s""",(bill_id,tp['id']),fetchone=True)
     if not b: return err('Bill not found',404)
+    if b['status'] == 'paid': return err('This bill is already paid', 409)
+    if query("SELECT 1 FROM payments WHERE bill_id=%s AND status='pending'", (bill_id,), fetchone=True):
+        return err('A payment for this bill is already waiting for review', 409)
 
-    try:
-        pid,_=execute(
-            "INSERT INTO payments (bill_id,amount_paid,proof_url,proof_public_id) VALUES (%s,%s,%s,%s)",
-            (bill_id, amount_paid, proof_url, proof_public_id)
-        )
-    except Exception as ep:
-        ep_str = str(ep)
-        if 'proof_public_id' in ep_str:
-            try:
-                pid,_=execute(
-                    "INSERT INTO payments (bill_id,amount_paid,proof_url) VALUES (%s,%s,%s)",
-                    (bill_id, amount_paid, proof_url)
-                )
-            except Exception as ep2:
-                if 'proof_url' in str(ep2):
-                    pid,_=execute(
-                        "INSERT INTO payments (bill_id,amount_paid) VALUES (%s,%s)",
-                        (bill_id, amount_paid)
-                    )
-                else:
-                    raise
-        elif 'proof_url' in ep_str:
-            pid,_=execute(
-                "INSERT INTO payments (bill_id,amount_paid) VALUES (%s,%s)",
-                (bill_id, amount_paid)
-            )
-        else:
-            raise
+    pid,_=execute(
+        "INSERT INTO payments (bill_id,amount_paid,proof_url,proof_public_id) VALUES (%s,%s,%s,%s)",
+        (bill_id, amount_paid, proof_url, (proof_public_id or '')[:255])
+    )
 
     if b.get('landlord_user_id'):
+        name = g.current_user["full_name"]
         push_notification(b['landlord_user_id'], 'New Payment Submitted',
-                          f'{g.current_user["full_name"]} submitted a payment.', 'payment')
+                          f'{name} paid ₱{amount_paid:,.2f} for {b["description"]}.', 'payment')
         ll_user = query("SELECT email, full_name FROM users WHERE id=%s", (b['landlord_user_id'],), fetchone=True)
         if ll_user:
-            proof_link = ''  # Do not include file URL in email — tenant must log in to view proof
+            # No proof link in the email - the landlord reviews it in the app
             send_email_if_opted_in(
                 b['landlord_user_id'], 'email_payment_submitted',
                 ll_user['email'],
-                f'Payment Submitted by {g.current_user["full_name"]}',
-                f'<h2>New Payment Submitted</h2><p>{g.current_user["full_name"]} submitted a payment of {amount_paid}.</p>' + proof_link + '<p><a href="' + APP_URL + '">Review in dashboard</a></p>'
+                f'Payment Submitted by {name}',
+                f'<h2>New Payment Submitted</h2><p>{h(name)} submitted a payment of ₱{amount_paid:,.2f} '
+                f'for {h(b["description"])}.</p><p><a href="{APP_URL}">Review in dashboard</a></p>'
             )
 
     return ok({'payment_id':pid},status=201)
@@ -1431,11 +1680,12 @@ def list_payments():
 @require_auth('landlord')
 def approve_payment(pid):
     lp=get_landlord_profile(g.current_user['id'])
-    p=query("""SELECT py.id, c.tenant_id FROM payments py
+    p=query("""SELECT py.id, py.status, c.tenant_id FROM payments py
                JOIN bills b ON b.id=py.bill_id JOIN contracts c ON c.id=b.contract_id
                JOIN units un ON un.id=c.unit_id JOIN properties pr ON pr.id=un.property_id
                WHERE py.id=%s AND pr.landlord_id=%s""",(pid,lp['id']),fetchone=True)
     if not p: return err('Not found',404)
+    if p['status'] != 'pending': return err('This payment was already reviewed', 409)
     execute("UPDATE payments SET status='approved',reviewed_at=NOW(),reviewed_by=%s WHERE id=%s",(g.current_user['id'],pid))
 
     tenant_user = query(
@@ -1450,7 +1700,7 @@ def approve_payment(pid):
             'Your Payment Has Been Approved',
             f"""
             <h2>Payment Approved ✓</h2>
-            <p>Hi {tenant_user['full_name']},</p>
+            <p>Hi {h(tenant_user['full_name'])},</p>
             <p>Your payment has been reviewed and <strong>approved</strong>.</p>
             <p><a href="{APP_URL}">View your dashboard →</a></p>
             """
@@ -1463,11 +1713,12 @@ def approve_payment(pid):
 def reject_payment(pid):
     lp=get_landlord_profile(g.current_user['id']); data=request.get_json() or {}
     notes=data.get('notes','')
-    p=query("""SELECT py.id, c.tenant_id FROM payments py
+    p=query("""SELECT py.id, py.status, c.tenant_id FROM payments py
                JOIN bills b ON b.id=py.bill_id JOIN contracts c ON c.id=b.contract_id
                JOIN units un ON un.id=c.unit_id JOIN properties pr ON pr.id=un.property_id
                WHERE py.id=%s AND pr.landlord_id=%s""",(pid,lp['id']),fetchone=True)
     if not p: return err('Not found',404)
+    if p['status'] != 'pending': return err('This payment was already reviewed', 409)
     execute("UPDATE payments SET status='rejected',notes=%s,reviewed_at=NOW(),reviewed_by=%s WHERE id=%s",(notes,g.current_user['id'],pid))
 
     tenant_user = query(
@@ -1483,9 +1734,9 @@ def reject_payment(pid):
             'Your Payment Was Rejected',
             f"""
             <h2>Payment Rejected</h2>
-            <p>Hi {tenant_user['full_name']},</p>
+            <p>Hi {h(tenant_user['full_name'])},</p>
             <p>Your payment submission was <strong>rejected</strong>.</p>
-            {f'<p><strong>Reason:</strong> {notes}</p>' if notes else ''}
+            {f'<p><strong>Reason:</strong> {h(notes)}</p>' if notes else ''}
             <p>Please resubmit with the correct proof of payment.</p>
             <p><a href="{APP_URL}">Go to dashboard →</a></p>
             """
@@ -1518,8 +1769,14 @@ def create_water_session():
     lp=get_landlord_profile(g.current_user['id']); data=request.get_json() or {}
     property_id=data.get('property_id'); session_month=data.get('session_month'); session_year=data.get('session_year')
     prev_reading_date=data.get('prev_reading_date'); curr_reading_date=data.get('curr_reading_date')
-    total_bill=float(data.get('total_bill',0)); overall_consumption=float(data.get('overall_consumption',0))
-    pump_total=float(data.get('pump_total',0)); number_of_units=int(data.get('number_of_units',1))
+    try:
+        total_bill=float(data.get('total_bill') or 0); overall_consumption=float(data.get('overall_consumption') or 0)
+    except (TypeError, ValueError):
+        return err('Amounts must be numbers')
+    try:
+        pump_total=float(data.get('pump_total') or 0); number_of_units=int(data.get('number_of_units') or 1)
+    except (TypeError, ValueError):
+        return err('Amounts must be numbers')
     if not all([property_id,session_month,session_year,prev_reading_date,curr_reading_date,total_bill,overall_consumption]):
         return err('All fields required')
     p=query("SELECT id FROM properties WHERE id=%s AND landlord_id=%s",(property_id,lp['id']),fetchone=True)
@@ -1557,11 +1814,21 @@ def save_water_readings(sid):
     readings=data.get('readings',[])
     if not readings: return err('No readings')
     price_per_cubic=float(session['price_per_cubic']); pump_per_unit=float(session['pump_per_unit'])
+    # Only units of this session's property (the landlord's own)
+    prop_units={u['id'] for u in query("SELECT id FROM units WHERE property_id=%s",(session['property_id'],))}
+    try:
+        readings=[{**r,'unit_id':int(r.get('unit_id')),'prev_reading':float(r.get('prev_reading') or 0),
+                   'curr_reading':float(r.get('curr_reading') or 0)} for r in readings]
+    except (TypeError, ValueError):
+        return err('Readings must be numbers')
+    for r in readings:
+        if r['unit_id'] not in prop_units: return err('Unit not found in this property', 404)
+        if r['curr_reading']<r['prev_reading'] or r['prev_reading']<0:
+            return err(f"Current reading is lower than previous for unit {r['unit_id']}")
     saved=[]
     for r in readings:
-        unit_id=r.get('unit_id'); prev_reading=float(r.get('prev_reading',0))
-        curr_reading=float(r.get('curr_reading',0)); is_owner_unit=1 if r.get('is_owner_unit') else 0
-        if curr_reading<prev_reading: return err(f'Current < previous for unit {unit_id}')
+        unit_id=r['unit_id']; prev_reading=r['prev_reading']
+        curr_reading=r['curr_reading']; is_owner_unit=1 if r.get('is_owner_unit') else 0
         consumption=curr_reading-prev_reading; water_bill=price_per_cubic*consumption
         pump_fee=pump_per_unit; total_amount=water_bill+pump_fee
         execute("DELETE FROM water_meter_readings WHERE session_id=%s AND unit_id=%s",(sid,unit_id))
@@ -1581,17 +1848,18 @@ def generate_water_bills(sid):
     if not session: return err('Not found',404)
     if session['status']=='billed': return err('Already billed',409)
     readings=query("""SELECT wmr.*,u.unit_number FROM water_meter_readings wmr JOIN units u ON u.id=wmr.unit_id
-        WHERE wmr.session_id=%s AND wmr.is_owner_unit=0""",(sid,))
+        WHERE wmr.session_id=%s AND wmr.is_owner_unit=0 AND u.property_id=%s""",(sid,session['property_id']))
     if not readings: return err('No readings. Save readings first.',400)
     month_names=['January','February','March','April','May','June','July','August','September','October','November','December']
     month_name=month_names[int(session['session_month'])-1]; bills_created=0
     for r in readings:
-        contract=query("SELECT c.id FROM contracts c WHERE c.unit_id=%s AND c.status='active'",(r['unit_id'],),fetchone=True)
+        contract=query("SELECT c.id FROM contracts c WHERE c.unit_id=%s AND c.status IN ('active','move_out_pending') ORDER BY c.id DESC LIMIT 1",(r['unit_id'],),fetchone=True)
         if not contract: continue
         description=f"Water Bill — {month_name} {session['session_year']} (Unit {r['unit_number']})"
         bid,_=execute("INSERT INTO bills (contract_id,description,bill_type,bill_month,bill_year,amount,due_date) VALUES (%s,%s,'water',%s,%s,%s,%s)",
                       (contract['id'],description,session['session_month'],session['session_year'],r['total_amount'],due_date))
         execute("UPDATE water_meter_readings SET bill_id=%s WHERE id=%s",(bid,r['id']))
+        notify_new_bill(contract['id'], description, r['total_amount'], due_date)
         bills_created+=1
     execute("UPDATE water_meter_sessions SET status='billed' WHERE id=%s",(sid,))
     return ok({'bills_created':bills_created})
@@ -1632,133 +1900,120 @@ def delete_reminder(rid):
 @app.route('/api/landlord/tenants', methods=['GET'])
 @require_auth('landlord')
 def landlord_tenants():
+    """The landlord's tenants. Contract/unit columns only ever show this landlord's own units
+    (a tenant may also rent elsewhere). A tenant renting several units here is one row."""
     lp = get_landlord_profile(g.current_user['id'])
     tenants = query("""
         SELECT tp.id, u.id AS user_id, u.full_name, u.email, u.phone, u.is_active, tl.joined_at,
-               c.id AS contract_id, c.status AS contract_status, un.unit_number, p.name AS property_name
+               rp.name AS requested_property,
+               MAX(c.id) AS contract_id,
+               MAX(c.status) AS contract_status,
+               GROUP_CONCAT(DISTINCT un.unit_number ORDER BY un.unit_number SEPARATOR ', ') AS unit_number,
+               GROUP_CONCAT(DISTINCT p.name ORDER BY p.name SEPARATOR ', ') AS property_name
         FROM tenant_landlords tl
         JOIN tenant_profiles tp ON tp.id = tl.tenant_id
         JOIN users u ON u.id = tp.user_id
-        LEFT JOIN contracts c ON c.tenant_id = tp.id AND c.status = 'active'
-        LEFT JOIN units un ON un.id = c.unit_id
-        LEFT JOIN properties p ON p.id = un.property_id
+        LEFT JOIN properties rp ON rp.id = tl.property_id
+        LEFT JOIN (contracts c
+                   JOIN units un ON un.id = c.unit_id
+                   JOIN properties p ON p.id = un.property_id AND p.landlord_id = %s)
+               ON c.tenant_id = tp.id AND c.status IN ('active','move_out_pending')
         WHERE tl.landlord_id = %s AND tl.is_active = 1
+        GROUP BY tp.id, u.id, u.full_name, u.email, u.phone, u.is_active, tl.joined_at, rp.name
         ORDER BY tl.joined_at DESC
-    """, (lp['id'],))
+    """, (lp['id'], lp['id']))
     return ok(tenants)
+
+
+@app.route('/api/landlord/join-code', methods=['GET', 'POST'])
+@require_auth('landlord')
+def landlord_join_code():
+    """The landlord's join code and link. POST {"regenerate": true} replaces the code, so old
+    links and printed QR codes stop working; tenants who already joined are not affected."""
+    lp = get_landlord_profile(g.current_user['id'])
+    code = lp['landlord_code']
+    if request.method == 'POST' and (request.get_json(silent=True) or {}).get('regenerate'):
+        code = gen_landlord_code()
+        execute("UPDATE landlord_profiles SET landlord_code=%s WHERE id=%s", (code, lp['id']))
+        log_action('REGENERATE_JOIN_CODE', 'landlord_profiles', lp['id'])
+    return ok({'code': code, 'join_url': f'{APP_URL}/join/{code}', 'login_url': APP_URL + '/',
+               'business_name': lp.get('business_name') or ''})
 
 
 @app.route('/api/landlord/dashboard', methods=['GET'])
 @require_auth('landlord')
 def landlord_dashboard():
     lp=get_landlord_profile(g.current_user['id'])
-    try:
-        summary=query("SELECT * FROM v_landlord_summary WHERE landlord_id=%s",(lp['id'],),fetchone=True)
-    except:
-        summary=query("""SELECT lp2.id AS landlord_id,
-            COUNT(DISTINCT p.id) AS total_properties,
-            COUNT(DISTINCT u.id) AS total_units,
-            COALESCE(SUM(u.status='occupied'),0) AS occupied_units,
-            COALESCE(SUM(u.status='vacant'),0) AS vacant_units,
-            COUNT(DISTINCT tl.tenant_id) AS total_tenants
-            FROM landlord_profiles lp2
-            LEFT JOIN properties p ON p.landlord_id=lp2.id AND p.is_active=1
-            LEFT JOIN units u ON u.property_id=p.id
-            LEFT JOIN tenant_landlords tl ON tl.landlord_id=lp2.id AND tl.is_active=1
-            WHERE lp2.id=%s GROUP BY lp2.id""", (lp['id'],), fetchone=True) or {}
-    try:
-        recent_payments=query("""SELECT py.id,py.amount_paid,py.status,py.paid_at,u.full_name AS tenant_name,b.description AS bill_desc
-            FROM payments py JOIN bills b ON b.id=py.bill_id JOIN contracts c ON c.id=b.contract_id
-            JOIN tenant_profiles tp ON tp.id=c.tenant_id JOIN users u ON u.id=tp.user_id
+    # Separate subqueries, so no count is multiplied by another join
+    summary=query("""SELECT
+        (SELECT COUNT(*) FROM properties WHERE landlord_id=%s AND is_active=1) AS total_properties,
+        (SELECT COUNT(*) FROM units un JOIN properties p ON p.id=un.property_id
+            WHERE p.landlord_id=%s AND p.is_active=1) AS total_units,
+        (SELECT COUNT(*) FROM units un JOIN properties p ON p.id=un.property_id
+            WHERE p.landlord_id=%s AND p.is_active=1 AND un.status='occupied') AS occupied_units,
+        (SELECT COUNT(*) FROM units un JOIN properties p ON p.id=un.property_id
+            WHERE p.landlord_id=%s AND p.is_active=1 AND un.status='vacant') AS vacant_units,
+        (SELECT COUNT(*) FROM tenant_landlords WHERE landlord_id=%s AND is_active=1) AS total_tenants,
+        (SELECT COUNT(*) FROM payments py JOIN bills b ON b.id=py.bill_id JOIN contracts c ON c.id=b.contract_id
             JOIN units un ON un.id=c.unit_id JOIN properties p ON p.id=un.property_id
-            WHERE p.landlord_id=%s ORDER BY py.paid_at DESC LIMIT 5""",(lp['id'],))
-    except Exception as e:
-        print(f"[LANDLORD DASH recent_payments ERR] {e}")
-        recent_payments=[]
-    try:
-        unread_threads=query("SELECT COUNT(*) AS cnt FROM message_threads WHERE landlord_id=%s AND is_read_landlord=0",
-                             (g.current_user['id'],),fetchone=True)
-    except:
-        unread_threads=None
-    today=datetime.now().day
-    try:
-        due_reminders=query("SELECT * FROM reminders WHERE landlord_id=%s AND day_of_month=%s AND is_active=1",(lp['id'],today))
-    except:
-        due_reminders=[]
-    try:
-        unread_ann = query("""
-            SELECT COUNT(*) AS cnt FROM announcements WHERE landlord_id=%s AND is_active=1
-        """, (lp['id'],), fetchone=True)
-        ann_count = unread_ann['cnt'] if unread_ann else 0
-    except:
-        ann_count = 0
+            WHERE p.landlord_id=%s AND py.status='pending') AS pending_payments,
+        (SELECT COALESCE(SUM(b.amount),0) FROM bills b JOIN contracts c ON c.id=b.contract_id
+            JOIN units un ON un.id=c.unit_id JOIN properties p ON p.id=un.property_id
+            WHERE p.landlord_id=%s AND b.status IN ('pending','overdue')) AS outstanding_amount
+        """, (lp['id'],)*7, fetchone=True) or {}
+    recent_payments=query("""SELECT py.id,py.amount_paid,py.status,py.paid_at,u.full_name AS tenant_name,b.description AS bill_desc
+        FROM payments py JOIN bills b ON b.id=py.bill_id JOIN contracts c ON c.id=b.contract_id
+        JOIN tenant_profiles tp ON tp.id=c.tenant_id JOIN users u ON u.id=tp.user_id
+        JOIN units un ON un.id=c.unit_id JOIN properties p ON p.id=un.property_id
+        WHERE p.landlord_id=%s ORDER BY py.paid_at DESC LIMIT 5""",(lp['id'],))
+    unread_threads=query("SELECT COUNT(*) AS cnt FROM message_threads WHERE landlord_id=%s AND is_read_landlord=0",
+                         (g.current_user['id'],),fetchone=True)
+    due_reminders=query("SELECT * FROM reminders WHERE landlord_id=%s AND day_of_month=%s AND is_active=1",
+                        (lp['id'],datetime.now().day))
+    ann=query("SELECT COUNT(*) AS cnt FROM announcements WHERE landlord_id=%s AND is_active=1", (lp['id'],), fetchone=True)
     return ok({'summary':summary,'recent_payments':recent_payments,'landlord_code':lp['landlord_code'],
                'due_reminders':due_reminders,
                'unread_threads':unread_threads['cnt'] if unread_threads else 0,
-               'announcement_count': ann_count})
+               'announcement_count': ann['cnt'] if ann else 0})
 
 @app.route('/api/tenant/dashboard', methods=['GET'])
 @require_auth('tenant')
 def tenant_dashboard():
-    try:
-        tp = get_tenant_profile(g.current_user['id'])
-        if not tp:
-            return err('Tenant profile not found. Please re-login.', 404)
-
-        try:
-            landlords = query("""SELECT lp.id AS landlord_profile_id, lu.id AS landlord_user_id, lu.full_name AS landlord_name,
-                       lp.landlord_code, tl.joined_at,
-                       c.id AS contract_id, c.status AS contract_status, c.monthly_rent,
-                       c.is_open_term, c.minimum_months, c.contract_doc_url, c.tenant_ack,
-                       un.unit_number, p.name AS property_name, p.address
-                FROM tenant_landlords tl JOIN landlord_profiles lp ON lp.id=tl.landlord_id
-                JOIN users lu ON lu.id=lp.user_id
-                LEFT JOIN contracts c ON c.tenant_id=%s AND c.status='active'
-                LEFT JOIN units un ON un.id=c.unit_id LEFT JOIN properties p ON p.id=un.property_id
-                WHERE tl.tenant_id=%s AND tl.is_active=1""",(tp['id'], tp['id']))
-        except Exception as e:
-            print("🔥 LANDLORDS ERROR:", e)
-            raise
-
-        try:
-            bills = query("""SELECT b.*,py.id AS payment_id,py.status AS payment_status FROM bills b
-                LEFT JOIN payments py ON py.bill_id=b.id AND py.status!='rejected'
-                JOIN contracts c ON c.id=b.contract_id WHERE c.tenant_id=%s ORDER BY b.due_date DESC LIMIT 10""",(tp['id'],))
-        except Exception as e:
-            print("🔥 BILLS ERROR:", e)
-            raise
-
-        try:
-            unread_msgs = query(
-                "SELECT COUNT(*) AS cnt FROM message_threads WHERE tenant_id=%s AND is_read_tenant=0",
-                (g.current_user['id'],), fetchone=True
-            )
-        except Exception as e:
-            print("🔥 UNREAD MSG ERROR:", e)
-            raise
-
-        try:
-            unread_ann = query("""
-                SELECT COUNT(*) AS cnt FROM announcements a
-                JOIN landlord_profiles lp ON lp.id=a.landlord_id
-                JOIN tenant_landlords tl ON tl.landlord_id=lp.id
-                LEFT JOIN announcement_reads ar ON ar.announcement_id=a.id AND ar.tenant_user_id=%s
-                WHERE tl.tenant_id=%s AND tl.is_active=1 AND a.is_active=1 AND ar.id IS NULL
-            """,(g.current_user['id'], tp['id']), fetchone=True)
-        except Exception as e:
-            print("🔥 ANNOUNCEMENTS ERROR:", e)
-            raise
-
-        return ok({
-            'landlords': landlords or [],
-            'bills': bills or [],
-            'unread_messages': unread_msgs.get('cnt', 0) if unread_msgs else 0,
-            'unread_announcements': unread_ann.get('cnt', 0) if unread_ann else 0
-        })
-
-    except Exception as e:
-        print("🔥 FINAL ERROR:", e)
-        return err(str(e), 500)
+    """One card per landlord the tenant joined, each with only that landlord's contracts."""
+    tp = get_tenant_profile(g.current_user['id'])
+    if not tp:
+        return err('Tenant profile not found. Please sign in again.', 404)
+    landlords = query("""SELECT lp.id AS landlord_profile_id, lu.id AS landlord_user_id, lu.full_name AS landlord_name,
+               lp.business_name, tl.joined_at, rp.name AS requested_property
+        FROM tenant_landlords tl JOIN landlord_profiles lp ON lp.id=tl.landlord_id
+        JOIN users lu ON lu.id=lp.user_id
+        LEFT JOIN properties rp ON rp.id=tl.property_id
+        WHERE tl.tenant_id=%s AND tl.is_active=1 ORDER BY tl.joined_at""", (tp['id'],))
+    contracts = query("""SELECT c.id AS contract_id, c.status AS contract_status, c.monthly_rent, c.start_date,
+               c.end_date, c.is_open_term, c.minimum_months, c.contract_doc_url, c.tenant_ack,
+               un.unit_number, p.name AS property_name, p.address, p.landlord_id AS landlord_profile_id
+        FROM contracts c JOIN units un ON un.id=c.unit_id JOIN properties p ON p.id=un.property_id
+        WHERE c.tenant_id=%s AND c.status IN ('active','move_out_pending')
+        ORDER BY c.start_date""", (tp['id'],))
+    for l in landlords:
+        l['contracts'] = [c for c in contracts if c['landlord_profile_id'] == l['landlord_profile_id']]
+    bills = query(f"""SELECT b.*,py.id AS payment_id,py.status AS payment_status,
+               un.unit_number, p.name AS property_name FROM bills b
+        {LATEST_PAYMENT_JOIN}
+        JOIN contracts c ON c.id=b.contract_id JOIN units un ON un.id=c.unit_id
+        JOIN properties p ON p.id=un.property_id
+        WHERE c.tenant_id=%s ORDER BY (b.status='paid'), b.due_date DESC LIMIT 10""", (tp['id'],))
+    unread_msgs = query("SELECT COUNT(*) AS cnt FROM message_threads WHERE tenant_id=%s AND is_read_tenant=0",
+                        (g.current_user['id'],), fetchone=True)
+    unread_ann = query(f"""SELECT COUNT(*) AS cnt {TENANT_ANNOUNCEMENTS_FROM}
+        AND NOT EXISTS (SELECT 1 FROM announcement_reads ar WHERE ar.announcement_id=a.id AND ar.tenant_user_id=%s)""",
+        (tp['id'], tp['id'], g.current_user['id']), fetchone=True)
+    return ok({
+        'landlords': landlords,
+        'bills': bills,
+        'unread_messages': unread_msgs['cnt'] if unread_msgs else 0,
+        'unread_announcements': unread_ann['cnt'] if unread_ann else 0,
+    })
 
 
 # ════════════════════════════════════════════════════════════
@@ -1831,7 +2086,7 @@ def send_verification_email(user_id, email, full_name):
     send_email(email, "Verify your Shiloh Living email",
         f"""
         <h2>Welcome to Shiloh Living!</h2>
-        <p>Hi {full_name},</p>
+        <p>Hi {h(full_name)},</p>
         <p>Please verify your email address by clicking the link below:</p>
         <p><a href="{link}" style="background:#2D6A4F;color:#fff;padding:12px 24px;border-radius:8px;text-decoration:none;display:inline-block;font-weight:600">
            Verify Email Address
@@ -1853,6 +2108,8 @@ def verify_email():
     if datetime.utcnow() > row['expires_at']:
         execute("DELETE FROM email_verifications WHERE token=%s", (token,))
         return err('Verification link has expired. Please request a new one.', 400)
+    if query("SELECT id FROM users WHERE email=%s AND id!=%s", (row['new_email'], row['user_id']), fetchone=True):
+        return err('That email address is already used by another account.', 409)
     execute("UPDATE users SET email_verified=1, email=%s WHERE id=%s",
             (row['new_email'], row['user_id']))
     execute("DELETE FROM email_verifications WHERE user_id=%s", (row['user_id'],))
@@ -1885,7 +2142,7 @@ def forgot_password():
         link = APP_URL + "/?type=reset&token=" + token
         body = (
             "<h2>Password Reset Request</h2>"
-            "<p>Hi " + user['full_name'] + ",</p>"
+            "<p>Hi " + h(user['full_name']) + ",</p>"
             "<p>We received a request to reset your password. Click below to set a new one:</p>"
             '<p><a href="' + link + '" style="background:#2D6A4F;color:#fff;padding:12px 24px;'
             'border-radius:8px;text-decoration:none;display:inline-block;font-weight:600">'
@@ -1959,17 +2216,9 @@ def change_email():
 @require_auth('landlord')
 def landlord_qr_code():
     lp = get_landlord_profile(g.current_user['id'])
-    if not lp:
-        return err('Landlord profile not found', 404)
     code = lp['landlord_code']
-    register_url = f"{APP_URL}/?register=tenant&code={code}"
-    if not QR_AVAILABLE:
-        return ok({'register_url': register_url, 'landlord_code': code, 'qr_base64': None})
-    img = qrcode.make(register_url)
-    buf = io.BytesIO()
-    img.save(buf, format='PNG')
-    b64 = base64.b64encode(buf.getvalue()).decode()
-    return ok({'register_url': register_url, 'landlord_code': code, 'qr_base64': b64})
+    return ok({'register_url': f'{APP_URL}/join/{code}', 'landlord_code': code,
+               'qr_url': f'/api/join/{code}/qr.png'})
 
 
 # ════════════════════════════════════════════════════════════
@@ -2019,7 +2268,7 @@ def start_support_chat():
     execute("INSERT INTO support_chat_messages (chat_id,sender_id,sender_role,body) VALUES (%s,%s,%s,%s)",
             (cid, u['id'], u['role'], body))
     execute("UPDATE support_chats SET last_message_at=NOW(), subject=%s WHERE id=%s", (subject, cid))
-    admins = query("SELECT id FROM users WHERE role='admin'")
+    admins = query("SELECT id FROM users WHERE role='admin' AND is_active=1")
     for a in admins:
         push_notification(a['id'], f'Support message from {u["full_name"]}', body[:80], 'support')
     return ok({'chat_id': cid}, status=201)
@@ -2054,6 +2303,8 @@ def reply_support_chat(cid):
     if not chat: return err('Chat not found', 404)
     if u['role'] != 'admin' and chat['user_id'] != u['id']:
         return err('Access denied', 403)
+    if chat['status'] != 'open':
+        return err('This chat is closed. Please start a new one.', 409)
     execute("INSERT INTO support_chat_messages (chat_id,sender_id,sender_role,body) VALUES (%s,%s,%s,%s)",
             (cid, u['id'], u['role'], body))
     execute("UPDATE support_chats SET last_message_at=NOW() WHERE id=%s", (cid,))
@@ -2063,7 +2314,7 @@ def reply_support_chat(cid):
         if chat_user:
             send_email_if_opted_in(chat['user_id'], 'email_ticket_reply', chat_user['email'],
                 f'Support replied: {chat["subject"]}',
-                f'<h2>Support Reply</h2><p>{body}</p><p><a href="{APP_URL}">View conversation →</a></p>')
+                f'<h2>Support Reply</h2><p style="white-space:pre-wrap">{h(body)}</p><p><a href="{APP_URL}">View conversation →</a></p>')
     else:
         admins = query("SELECT id FROM users WHERE role='admin'")
         for a in admins:
@@ -2133,7 +2384,8 @@ def admin_update_user(uid):
 def admin_reset_password(uid):
     data = request.get_json() or {}
     new_password = data.get('password', '')
-    if len(new_password) < 8: return err('Password must be at least 8 characters')
+    pw_err = validate_password_strength(new_password)
+    if pw_err: return err(pw_err)
     execute("UPDATE users SET password_hash=%s WHERE id=%s", (hash_password(new_password), uid))
     log_action('ADMIN_RESET_PASSWORD', 'users', uid)
     return ok(msg='Password reset')
@@ -2141,11 +2393,28 @@ def admin_reset_password(uid):
 
 @app.route('/sw.js')
 def service_worker():
-    return send_from_directory(
-        os.path.join(os.path.dirname(__file__), 'static', 'js'),
-        'sw.js',
-        mimetype='application/javascript'
-    )
+    # Served from the root so it controls the whole app (needed for install + push)
+    resp = send_from_directory(os.path.join(BASE_DIR, 'static'), 'sw.js', mimetype='application/javascript')
+    resp.headers['Cache-Control'] = 'no-cache'
+    resp.headers['Service-Worker-Allowed'] = '/'
+    return resp
+
+@app.route('/manifest.webmanifest')
+def web_manifest():
+    resp = send_from_directory(os.path.join(BASE_DIR, 'static'), 'manifest.json',
+                               mimetype='application/manifest+json')
+    resp.headers['Cache-Control'] = 'no-cache'
+    return resp
+
+
+@app.after_request
+def security_headers(resp):
+    resp.headers.setdefault('X-Content-Type-Options', 'nosniff')
+    resp.headers.setdefault('X-Frame-Options', 'DENY')
+    resp.headers.setdefault('Referrer-Policy', 'strict-origin-when-cross-origin')
+    if request.path.startswith('/api/') and request.path != '/api/push/key' and '/qr.png' not in request.path:
+        resp.headers.setdefault('Cache-Control', 'no-store')
+    return resp
 
 
 if __name__ == '__main__':

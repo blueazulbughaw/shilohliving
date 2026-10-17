@@ -29,8 +29,31 @@ After changing app code, always:
    - `--deps` after changing `requirements.txt`
    - `--env` after changing `.env` (secrets live only in `.env`, never committed; keep
      `.env.example` in sync with new variable names)
+   - `--migrate` after adding a `migrations/NNN_*.sql` file: backs the database up to
+     `~/backups` on the server, then `migrations/apply.py` runs each new file once
+     (tracked in `schema_migrations`). Plain statements only — no trigger/procedure bodies.
 
 Don't edit files directly on the server — the next deploy would overwrite them.
+
+## How the app works (things not obvious from the code)
+
+- **Sign-up:** anyone can register as a *landlord*. Tenants can't register on their own —
+  they join through a landlord code (`L…`) or a property code (`P…`), by typing it, opening
+  `/join/CODE`, or scanning its QR (`/api/join/CODE/qr.png`). A tenant can join several
+  landlords/properties and rent several units (`tenant_landlords`, one row per landlord;
+  `property_id` = the property they asked for).
+- **Notifications:** always go through `push_notification()` in `app.py` — it saves the bell
+  notification *and* sends a phone push (Web Push, VAPID keys in `.env`). Don't insert into
+  `notifications` directly or from DB triggers (the old bill/payment triggers were dropped
+  for that reason).
+- **PWA:** `/sw.js` and `/manifest.webmanifest` are served from the site root by `app.py`
+  (the files live in `static/`). Bump `CACHE` in `static/sw.js` when the shell file list changes.
+- **Frontend safety:** anything from the API goes through `esc()` before `innerHTML`, and
+  through `jsArg()` inside `onclick="…"` (see the top of `static/js/app.js`).
+- **Look:** the styling deliberately matches the marketing site (`../shilohliving-site`,
+  paper/green/lime palette, DM Sans + Manrope). Keep the two in step.
+- Uploads (contracts, payment proofs) go to Cloudinary from the browser with an unsigned
+  preset; the API only accepts URLs from our Cloudinary cloud (`CLOUDINARY_CLOUD`).
 
 ## Config
 

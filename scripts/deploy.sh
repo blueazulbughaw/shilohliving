@@ -4,6 +4,7 @@
 #   scripts/deploy.sh            push + deploy HEAD
 #   scripts/deploy.sh --env      also upload the local .env
 #   scripts/deploy.sh --deps     also reinstall requirements.txt on the server
+#   scripts/deploy.sh --migrate  back up the database, then apply new migrations/*.sql
 set -euo pipefail
 
 SSH_HOST="shilzikx@server353.web-hosting.com"
@@ -14,11 +15,12 @@ HEALTH_URL="https://hub.shilohliving.app/api/health"
 
 cd "$(dirname "$0")/.."
 
-UPLOAD_ENV=0; INSTALL_DEPS=0
+UPLOAD_ENV=0; INSTALL_DEPS=0; MIGRATE=0
 for arg in "$@"; do
   case "$arg" in
     --env)  UPLOAD_ENV=1 ;;
     --deps) INSTALL_DEPS=1 ;;
+    --migrate) MIGRATE=1 ;;
     *) echo "Unknown option: $arg" >&2; exit 1 ;;
   esac
 done
@@ -44,6 +46,18 @@ fi
 if [ "$INSTALL_DEPS" = 1 ]; then
   echo "==> Installing requirements"
   ssh "${SSH_OPTS[@]}" "$SSH_HOST" "~/$VENV/pip install -q -r ~/$APP_ROOT/requirements.txt"
+fi
+
+if [ "$MIGRATE" = 1 ]; then
+  echo "==> Backing up database to ~/backups"
+  # .env may have Windows line endings; strip them before reading the DB settings
+  ssh "${SSH_OPTS[@]}" "$SSH_HOST" 'cd ~/'"$APP_ROOT"' && eval "$(tr -d "\r" < .env | grep -E "^DB_[A-Z_]+=" | sed "s/^/export /")" \
+    && mkdir -p ~/backups && umask 077 \
+    && f=~/backups/shiloh-$(date +%Y%m%d-%H%M%S).sql.gz \
+    && mysqldump --single-transaction --routines --triggers --no-tablespaces -h "$DB_HOST" -u "$DB_USER" -p"$DB_PASSWORD" "$DB_NAME" 2>/dev/null | gzip > "$f" \
+    && [ "$(gzip -dc "$f" | head -c 100 | wc -c)" -gt 0 ] && echo "    saved $f"'
+  echo "==> Applying migrations"
+  ssh "${SSH_OPTS[@]}" "$SSH_HOST" "~/$VENV/python ~/$APP_ROOT/migrations/apply.py"
 fi
 
 echo "==> Restarting app"
