@@ -46,6 +46,15 @@ Don't edit files directly on the server — the next deploy would overwrite them
   `app.py`, saved as JSON in `properties.features`; missing keys use the default). To add a
   module, add it there, then check it where it matters (`property_features(...)[key]` on the
   server, `hasFeature(prop, key)` in the UI). The app is meant to grow into a CRM this way.
+- **Past tenants:** completing a move-out with no other unit at that landlord sets
+  `tenant_landlords.is_active=0` (+ `left_at`). Their contracts/bills/payments/threads stay as
+  records; messaging, contracts and announcements require an active link (`still_linked`).
+  Rejoining with the code reactivates them.
+- **PDFs** (`pdfs.py`, fpdf2, fonts in `pdf_fonts/` for the ₱ sign): bill statements and
+  receipts. Approving a payment numbers the receipt (`AR-000123`), pushes/emails it with the PDF
+  and sets `receipt_sent_at`. Receipts say "Acknowledgement Receipt", not a BIR official receipt.
+  PDFs open via `/api/docs/link` → a 10-minute link for that one path (`require_doc_auth`), since
+  a new tab can't send the sign-in header; those tokens are rejected as sign-ins.
 - **Back button:** screens are opened with `goPage(id)` or `showView(page, render)` (for views
   inside a page), which add a browser history entry — so the topbar ‹ Back and the phone's back
   gesture work. Pop-ups are history entries too (back closes them).

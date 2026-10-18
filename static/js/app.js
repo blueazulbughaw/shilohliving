@@ -698,12 +698,32 @@ function badge(status) {
   return `<span class="badge badge-${map[s] || 'gray'}">${esc(s.replace(/_/g, ' '))}</span>`;
 }
 function fmt(val) { if (val === null || val === undefined || val === '') return '—'; return Number(val).toLocaleString(undefined, { minimumFractionDigits: 2, maximumFractionDigits: 2 }); }
-function fmtDate(d) { return d ? new Date(d).toLocaleDateString() : '—'; }
+// Plain dates (due dates, contract dates) arrive as "... 00:00:00 GMT"; show them as that calendar
+// day everywhere instead of shifting a day back in timezones west of UTC.
+function fmtDate(d) {
+  if (!d) return '—';
+  const x = new Date(d);
+  if (isNaN(x)) return '—';
+  return x.toLocaleDateString(undefined, typeof d === 'string' && / 00:00:00 GMT$/.test(d) ? { timeZone: 'UTC' } : {});
+}
 function fmtDateTime(d) { return d ? new Date(d).toLocaleString() : '—'; }
 const MONTHS = ['January', 'February', 'March', 'April', 'May', 'June', 'July', 'August', 'September', 'October', 'November', 'December'];
 const loadingHtml = '<p class="loading">Loading…</p>';
 const errHtml = e => `<p class="err-msg">${esc(e.message)}</p>`;
 
+// Bill statements and receipts: the window opens right away (so it isn't blocked as a pop-up),
+// then goes to a 10-minute link for that one PDF (see /api/docs/link). Print from the PDF viewer.
+async function openPdf(path) {
+  const w = window.open('', '_blank');
+  try {
+    const d = await apiFetch('/docs/link', { method: 'POST', body: JSON.stringify({ path }) });
+    if (w) w.location.href = d.url; else location.href = d.url;
+  } catch (e) { if (w) w.close(); alert(e.message); }
+}
+async function resendReceipt(pid) {
+  try { const d = await apiFetch(`/payments/${pid}/send-receipt`, { method: 'POST' }); alert(`✅ Receipt ${d.receipt_no} sent again.`); }
+  catch (e) { alert(e.message); }
+}
 function openDoc(url) {
   if (!url || !/^https:\/\//.test(url)) { alert('No document available'); return; }
   window.open(url, '_blank', 'noopener,noreferrer');
@@ -1030,62 +1050,263 @@ async function submitAddUnit() {
 }
 
 // ═══════════════════════════════════════════════
-// TENANTS
+// TENANTS — by property, one line per unit with its current tenant; details on tap.
+// Then tenants waiting for a unit, then past tenants (records only).
 // ═══════════════════════════════════════════════
+const byUnit = (a, b) => String(a.unit_number).localeCompare(String(b.unit_number), undefined, { numeric: true });
+const chevron = '<span class="chev" aria-hidden="true">›</span>';
+let _board = null;
 async function loadTenants() {
   const pg = document.getElementById('page-tenants'); pg.innerHTML = loadingHtml;
   try {
-    const tenants = await apiFetch('/landlord/tenants');
-    pg.innerHTML = `<div class="card"><div class="card-header"><h3>Tenants (${tenants.length})</h3>
-      <button class="btn btn-brand" onclick="showLandlordInvite()">👋 Invite Tenants</button></div>
-      ${!tenants.length ? `<div class="empty-state"><div class="icon">👥</div><p>No tenants yet. Share your join code, link or QR code.</p></div>` :
-        `<div class="table-wrap"><table><thead><tr><th>Name</th><th>Contact</th><th>Property / Unit</th><th>Contract</th><th>Actions</th></tr></thead><tbody>
-        ${tenants.map(t => `<tr><td><strong>${esc(t.full_name)}</strong><br><small class="muted-text">Joined ${fmtDate(t.joined_at)}</small></td>
-          <td style="font-size:12px">${esc(t.email)}${t.phone ? '<br>' + esc(t.phone) : ''}</td>
-          <td>${t.unit_number ? `${esc(t.property_name)} — Unit ${esc(t.unit_number)}` : '<span class="muted-text">Not assigned</span>'}</td>
-          <td>${t.contract_status ? badge(t.contract_status) : `<button class="btn btn-sm btn-outline" onclick="showCreateContract(${parseInt(t.id)})">+ Contract</button>`}</td>
-          <td><button class="btn btn-sm btn-info" onclick="showNewThread(${parseInt(t.user_id)})">Message</button></td></tr>`).join('')}
-        </tbody></table></div>`}
-    </div>`;
+    _board = await apiFetch('/landlord/tenant-board');
+    renderTenantBoard();
   } catch (e) { pg.innerHTML = errHtml(e); }
+}
+function renderTenantBoard() {
+  const pg = document.getElementById('page-tenants');
+  const { properties, unassigned, past } = _board;
+  const q = (document.getElementById('tenant-search')?.value || '').trim().toLowerCase();
+  const hit = (...xs) => !q || xs.some(x => String(x || '').toLowerCase().includes(q));
+  const tenantLine = (c) => `
+    <details class="row-toggle">
+      <summary><span class="row-main"><span class="row-unit">${esc(c._unit)}</span><span class="row-name">${esc(c.full_name)}</span></span>
+        <span class="row-flags">${c.status === 'move_out_pending' ? '<span class="badge badge-orange">Moving out</span>' : ''}
+          ${c.overdue > 0 ? `<span class="badge badge-red">${parseInt(c.overdue)} overdue</span>` : ''}${chevron}</span></summary>
+      <div class="row-body">
+        <div class="field-grid">
+          ${field('Contact', `${esc(c.email)}${c.phone ? '<br>' + esc(c.phone) : ''}`)}
+          ${field('Rent', '₱' + fmt(c.monthly_rent) + '/mo')}
+          ${field('Term', c.is_open_term ? 'Open term' : `${fmtDate(c.start_date)} → ${fmtDate(c.end_date)}`)}
+          ${field('Unpaid', '₱' + fmt(c.unpaid))}
+          ${field('Contract', c.contract_doc_url ? (c.tenant_ack ? 'Signed copy · acknowledged' : 'Signed copy · not yet acknowledged') : 'No document uploaded')}
+        </div>
+        <div class="btn-group" style="margin-top:12px">
+          <button class="btn btn-sm btn-brand" onclick="openTenantProfile(${parseInt(c.tenant_id)})">👤 Profile &amp; history</button>
+          <button class="btn btn-sm btn-outline" onclick="showNewThread(${parseInt(c.user_id)})">💬 Message</button>
+        </div>
+      </div>
+    </details>`;
+  const propHtml = properties.map(p => {
+    const units = [...p.units].sort(byUnit);
+    const lines = units.flatMap(u => u.contracts.length
+      ? u.contracts.map(c => ({ ...c, _unit: 'Unit ' + u.unit_number }))
+      : [{ _vacant: true, _unit: 'Unit ' + u.unit_number }]);
+    const shown = lines.filter(l => l._vacant ? !q : hit(l.full_name, l._unit, l.email, l.phone));
+    if (q && !shown.length) return '';
+    const occupied = units.filter(u => u.contracts.length).length;
+    return `<div class="card group-card">
+      <div class="group-head"><h3>🏢 ${esc(p.name)}</h3><span class="muted-text">${occupied}/${units.length} occupied</span></div>
+      ${!units.length ? '<p class="muted-text">No units yet.</p>' : shown.map(l => l._vacant
+        ? `<div class="row-static"><span class="row-main"><span class="row-unit">${esc(l._unit)}</span><span class="row-name muted-text">Vacant</span></span></div>`
+        : tenantLine(l)).join('')}
+    </div>`;
+  }).join('');
+  const waiting = unassigned.filter(t => hit(t.full_name, t.email, t.phone));
+  const gone = past.filter(t => hit(t.full_name, t.email, t.units));
+  pg.innerHTML = `
+    <div class="card"><div class="card-header"><h3>Tenants</h3>
+      <button class="btn btn-brand" onclick="showLandlordInvite()">👋 Invite Tenants</button></div>
+      <input type="search" id="tenant-search" class="search-input" placeholder="Search name, unit, email or phone"
+        value="${esc(q)}" oninput="renderTenantBoard()"/></div>
+    ${propHtml || (!q ? '<div class="card"><div class="empty-state"><div class="icon">🏢</div><p>Add a property and units first.</p></div></div>' : '')}
+    ${waiting.length ? `<div class="card group-card">
+      <div class="group-head"><h3>🕓 Joined — waiting for a unit</h3><span class="muted-text">${waiting.length}</span></div>
+      ${waiting.map(t => `<details class="row-toggle">
+        <summary><span class="row-main"><span class="row-name">${esc(t.full_name)}</span></span><span class="row-flags">${chevron}</span></summary>
+        <div class="row-body">
+          <div class="field-grid">${field('Contact', `${esc(t.email)}${t.phone ? '<br>' + esc(t.phone) : ''}`)}${field('Joined', fmtDate(t.joined_at))}</div>
+          <div class="btn-group" style="margin-top:12px">
+            <button class="btn btn-sm btn-brand" onclick="showCreateContract(${parseInt(t.tenant_id)})">+ Give a Unit (Contract)</button>
+            <button class="btn btn-sm btn-outline" onclick="showNewThread(${parseInt(t.user_id)})">💬 Message</button>
+            <button class="btn btn-sm btn-outline" onclick="openTenantProfile(${parseInt(t.tenant_id)})">👤 Profile</button>
+            <button class="btn btn-sm btn-outline" onclick="archiveTenant(${parseInt(t.tenant_id)})">Move to Past Tenants</button>
+          </div></div></details>`).join('')}
+    </div>` : ''}
+    ${past.length ? `<details class="card group-card past-group">
+      <summary class="group-head"><h3>🗂️ Past tenants</h3><span class="muted-text">${gone.length} ${chevron}</span></summary>
+      <p class="hint" style="margin-bottom:8px">Moved out. Their contracts, bills, payments and messages are kept as records; they can't be messaged.</p>
+      ${gone.map(t => `<details class="row-toggle">
+        <summary><span class="row-main"><span class="row-name">${esc(t.full_name)}</span><span class="row-unit muted-text">${esc(t.units || '')}</span></span>
+          <span class="row-flags"><span class="muted-text small">${t.moved_out ? 'Left ' + fmtDate(t.moved_out) : t.left_at ? 'Left ' + fmtDate(t.left_at) : ''}</span>${chevron}</span></summary>
+        <div class="row-body">
+          <div class="field-grid">${field('Contact', `${esc(t.email)}${t.phone ? '<br>' + esc(t.phone) : ''}`)}${field('Joined', fmtDate(t.joined_at))}${field('Moved out', fmtDate(t.moved_out || t.left_at))}</div>
+          <button class="btn btn-sm btn-outline" style="margin-top:12px" onclick="openTenantProfile(${parseInt(t.tenant_id)})">🗂️ View records</button>
+        </div></details>`).join('')}
+    </details>` : ''}`;
+  const s = document.getElementById('tenant-search');
+  if (q && s) { s.focus(); s.setSelectionRange(s.value.length, s.value.length); }
+}
+async function archiveTenant(tpId) {
+  if (!confirm('Move this tenant to Past Tenants? Their records stay; they can no longer be messaged. They can rejoin with your code.')) return;
+  try { await apiFetch(`/landlord/tenants/${tpId}/archive`, { method: 'POST' }); loadTenants(); }
+  catch (e) { alert(e.message); }
 }
 
 // ═══════════════════════════════════════════════
-// CONTRACTS
+// TENANT PROFILE (CRM) — everything about one tenant, in collapsible, sortable sections
+// ═══════════════════════════════════════════════
+let _profile = null;   // { data, sort: {section: 'desc'|'asc'}, billType }
+function openTenantProfile(tpId) { showView('tenants', () => loadTenantProfile(tpId)); }
+async function loadTenantProfile(tpId) {
+  const pg = document.getElementById('page-tenants'); pg.innerHTML = loadingHtml;
+  try {
+    const data = await apiFetch(`/landlord/tenants/${tpId}/profile`);
+    _profile = { data, sort: { contracts: 'desc', bills: 'desc', payments: 'desc', water: 'desc', threads: 'desc' }, billType: 'all' };
+    renderTenantProfile();
+  } catch (e) { pg.innerHTML = errHtml(e); }
+}
+function sortedBy(list, key, dir) {
+  const v = x => { const d = x[key]; const t = d ? new Date(d).getTime() : 0; return isNaN(t) ? 0 : t; };
+  return [...list].sort((a, b) => dir === 'asc' ? v(a) - v(b) : v(b) - v(a));
+}
+function sortControl(section) {
+  const dir = _profile.sort[section];
+  return `<button class="btn btn-sm btn-outline sort-btn" onclick="event.preventDefault();toggleProfileSort('${section}')">
+    ${dir === 'desc' ? '↓ Newest first' : '↑ Oldest first'}</button>`;
+}
+function toggleProfileSort(section) {
+  _profile.sort[section] = _profile.sort[section] === 'desc' ? 'asc' : 'desc';
+  document.getElementById('ps-' + section).innerHTML = profileSection(section);
+}
+function setBillType(t) { _profile.billType = t; document.getElementById('ps-bills').innerHTML = profileSection('bills'); }
+const step = (label, d, done) => `<span class="tl-step ${done ? 'done' : ''}">${label}${d ? ' · ' + fmtDate(d) : ''}</span>`;
+function profileSection(section) {
+  const { data, sort } = _profile;
+  if (section === 'contracts') {
+    const list = sortedBy(data.contracts, 'start_date', sort.contracts);
+    return list.length ? list.map(c => `<div class="record">
+        <div class="record-top"><strong>${esc(c.property_name)} — Unit ${esc(c.unit_number)}</strong>${badge(c.status)}</div>
+        <div class="record-meta">${c.is_open_term ? 'Open term from ' + fmtDate(c.start_date) : fmtDate(c.start_date) + ' → ' + fmtDate(c.end_date)}
+          · ₱${fmt(c.monthly_rent)}/mo · deposit ₱${fmt(c.deposit)}${c.move_out_date ? ' · moved out ' + fmtDate(c.move_out_date) : ''}</div>
+        ${c.contract_doc_url ? `<div class="btn-group" style="margin-top:6px"><button class="btn btn-sm btn-outline" onclick="openDoc(${jsArg(c.contract_doc_url)})">📄 Signed contract</button>
+          <span class="muted-text small">${c.tenant_ack ? 'Acknowledged ' + fmtDate(c.tenant_ack_at) : 'Not yet acknowledged'}</span></div>` : ''}
+      </div>`).join('') : '<p class="muted-text">No contracts.</p>';
+  }
+  if (section === 'bills') {
+    const types = ['all', 'rent', 'water', 'electricity', 'other'];
+    const list = sortedBy(data.bills.filter(b => _profile.billType === 'all' || b.bill_type === _profile.billType), 'due_date', sort.bills);
+    return `<div class="chip-row">${types.map(t => `<button class="chip ${_profile.billType === t ? 'active' : ''}" onclick="setBillType('${t}')">${t === 'all' ? 'All' : t[0].toUpperCase() + t.slice(1)}</button>`).join('')}</div>
+      ${list.length ? list.map(b => {
+        const approved = b.payment_status === 'approved';
+        return `<div class="record">
+          <div class="record-top"><strong>${esc(b.description)}</strong><span class="btn-group">${badge(b.bill_type)}${badge(b.status)}</span></div>
+          <div class="record-meta">₱${fmt(b.amount)} · due ${fmtDate(b.due_date)} · ${esc(b.property_name)} Unit ${esc(b.unit_number)}</div>
+          <div class="timeline">${step('Issued', b.created_at, true)}${step('Paid', b.paid_at, !!b.paid_at)}${step('Approved', approved ? b.reviewed_at : null, approved)}${step('Receipt sent', b.receipt_sent_at, !!b.receipt_sent_at)}</div>
+          <div class="btn-group" style="margin-top:6px">
+            <button class="btn btn-sm btn-outline" onclick="openPdf('/api/bills/${parseInt(b.id)}/pdf')">🧾 Statement PDF</button>
+            ${approved ? `<button class="btn btn-sm btn-outline" onclick="openPdf('/api/payments/${parseInt(b.payment_id)}/receipt.pdf')">✅ Receipt ${esc(b.receipt_no || '')}</button>` : ''}
+          </div></div>`; }).join('') : '<p class="muted-text">No bills of this type.</p>'}`;
+  }
+  if (section === 'payments') {
+    const list = sortedBy(data.payments, 'paid_at', sort.payments);
+    return list.length ? list.map(p => `<div class="record">
+        <div class="record-top"><strong>₱${fmt(p.amount_paid)}</strong>${badge(p.status)}</div>
+        <div class="record-meta">${esc(p.bill_desc)} · submitted ${fmtDateTime(p.paid_at)}
+          ${p.reviewed_at ? ` · ${esc(p.status)} ${fmtDateTime(p.reviewed_at)}${p.reviewed_by_name ? ' by ' + esc(p.reviewed_by_name) : ''}` : ''}
+          ${p.receipt_no ? ` · receipt ${esc(p.receipt_no)}${p.receipt_sent_at ? ' sent ' + fmtDateTime(p.receipt_sent_at) : ''}` : ''}
+          ${p.notes ? `<br>Note: ${esc(p.notes)}` : ''}</div>
+        <div class="btn-group" style="margin-top:6px">
+          ${p.proof_url ? `<button class="btn btn-sm btn-outline" onclick="openDoc(${jsArg(p.proof_url)})">📎 Proof</button>` : ''}
+          ${p.status === 'approved' ? `<button class="btn btn-sm btn-outline" onclick="openPdf('/api/payments/${parseInt(p.id)}/receipt.pdf')">✅ Receipt</button>
+            <button class="btn btn-sm btn-outline" onclick="resendReceipt(${parseInt(p.id)})">✉️ Resend receipt</button>` : ''}
+        </div></div>`).join('') : '<p class="muted-text">No payments yet.</p>';
+  }
+  if (section === 'water') {
+    const list = [...data.water].sort((a, b) => {
+      const d = (a.session_year * 12 + a.session_month) - (b.session_year * 12 + b.session_month);
+      return sort.water === 'asc' ? d : -d;
+    });
+    return list.length ? `<div class="table-wrap"><table><thead><tr><th>Month</th><th>Unit</th><th>Previous</th><th>Current</th><th>Used</th><th>Amount</th><th>Status</th></tr></thead><tbody>
+      ${list.map(w => `<tr><td>${MONTHS[w.session_month - 1]} ${esc(w.session_year)}</td><td>${esc(w.unit_number)}</td>
+        <td>${fmt(w.prev_reading)}</td><td>${fmt(w.curr_reading)}</td><td>${fmt(w.consumption)} cu</td><td>₱${fmt(w.total_amount)}</td><td>${badge(w.bill_status)}</td></tr>`).join('')}
+      </tbody></table></div>` : '<p class="muted-text">No water readings.</p>';
+  }
+  if (section === 'threads') {
+    const list = sortedBy(data.threads, 'last_reply_at', sort.threads);
+    return list.length ? list.map(t => `<div class="record clickable" onclick="openThread(${parseInt(t.id)})">
+        <div class="record-top"><strong>${esc(t.subject)}</strong><span class="muted-text small">${fmtDate(t.last_reply_at)}</span></div></div>`).join('')
+      : '<p class="muted-text">No conversations.</p>';
+  }
+  return '';
+}
+function renderTenantProfile() {
+  const { data } = _profile; const t = data.tenant; const s = data.summary;
+  const current = !!t.is_active;
+  const sec = (key, title, count, open) => `<details class="card profile-section" ${open ? 'open' : ''}>
+      <summary class="group-head"><h3>${title} <span class="muted-text">(${count})</span></h3><span class="row-flags">${sortControl(key)}${chevron}</span></summary>
+      <div id="ps-${key}">${profileSection(key)}</div></details>`;
+  document.getElementById('page-tenants').innerHTML = `
+    <div class="card">
+      <div class="profile-head">
+        <div class="thread-avatar big">${esc((t.full_name || '?')[0].toUpperCase())}</div>
+        <div style="min-width:0"><h2 class="profile-name">${esc(t.full_name)}</h2>
+          <div class="muted-text">${esc(t.email)}${t.phone ? ' · ' + esc(t.phone) : ''}</div>
+          <div class="btn-group" style="margin-top:6px">${current ? '<span class="badge badge-green">Current tenant</span>' : '<span class="badge badge-gray">Past tenant</span>'}
+            <span class="muted-text small">Joined ${fmtDate(t.joined_at)}${t.left_at ? ' · left ' + fmtDate(t.left_at) : ''}</span></div></div>
+      </div>
+      ${current ? `<div class="btn-group" style="margin-top:14px"><button class="btn btn-sm btn-brand" onclick="showNewThread(${parseInt(t.user_id)})">💬 Message</button></div>`
+        : '<div class="info-box">Records only — this tenant has moved out and can\'t be messaged.</div>'}
+    </div>
+    <div class="stats-grid">
+      <div class="stat-card"><div class="value">₱${fmt(s.total_paid)}</div><div class="label">Total Paid</div></div>
+      <div class="stat-card"><div class="value">₱${fmt(s.unpaid)}</div><div class="label">Unpaid</div></div>
+      <div class="stat-card"><div class="value">${s.on_time_rate === null ? '—' : s.on_time_rate + '%'}</div><div class="label">Paid on Time</div></div>
+      <div class="stat-card"><div class="value">${parseInt(s.overdue_bills)}</div><div class="label">Overdue Bills</div></div>
+    </div>
+    ${sec('bills', '💰 Bills', data.bills.length, true)}
+    ${sec('payments', '💳 Payments', data.payments.length, false)}
+    ${sec('contracts', '📋 Contracts', data.contracts.length, true)}
+    ${sec('water', '💧 Water readings', data.water.length, false)}
+    ${sec('threads', '💬 Conversations', data.threads.length, false)}`;
+}
+
+// ═══════════════════════════════════════════════
+// CONTRACTS — by property and unit: the current contract, with the unit's history under it
 // ═══════════════════════════════════════════════
 let _contracts = [];
 async function loadContracts() {
   const pg = document.getElementById('page-contracts'); pg.innerHTML = loadingHtml;
   try {
     _contracts = await apiFetch('/contracts');
-    pg.innerHTML = `<div class="card"><div class="card-header"><h3>Contracts (${_contracts.length})</h3>
-      <button class="btn btn-brand" onclick="showCreateContract()">+ New Contract</button></div>
-      ${!_contracts.length ? '<div class="empty-state"><p>No contracts yet</p></div>' :
-        `<div class="table-wrap"><table><thead><tr><th>Tenant</th><th>Unit</th><th>Term</th><th>Rent</th><th>Contract Doc</th><th>Status</th><th>Actions</th></tr></thead><tbody>
-        ${_contracts.map(c => { const id = parseInt(c.id); return `<tr>
-          <td><strong>${esc(c.tenant_name)}</strong><br><small class="muted-text">${esc(c.property_name)}</small></td>
-          <td>${esc(c.unit_number)}</td>
-          <td style="font-size:12px">
-            ${c.is_open_term ? '<span class="badge badge-blue">Open Term</span>' : `${fmtDate(c.start_date)} → ${fmtDate(c.end_date)}`}
-            ${c.minimum_months ? `<br><small class="muted-text">Min ${esc(c.minimum_months)} mo</small>` : ''}
-          </td>
-          <td>₱${fmt(c.monthly_rent)}/mo</td>
-          <td style="font-size:12px">
-            ${c.contract_doc_url
-            ? `<button class="btn btn-sm btn-outline" onclick="openDoc(${jsArg(c.contract_doc_url)})">📄 View</button>
-                 ${c.tenant_ack ? '<br><span class="badge badge-green" style="margin-top:4px">Acknowledged</span>' : '<br><span class="badge badge-yellow" style="margin-top:4px">Pending ACK</span>'}`
-            : `<button class="btn btn-sm btn-brand" onclick="uploadContractDoc(${id})">📤 Upload</button>`}
-          </td>
-          <td>${badge(c.status)}</td>
-          <td><div class="btn-group">${c.status === 'active' ? `
-            <button class="btn btn-sm btn-warn" onclick="showExtendContract(${id})">Extend</button>
-            <button class="btn btn-sm btn-red" onclick="showMoveOut(${id})">Move Out</button>
-            ${c.contract_doc_url ? `<button class="btn btn-sm btn-brand" onclick="uploadContractDoc(${id})">Re-upload</button>` : ''}` :
-            c.status === 'move_out_pending' ? `<button class="btn btn-sm btn-warn" onclick="showMoveOutChecklist(${id})">📋 Checklist</button>` : ''}</div></td>
-        </tr>`; }).join('')}
-        </tbody></table></div>`}
-    </div>`;
+    const isCurrent = c => c.status === 'active' || c.status === 'move_out_pending';
+    const props = {};
+    _contracts.forEach(c => {
+      const p = props[c.property_id] = props[c.property_id] || { name: c.property_name, units: {} };
+      (p.units[c.unit_id] = p.units[c.unit_id] || { unit_number: c.unit_number, list: [] }).list.push(c);
+    });
+    const body = Object.values(props).sort((a, b) => a.name.localeCompare(b.name)).map(p => `
+      <div class="card group-card"><div class="group-head"><h3>🏢 ${esc(p.name)}</h3></div>
+        ${Object.values(p.units).sort(byUnit).map(u => {
+          const cur = u.list.filter(isCurrent);
+          const hist = sortedBy(u.list.filter(c => !isCurrent(c)), 'start_date', 'desc');
+          return `<div class="unit-block">
+            <div class="unit-title">Unit ${esc(u.unit_number)} ${cur.length ? '' : '<span class="muted-text">· vacant</span>'}</div>
+            ${cur.map(c => contractCard(c)).join('')}
+            ${hist.length ? `<details class="history"><summary>History (${hist.length}) ${chevron}</summary>${hist.map(c => contractCard(c)).join('')}</details>` : ''}
+          </div>`; }).join('')}
+      </div>`).join('');
+    pg.innerHTML = `<div class="card"><div class="card-header"><h3>Contracts</h3>
+        <button class="btn btn-brand" onclick="showCreateContract()">+ New Contract</button></div>
+        <p class="muted-text">Each contract belongs to a unit. Ended contracts stay in the unit's history.</p></div>
+      ${body || '<div class="card"><div class="empty-state"><p>No contracts yet</p></div></div>'}`;
   } catch (e) { pg.innerHTML = errHtml(e); }
+}
+function contractCard(c) {
+  const id = parseInt(c.id);
+  return `<div class="record">
+    <div class="record-top"><strong class="link" onclick="openTenantProfile(${parseInt(c.tenant_id)})">${esc(c.tenant_name)}</strong>${badge(c.status)}</div>
+    <div class="record-meta">${c.is_open_term ? 'Open term from ' + fmtDate(c.start_date) : fmtDate(c.start_date) + ' → ' + fmtDate(c.end_date)}
+      ${c.minimum_months ? ` · min ${esc(c.minimum_months)} mo` : ''} · ₱${fmt(c.monthly_rent)}/mo
+      ${c.contract_doc_url ? ` · signed copy ${c.tenant_ack ? '(acknowledged)' : '(awaiting acknowledgement)'}` : ''}</div>
+    <div class="btn-group" style="margin-top:6px">
+      ${c.contract_doc_url ? `<button class="btn btn-sm btn-outline" onclick="openDoc(${jsArg(c.contract_doc_url)})">📄 View</button>` : ''}
+      ${c.status === 'active' ? `
+        <button class="btn btn-sm btn-outline" onclick="uploadContractDoc(${id})">📤 ${c.contract_doc_url ? 'Re-upload' : 'Upload signed copy'}</button>
+        <button class="btn btn-sm btn-warn" onclick="showExtendContract(${id})">Extend</button>
+        <button class="btn btn-sm btn-red" onclick="showMoveOut(${id})">Move Out</button>` : ''}
+      ${c.status === 'move_out_pending' ? `<button class="btn btn-sm btn-warn" onclick="showMoveOutChecklist(${id})">📋 Move-out checklist</button>` : ''}
+    </div></div>`;
 }
 
 async function showCreateContract(tenantId) {
@@ -1223,8 +1444,10 @@ async function saveMoveOutChecklist(contractId) {
 async function completeMoveOut(contractId) {
   if (!confirm('Complete move-out? This will mark the unit as vacant.')) return;
   try {
-    await apiFetch('/contracts/' + contractId + '/complete-move-out', { method: 'POST', body: '{}' });
-    closeModalDirect(); alert('✅ Move-out complete. Unit is now vacant.'); loadContracts();
+    const d = await apiFetch('/contracts/' + contractId + '/complete-move-out', { method: 'POST', body: '{}' });
+    closeModalDirect();
+    alert('✅ Move-out complete. Unit is now vacant.' + (d && d.archived ? ' The tenant is now in Past Tenants — their records are kept.' : ''));
+    loadContracts();
   } catch (e) { alert(e.message); }
 }
 function showExtendContract(id) {
@@ -1249,10 +1472,12 @@ async function loadBills() {
       <div class="btn-group"><button class="btn btn-outline" onclick="generateMonthly()">⚡ Generate Monthly Rent</button>
       <button class="btn btn-brand" onclick="showCreateBill()">+ Add Bill</button></div></div>
       ${!bills.length ? '<div class="empty-state"><p>No bills yet</p></div>' :
-        `<div class="table-wrap"><table><thead><tr><th>Tenant</th><th>Type</th><th>Description</th><th>Amount</th><th>Due</th><th>Status</th></tr></thead><tbody>
+        `<div class="table-wrap"><table><thead><tr><th>Tenant</th><th>Type</th><th>Description</th><th>Amount</th><th>Due</th><th>Status</th><th>Documents</th></tr></thead><tbody>
         ${bills.map(b => `<tr><td><strong>${esc(b.tenant_name)}</strong><br><small>${esc(b.property_name)} · ${esc(b.unit_number)}</small></td>
           <td>${badge(b.bill_type || 'rent')}</td><td>${esc(b.description)}</td>
-          <td>₱${fmt(b.amount)}</td><td>${fmtDate(b.due_date)}</td><td>${badge(b.status)}</td></tr>`).join('')}
+          <td>₱${fmt(b.amount)}</td><td>${fmtDate(b.due_date)}</td><td>${badge(b.status)}</td>
+          <td><div class="btn-group"><button class="btn btn-sm btn-outline" onclick="openPdf('/api/bills/${parseInt(b.id)}/pdf')">🧾 PDF</button>
+            ${b.payment_status === 'approved' ? `<button class="btn btn-sm btn-outline" onclick="openPdf('/api/payments/${parseInt(b.payment_id)}/receipt.pdf')">✅ Receipt</button>` : ''}</div></td></tr>`).join('')}
         </tbody></table></div>`}
     </div>`;
   } catch (e) { pg.innerHTML = errHtml(e); }
@@ -1297,8 +1522,13 @@ async function submitCreateBill() {
     contract_id: v('m-b-contract'), description: v('m-b-desc').trim(), bill_type: v('m-b-type'),
     bill_month: v('m-b-month'), bill_year: v('m-b-year'), amount: v('m-b-amt'), due_date: v('m-b-due')
   };
-  try { await apiFetch('/bills', { method: 'POST', body: JSON.stringify(body) }); closeModalDirect(); loadBills(); }
-  catch (e) { document.getElementById('m-b-err').textContent = e.message; }
+  try {
+    const d = await apiFetch('/bills', { method: 'POST', body: JSON.stringify(body) });
+    loadBills();
+    openModal('Bill created', `<div class="info-box">The tenant has been notified. You can open the billing statement as a PDF to print or send.</div>`,
+      `<button class="btn btn-outline" onclick="closeModalDirect()">Done</button>
+       <button class="btn btn-brand" onclick="openPdf('/api/bills/${parseInt(d.bill_id)}/pdf')">🧾 Open / Print PDF</button>`);
+  } catch (e) { document.getElementById('m-b-err').textContent = e.message; }
 }
 
 // ═══════════════════════════════════════════════
@@ -1317,13 +1547,18 @@ async function loadPayments() {
           <td><div class="btn-group">${p.status === 'pending' ? `
             <button class="btn btn-sm btn-green" onclick="reviewPayment(${parseInt(p.id)},'approve')">✓ Approve</button>
             <button class="btn btn-sm btn-red" onclick="rejectPaymentModal(${parseInt(p.id)})">✗ Reject</button>` : ''}
-            ${p.proof_url ? `<button class="btn btn-sm btn-outline" onclick="openDoc(${jsArg(p.proof_url)})">📎 Proof</button>` : ''}</div></td></tr>`).join('')}
+            ${p.proof_url ? `<button class="btn btn-sm btn-outline" onclick="openDoc(${jsArg(p.proof_url)})">📎 Proof</button>` : ''}
+            ${p.status === 'approved' ? `<button class="btn btn-sm btn-outline" onclick="openPdf('/api/payments/${parseInt(p.id)}/receipt.pdf')">✅ ${esc(p.receipt_no || 'Receipt')}</button>
+              <button class="btn btn-sm btn-outline" onclick="resendReceipt(${parseInt(p.id)})" title="${p.receipt_sent_at ? 'Sent ' + esc(fmtDateTime(p.receipt_sent_at)) : 'Not sent yet'}">✉️ Resend</button>` : ''}</div></td></tr>`).join('')}
         </tbody></table></div>`}
     </div>`;
   } catch (e) { pg.innerHTML = errHtml(e); }
 }
 async function reviewPayment(id, action) {
-  try { await apiFetch('/payments/' + id + '/' + action, { method: 'PATCH', body: '{}' }); } catch (e) { alert(e.message); }
+  try {
+    const d = await apiFetch('/payments/' + id + '/' + action, { method: 'PATCH', body: '{}' });
+    if (d && d.receipt_no) alert(`✅ Approved. Receipt ${d.receipt_no} was sent to the tenant.`);
+  } catch (e) { alert(e.message); }
   loadPayments();
 }
 function rejectPaymentModal(id) {
@@ -1465,9 +1700,10 @@ async function openThread(tid) {
         <div class="bname">${mine ? 'You' : esc(r.sender_name)}</div>
         <div class="btext">${esc(r.body)}</div><div class="btime">${fmtDateTime(r.sent_at)}</div></div>`; }).join('')}
     </div>
-    <div style="margin-top:12px"><textarea id="reply-body" rows="3" placeholder="Type your reply…"></textarea></div>`,
+    ${t.read_only ? '<div class="info-box" style="margin-top:12px">This tenant has moved out. The conversation is kept as a record.</div>'
+      : '<div style="margin-top:12px"><textarea id="reply-body" rows="3" placeholder="Type your reply…"></textarea></div>'}`,
     `<button class="btn btn-outline" onclick="closeModalDirect()">Close</button>
-     <button class="btn btn-brand" onclick="submitReplyThread(${parseInt(tid)})">Send Reply</button>`);
+     ${t.read_only ? '' : `<button class="btn btn-brand" onclick="submitReplyThread(${parseInt(tid)})">Send Reply</button>`}`);
   setTimeout(() => { const cw = document.getElementById('chat-wrap'); if (cw) cw.scrollTop = cw.scrollHeight; }, 50);
   loadNotifications();
 }
@@ -2001,7 +2237,9 @@ async function loadTenantBills() {
         `<div class="table-wrap"><table><thead><tr><th>Description</th><th>Property</th><th>Type</th><th>Amount</th><th>Due</th><th>Status</th><th>Action</th></tr></thead><tbody>
         ${_bills.map(b => `<tr><td>${esc(b.description)}</td><td>${esc(b.property_name)} · ${esc(b.unit_number)}<br><small class="muted-text">${esc(b.landlord_name)}</small></td>
           <td>${badge(b.bill_type || 'rent')}</td><td>₱${fmt(b.amount)}</td><td>${fmtDate(b.due_date)}</td><td>${badge(b.status)}</td>
-          <td>${payButton(b, 'Pay Now')}</td></tr>`).join('')}
+          <td><div class="btn-group">${payButton(b, 'Pay Now')}
+            <button class="btn btn-sm btn-outline" onclick="openPdf('/api/bills/${parseInt(b.id)}/pdf')">🧾 Statement</button>
+            ${b.payment_status === 'approved' ? `<button class="btn btn-sm btn-outline" onclick="openPdf('/api/payments/${parseInt(b.payment_id)}/receipt.pdf')">✅ Receipt</button>` : ''}</div></td></tr>`).join('')}
         </tbody></table></div>`}
     </div>`;
   } catch (e) { pg.innerHTML = errHtml(e); }
