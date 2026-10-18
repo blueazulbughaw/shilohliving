@@ -30,24 +30,28 @@ async function apiFetch(path, opts = {}) {
     logout(true);
     throw new Error('Your session has ended. Please sign in again.');
   }
+  if (res.status === 402) refreshPlanBanner();
   if (!res.ok) throw new Error(json.message || 'Request failed');
   return json.data !== undefined ? json.data : json;
 }
 
 // ═══════════════════════════════════════════════
 // ENTRY LINKS — /join/CODE (tenant join link / QR), old ?register=tenant&code=X links,
-// and ?open=page from a tapped phone notification
+// /invite/CODE (a landlord invite from the admin), and ?open=page from a tapped phone notification
 // ═══════════════════════════════════════════════
 let PENDING_JOIN_CODE = null;
 let PENDING_OPEN_PAGE = null;
+let PENDING_INVITE_CODE = null;
 (function captureEntryIntent() {
   const params = new URLSearchParams(location.search);
   const m = location.pathname.match(/^\/join\/([A-Za-z0-9]{8})\/?$/);
+  const inv = location.pathname.match(/^\/invite\/([A-Za-z0-9]{8})\/?$/);
+  if (inv) PENDING_INVITE_CODE = inv[1].toUpperCase();
   if (m) PENDING_JOIN_CODE = m[1].toUpperCase();
   else if (params.get('register') === 'tenant' && params.get('code')) PENDING_JOIN_CODE = params.get('code').toUpperCase();
   if (params.get('open')) PENDING_OPEN_PAGE = params.get('open');
   if (params.get('notif')) apiFetchQuiet('/notifications/' + parseInt(params.get('notif')) + '/read', { method: 'PATCH' });
-  if (m || params.get('register') || params.get('open') || params.get('source')) history.replaceState(null, '', '/');
+  if (m || inv || params.get('register') || params.get('open') || params.get('source')) history.replaceState(null, '', '/');
 })();
 function apiFetchQuiet(path, opts) { if (token) apiFetch(path, opts).catch(() => { }); }
 
@@ -337,12 +341,22 @@ function showLandlordRegister() {
   authCard(`
     <h2 class="auth-title">Register as a Landlord</h2>
     <p class="center muted-text" style="margin-bottom:14px">Manage your properties, tenants, bills and payments. Tenants join you with your code — they don't register here.</p>
+    <p class="info-box" id="reg-trial" hidden></p>
     <form onsubmit="event.preventDefault();doRegister('landlord')">
+      <div class="form-group" id="reg-invite-group"><label>Invite Code</label>
+        <input type="text" id="reg-invite" maxlength="8" value="${esc(PENDING_INVITE_CODE || '')}" placeholder="e.g. I7KX9MFA" class="code-input" autocomplete="off"/>
+        <small class="hint">Sign-up is invite-only for now. Ask Shiloh Living support for a code.</small></div>
       ${registerFields('<div class="form-group"><label>Business Name (optional)</label><input type="text" id="reg-biz" autocomplete="organization"/></div>')}
       <button class="btn-primary" type="submit" id="reg-btn">Create Landlord Account</button>
     </form>
     <p class="err-msg" id="reg-err"></p>
     <button class="btn-link" onclick="showLogin()">← Back to Sign In</button>`);
+  apiFetch('/auth/signup-info').then(info => {
+    const grp = document.getElementById('reg-invite-group');
+    if (grp && !info.invite_only) grp.hidden = true;
+    const trial = document.getElementById('reg-trial');
+    if (trial && info.trial_days) { trial.textContent = `Free for ${info.trial_days} days — no card needed.`; trial.hidden = false; }
+  }).catch(() => { });
 }
 
 // ═══════════════════════════════════════════════
@@ -404,12 +418,13 @@ async function doRegister(role) {
     phone: document.getElementById('reg-phone').value.trim(),
     business_name: (document.getElementById('reg-biz')?.value || '').trim(),
     landlord_code: role === 'tenant' ? PENDING_JOIN_CODE : '',
+    invite_code: role === 'landlord' ? (document.getElementById('reg-invite')?.value || '').trim().toUpperCase() : '',
   };
   if (!body.full_name || !body.email) { errEl.textContent = 'Name and email are required'; return; }
   const btn = document.getElementById('reg-btn'); btn.disabled = true;
   try {
     saveSession(await apiFetch('/auth/register', { method: 'POST', body: JSON.stringify(body) }));
-    PENDING_JOIN_CODE = null; _joinInfo = null;   // the account is already linked to the landlord
+    PENDING_JOIN_CODE = null; _joinInfo = null; PENDING_INVITE_CODE = null;   // the account is already linked / the invite used
     showVerifyGate();
   } catch (e) { errEl.textContent = e.message; btn.disabled = false; }
 }
@@ -529,6 +544,32 @@ function initApp() {
 }
 
 let NAV = {};   // page id -> { label, fn }
+
+// ── PLAN BANNER (landlords) ──
+// Trial days left, or — once the trial ended unpaid — that changes are paused and how to pay.
+function showPlanBanner(sub) {
+  const el = document.getElementById('plan-banner');
+  if (!el) return;
+  if (!sub || sub.state === 'exempt' || (sub.state === 'paid' && sub.days_left > 7)) { el.hidden = true; return; }
+  const pay = sub.pay_info ? `<div style="margin-top:4px">${esc(sub.pay_info)}</div>` : '';
+  const support = `<a href="#" onclick="event.preventDefault();goPage('support')">Message Support</a>`;
+  let html;
+  if (sub.state === 'expired') {
+    html = `<div class="warn-box"><strong>Your free trial has ended.</strong> You can still view everything, but changes are paused until you subscribe.${pay}<div style="margin-top:4px">${support} once you've paid and we'll switch you on.</div></div>`;
+  } else if (sub.state === 'trial') {
+    html = `<div class="info-box">Free trial: <strong>${esc(sub.days_left)} day${sub.days_left === 1 ? '' : 's'} left</strong>.${pay}</div>`;
+  } else {
+    html = `<div class="info-box">Your plan renews in <strong>${esc(sub.days_left)} day${sub.days_left === 1 ? '' : 's'}</strong>.${pay}</div>`;
+  }
+  el.innerHTML = html; el.hidden = false;
+}
+let _planRefreshing = false;
+function refreshPlanBanner() {
+  if (_planRefreshing || !currentUser || currentUser.role !== 'landlord') return;
+  _planRefreshing = true;
+  apiFetch('/auth/me').then(me => { if (me && me.profile) showPlanBanner(me.profile.subscription); })
+    .catch(() => { }).finally(() => { _planRefreshing = false; });
+}
 function launchApp() {
   document.getElementById('auth-screen').style.display = 'none';
   document.getElementById('app-screen').style.display = 'block';
@@ -538,6 +579,7 @@ function launchApp() {
   _navEntries = []; _navIdx = -1;
   buildNav();
   if (currentUser.role === 'landlord') refreshPropertyFeatureNav();
+  showPlanBanner(currentUser.role === 'landlord' && currentUser.profile ? currentUser.profile.subscription : null);
   loadNotifications();
   clearInterval(window._notifTimer);
   window._notifTimer = setInterval(loadNotifications, 60000);
@@ -576,6 +618,7 @@ function buildNav() {
     { id: 'admin-stats', icon: '📊', label: 'Overview', fn: loadAdminStats },
     { id: 'admin-landlords', icon: '🏠', label: 'Landlords', fn: loadAdminLandlords },
     { id: 'admin-tenants', icon: '👥', label: 'Tenants', fn: loadAdminTenants },
+    { id: 'admin-invites', icon: '✉️', label: 'Invites', fn: loadAdminInvites },
     { id: 'admin-tickets', icon: '🎫', label: 'Support Tickets', fn: loadAdminTickets },
     { id: 'admin-chat', icon: '💬', label: 'Live Chat', fn: loadAdminChat },
     { id: 'admin-audit', icon: '📝', label: 'Audit Log', fn: loadAdminAudit },
@@ -2441,14 +2484,101 @@ async function loadAdminLandlords() {
   try {
     const rows = await apiFetch('/admin/landlords');
     pg.innerHTML = `<div class="card"><div class="card-header"><h3>Landlords (${rows.length})</h3></div>
-      <div class="table-wrap"><table><thead><tr><th>Name</th><th>Email</th><th>Code</th><th>Props</th><th>Tenants</th><th>Status</th><th>Actions</th></tr></thead><tbody>
+      <div class="table-wrap"><table><thead><tr><th>Name</th><th>Email</th><th>Code</th><th>Props</th><th>Tenants</th><th>Plan</th><th>Status</th><th>Actions</th></tr></thead><tbody>
       ${rows.map(r => `<tr>
         <td><strong>${esc(r.full_name)}</strong><br><small class="muted-text">${esc(r.business_name || '')}</small></td>
         <td style="font-size:12px">${esc(r.email)}</td><td><code>${esc(r.landlord_code)}</code></td>
         <td>${esc(r.properties)}</td><td>${esc(r.tenants)}</td>
+        <td>${planLabel(r.plan)}<br><button class="btn btn-sm btn-outline" style="margin-top:4px" onclick="adminEditPlan(${parseInt(r.id)}, ${jsArg(r.full_name)}, ${jsArg(r.plan)})">Change</button></td>
         <td>${r.is_active ? badge('active') : badge('suspended')}</td><td>${adminUserActions(r, 'landlord')}</td></tr>`).join('')}
       </tbody></table></div></div>`;
   } catch (e) { pg.innerHTML = errHtml(e); }
+}
+function planLabel(p) {
+  if (!p) return '—';
+  const cls = { exempt: 'blue', paid: 'green', trial: 'yellow', expired: 'red' }[p.state] || 'gray';
+  const name = { exempt: 'free', paid: 'paid', trial: 'trial', expired: 'trial ended' }[p.state] || p.state;
+  const when = p.state === 'paid' ? ` to ${fmtDate(p.paid_until)}` : p.state === 'trial' ? ` · ${p.days_left}d left` : '';
+  return `<span class="badge badge-${cls}">${esc(name + when)}</span>`;
+}
+function adminEditPlan(uid, name, plan) {
+  plan = plan || {};
+  openModal('Plan: ' + name, `
+    <p class="muted-text" style="margin-bottom:10px">Now: ${planLabel(plan)}</p>
+    <div class="form-group"><label>Paid until</label>
+      <input type="date" id="ap-paid" value="${esc((plan.paid_until || '').slice(0, 10))}"/>
+      <small class="hint">After they pay you, set the last day their payment covers. Clear it to remove.</small></div>
+    <div class="form-group"><label>Give more trial days</label>
+      <input type="number" id="ap-extend" min="0" max="365" placeholder="e.g. 7"/></div>
+    <div class="form-group"><label><input type="checkbox" id="ap-exempt" ${plan.state === 'exempt' ? 'checked' : ''}/> Free forever (family, friends, early testers)</label></div>
+    <p class="err-msg" id="ap-err"></p>`,
+    `<button class="btn btn-outline" onclick="closeModalDirect()">Cancel</button>
+     <button class="btn btn-brand" onclick="submitAdminPlan(${parseInt(uid)})">Save</button>`);
+}
+async function submitAdminPlan(uid) {
+  const errEl = document.getElementById('ap-err'); errEl.textContent = '';
+  const body = {
+    paid_until: document.getElementById('ap-paid').value || null,
+    billing_exempt: document.getElementById('ap-exempt').checked,
+  };
+  const extend = parseInt(document.getElementById('ap-extend').value);
+  if (extend > 0) body.extend_trial_days = extend;
+  try {
+    await apiFetch('/admin/landlords/' + uid + '/subscription', { method: 'PATCH', body: JSON.stringify(body) });
+    closeModalDirect(); loadAdminLandlords();
+  } catch (e) { errEl.textContent = e.message; }
+}
+
+async function loadAdminInvites() {
+  const pg = document.getElementById('page-admin-invites'); pg.innerHTML = loadingHtml;
+  try {
+    const rows = await apiFetch('/admin/invites');
+    const status = r => r.used_at ? `<span class="badge badge-green">used</span><br><small>${esc(r.used_by_name || '')} ${esc(r.used_by_email || '')}</small>`
+      : r.revoked_at ? badge('revoked') : badge('open');
+    const link = code => location.origin + '/invite/' + code;
+    pg.innerHTML = `<div class="card"><div class="card-header"><h3>Invite a landlord</h3></div>
+      <div class="info-box">Landlord sign-up is invite-only. Each code works once. "Free forever" skips the trial clock — use it for family and early testers.</div>
+      <div class="grid-2">
+        <div class="form-group"><label>Email (optional — only this email can use it)</label><input type="email" id="inv-email"/></div>
+        <div class="form-group"><label>Note (who it's for)</label><input type="text" id="inv-note" maxlength="255" placeholder="e.g. Mom"/></div>
+      </div>
+      <div class="form-group"><label><input type="checkbox" id="inv-free"/> Free forever</label>
+        <label style="margin-left:16px"><input type="checkbox" id="inv-send"/> Email them the link</label></div>
+      <button class="btn btn-brand" onclick="createInvite()">Create Invite</button>
+      <p class="err-msg" id="inv-err"></p>
+    </div>
+    <div class="card"><div class="card-header"><h3>Invites (${rows.length})</h3></div>
+      ${!rows.length ? '<div class="empty-state"><p>No invites yet</p></div>' : `
+      <div class="table-wrap"><table><thead><tr><th>Code</th><th>For</th><th>Plan</th><th>Status</th><th>Actions</th></tr></thead><tbody>
+      ${rows.map(r => `<tr>
+        <td><code>${esc(r.code)}</code></td>
+        <td>${esc(r.note || '')}<br><small class="muted-text">${esc(r.email || 'any email')}</small></td>
+        <td>${r.free_forever ? '<span class="badge badge-blue">free forever</span>' : '<span class="badge badge-yellow">trial</span>'}</td>
+        <td>${status(r)}</td>
+        <td>${r.used_at || r.revoked_at ? '' : `<div class="btn-group">
+          <button class="btn btn-sm btn-outline" onclick="copyText(${jsArg(link(r.code))}, 'Invite link copied!')">📋 Copy Link</button>
+          <button class="btn btn-sm btn-red" onclick="revokeInvite(${parseInt(r.id)})">Revoke</button></div>`}</td></tr>`).join('')}
+      </tbody></table></div>`}</div>`;
+  } catch (e) { pg.innerHTML = errHtml(e); }
+}
+async function createInvite() {
+  const errEl = document.getElementById('inv-err'); errEl.textContent = '';
+  const body = {
+    email: document.getElementById('inv-email').value.trim(),
+    note: document.getElementById('inv-note').value.trim(),
+    free_forever: document.getElementById('inv-free').checked,
+    send_email: document.getElementById('inv-send').checked,
+  };
+  try {
+    const d = await apiFetch('/admin/invites', { method: 'POST', body: JSON.stringify(body) });
+    await copyText(d.link, `Invite ${d.code} created — link copied!${d.emailed ? ' Email sent.' : ''}`);
+    loadAdminInvites();
+  } catch (e) { errEl.textContent = e.message; }
+}
+async function revokeInvite(id) {
+  if (!confirm('Revoke this invite? The code will stop working.')) return;
+  try { await apiFetch('/admin/invites/' + id, { method: 'DELETE' }); } catch (e) { alert(e.message); }
+  loadAdminInvites();
 }
 async function loadAdminTenants() {
   const pg = document.getElementById('page-admin-tenants'); pg.innerHTML = loadingHtml;
@@ -2634,6 +2764,9 @@ async function submitAdminEditUser(uid, role) {
   }
 
   if (token && currentUser) { initApp(); return; }
+
+  // A landlord invite link opened while signed out: straight to landlord sign-up, code filled in
+  if (PENDING_INVITE_CODE) { showLandlordRegister(); return; }
 
   // A tenant join link / QR opened while signed out: show who it's for, then sign up
   if (PENDING_JOIN_CODE) {

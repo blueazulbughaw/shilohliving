@@ -47,6 +47,11 @@ CLOUDINARY_URL_PREFIX = 'https://res.cloudinary.com/' + os.environ.get('CLOUDINA
 VAPID_PUBLIC_KEY  = os.environ.get('VAPID_PUBLIC_KEY', '')
 VAPID_PRIVATE_KEY = os.environ.get('VAPID_PRIVATE_KEY', '')
 VAPID_SUBJECT     = os.environ.get('VAPID_SUBJECT', 'mailto:' + SUPPORT_EMAIL)
+# Landlord sign-up: 'invite' needs an admin invite code, 'open' lets anyone register
+SIGNUP_MODE   = os.environ.get('SIGNUP_MODE', 'invite').strip().lower()
+TRIAL_DAYS    = int(os.environ.get('TRIAL_DAYS', 7))
+# How to pay once the trial ends (shown to the landlord), e.g. price + GCash number
+SUBSCRIPTION_PAY_INFO = os.environ.get('SUBSCRIPTION_PAY_INFO', '')
 
 # The SPA is served from the same origin; only the app's own URL may call the API cross-site.
 CORS(app, resources={r"/api/*": {"origins": [APP_URL]}})
@@ -236,6 +241,34 @@ def _gen_code(prefix, exists_sql):
 def gen_landlord_code():
     return _gen_code('L', "SELECT id FROM landlord_profiles WHERE landlord_code=%s")
 
+def gen_invite_code():
+    return _gen_code('I', "SELECT id FROM invites WHERE code=%s")
+
+def subscription_status(lp):
+    """A landlord's plan: state is exempt / paid / trial / expired. Only 'expired' blocks changes."""
+    now = datetime.now()
+    trial_end, paid_until = lp.get('trial_ends_at'), lp.get('paid_until')
+    if lp.get('billing_exempt'):
+        state, ends = 'exempt', None
+    elif paid_until and paid_until >= now.date():
+        state, ends = 'paid', datetime.combine(paid_until + timedelta(days=1), datetime.min.time())
+    elif trial_end and trial_end > now:
+        state, ends = 'trial', trial_end
+    else:
+        state, ends = 'expired', None
+    # Part of a day counts as a day: a 7-day trial reads "7 days left" right after sign-up
+    days_left = -(-(ends - now) // timedelta(days=1)) if ends else None
+    return {'state': state, 'trial_ends_at': fmt_dt(trial_end), 'paid_until': fmt_dt(paid_until),
+            'days_left': days_left, 'pay_info': SUBSCRIPTION_PAY_INFO}
+
+def fmt_dt(v):
+    return v.isoformat() if v else None
+
+# What a landlord can still do after the trial ends: sign-in/account, support, notifications, opening PDFs.
+# Every GET (viewing) also stays allowed, so nobody loses sight of their records.
+BILLING_FREE_PATHS = ('/api/auth/', '/api/support-chat', '/api/tickets', '/api/notifications',
+                      '/api/notification-preferences', '/api/push/', '/api/docs/link')
+
 def resolve_join_code(code):
     """A landlord's join code (L + 7 chars) -> their landlord profile, or None."""
     code = (code or '').strip().upper()
@@ -286,6 +319,13 @@ def require_auth(*roles):
             if roles and user['role'] not in roles:
                 return err('Access denied', 403)
             g.current_user = user
+            # Trial over and not paid: landlords can still look at everything, but not change it
+            if (user['role'] == 'landlord' and request.method != 'GET'
+                    and not request.path.startswith(BILLING_FREE_PATHS)):
+                lp = get_landlord_profile(user['id'])
+                if lp and subscription_status(lp)['state'] == 'expired':
+                    return err('Your free trial has ended. You can still view everything; '
+                               'subscribe to keep making changes.', 402)
             return f(*args, **kwargs)
         return wrapper
     return decorator
@@ -421,6 +461,7 @@ def register():
     phone     = data.get('phone', '')
     lcode     = (data.get('landlord_code') or '').strip().upper()
     biz_name  = data.get('business_name', '')
+    icode     = (data.get('invite_code') or '').strip().upper()
 
     if not email or not password or not full_name:
         return err('Email, password, and full name are required')
@@ -435,9 +476,20 @@ def register():
         return err('Email already registered', 409)
 
     if len(full_name) > 150: return err('Name is too long')
-    # Anyone can open a landlord account; tenants only join through a landlord's code or link
+    # Landlords need an admin invite code (SIGNUP_MODE=invite); tenants only join through a landlord's code or link
     landlord_profile = None
-    if role == 'tenant':
+    invite = None
+    if role == 'landlord' and SIGNUP_MODE == 'invite':
+        if not icode: return err('Landlord sign-up is invite-only for now. Enter your invite code.')
+        invite = query("SELECT * FROM invites WHERE code=%s AND used_at IS NULL AND revoked_at IS NULL",
+                       (icode,), fetchone=True)
+        if not invite: return err('That invite code is not valid or was already used', 404)
+        if invite['email'] and invite['email'].lower() != email:
+            return err('This invite is for a different email address', 403)
+        # Claim it first so two people can't use one code at the same moment
+        _, claimed = execute("UPDATE invites SET used_at=NOW() WHERE id=%s AND used_at IS NULL", (invite['id'],))
+        if not claimed: return err('That invite code was already used', 409)
+    elif role == 'tenant':
         if not lcode: return err('Tenants need a join code from their landlord to sign up')
         landlord_profile = resolve_join_code(lcode)
         if not landlord_profile: return err('Invalid join code — check it with your landlord', 404)
@@ -449,8 +501,11 @@ def register():
 
     if role == 'landlord':
         code = gen_landlord_code()
-        execute("INSERT INTO landlord_profiles (user_id,landlord_code,business_name) VALUES (%s,%s,%s)",
-                (uid, code, biz_name))
+        execute("""INSERT INTO landlord_profiles (user_id,landlord_code,business_name,trial_ends_at,billing_exempt)
+                   VALUES (%s,%s,%s,NOW() + INTERVAL %s DAY,%s)""",
+                (uid, code, biz_name, TRIAL_DAYS, 1 if invite and invite['free_forever'] else 0))
+        if invite:
+            execute("UPDATE invites SET used_by=%s WHERE id=%s", (uid, invite['id']))
     elif role == 'tenant':
         tp_id, _ = execute("INSERT INTO tenant_profiles (user_id) VALUES (%s)", (uid,))
         if landlord_profile:
@@ -460,6 +515,12 @@ def register():
     token = make_token(uid, role)
     user  = query("SELECT id,email,full_name,role FROM users WHERE id=%s", (uid,), fetchone=True)
     return ok({'token': token, 'user': user, 'email_verification_sent': True}, status=201)
+
+
+@app.route('/api/auth/signup-info', methods=['GET'])
+def signup_info():
+    """Public: whether landlord sign-up needs an invite code, and how long the free trial is."""
+    return ok({'invite_only': SIGNUP_MODE == 'invite', 'trial_days': TRIAL_DAYS})
 
 
 @app.route('/api/join/<code>', methods=['GET'])
@@ -552,8 +613,10 @@ def me():
     u = g.current_user
     profile = None
     if u['role'] == 'landlord':
-        profile = query("SELECT landlord_code,business_name FROM landlord_profiles WHERE user_id=%s",
-                        (u['id'],), fetchone=True)
+        lp = get_landlord_profile(u['id'])
+        if lp:
+            profile = {'landlord_code': lp['landlord_code'], 'business_name': lp['business_name'],
+                       'subscription': subscription_status(lp)}
     elif u['role'] == 'tenant':
         tp = get_tenant_profile(u['id'])
         if tp:
@@ -2328,11 +2391,78 @@ def admin_stats():
 @app.route('/api/admin/landlords', methods=['GET'])
 @require_auth('admin')
 def admin_landlords():
-    return ok(query("""SELECT u.id,u.email,u.full_name,u.is_active,u.created_at,lp.landlord_code,lp.business_name,
+    rows = query("""SELECT u.id,u.email,u.full_name,u.is_active,u.created_at,lp.landlord_code,lp.business_name,
+        lp.trial_ends_at,lp.paid_until,lp.billing_exempt,
         COUNT(DISTINCT p.id) AS properties,COUNT(DISTINCT tl.tenant_id) AS tenants
         FROM users u JOIN landlord_profiles lp ON lp.user_id=u.id
         LEFT JOIN properties p ON p.landlord_id=lp.id LEFT JOIN tenant_landlords tl ON tl.landlord_id=lp.id
-        WHERE u.role='landlord' GROUP BY u.id,lp.landlord_code,lp.business_name ORDER BY u.created_at DESC"""))
+        WHERE u.role='landlord'
+        GROUP BY u.id,lp.landlord_code,lp.business_name,lp.trial_ends_at,lp.paid_until,lp.billing_exempt
+        ORDER BY u.created_at DESC""")
+    for r in rows:
+        r['plan'] = subscription_status(r)
+    return ok(rows)
+
+@app.route('/api/admin/landlords/<int:uid>/subscription', methods=['PATCH'])
+@require_auth('admin')
+def admin_set_subscription(uid):
+    """After a landlord pays (GCash, bank...): set paid_until. Also: exempt them, or extend the trial."""
+    lp = get_landlord_profile(uid)
+    if not lp: return err('Landlord not found', 404)
+    data = request.get_json() or {}
+    if 'paid_until' in data:
+        pu = data['paid_until'] or None
+        if pu:
+            try: pu = date.fromisoformat(pu)
+            except (TypeError, ValueError): return err('Paid until must be a date like 2026-12-31')
+        execute("UPDATE landlord_profiles SET paid_until=%s WHERE id=%s", (pu, lp['id']))
+    if 'billing_exempt' in data:
+        execute("UPDATE landlord_profiles SET billing_exempt=%s WHERE id=%s",
+                (1 if data['billing_exempt'] else 0, lp['id']))
+    if data.get('extend_trial_days'):
+        try: days = int(data['extend_trial_days'])
+        except (TypeError, ValueError): return err('Extra trial days must be a number')
+        if not 0 < days <= 365: return err('Extra trial days must be 1 to 365')
+        execute("""UPDATE landlord_profiles SET trial_ends_at = GREATEST(COALESCE(trial_ends_at, NOW()), NOW()) + INTERVAL %s DAY
+                   WHERE id=%s""", (days, lp['id']))
+    log_action('ADMIN_SET_SUBSCRIPTION', 'landlord_profiles', lp['id'], str(data))
+    return ok(subscription_status(get_landlord_profile(uid)), msg='Plan updated')
+
+@app.route('/api/admin/invites', methods=['GET'])
+@require_auth('admin')
+def admin_invites():
+    return ok(query("""SELECT i.id,i.code,i.email,i.note,i.free_forever,i.used_at,i.revoked_at,i.created_at,
+        u.full_name AS used_by_name, u.email AS used_by_email
+        FROM invites i LEFT JOIN users u ON u.id=i.used_by ORDER BY i.created_at DESC"""))
+
+@app.route('/api/admin/invites', methods=['POST'])
+@require_auth('admin')
+def admin_create_invite():
+    data  = request.get_json() or {}
+    email = (data.get('email') or '').strip().lower() or None
+    if email and not re.match(r'^[^@]+@[^@]+\.[^@]+$', email): return err('Invalid email format')
+    note  = (data.get('note') or '').strip()[:255] or None
+    code  = gen_invite_code()
+    link  = f'{APP_URL}/invite/{code}'
+    iid, _ = execute("INSERT INTO invites (code,email,note,free_forever,created_by) VALUES (%s,%s,%s,%s,%s)",
+                     (code, email, note, 1 if data.get('free_forever') else 0, g.current_user['id']))
+    log_action('ADMIN_CREATE_INVITE', 'invites', iid, note)
+    emailed = False
+    if email and data.get('send_email'):
+        emailed = send_email(email, "You're invited to Shiloh Living",
+            f"""<h2>You're invited to Shiloh Living</h2>
+            <p>Use this link to create your landlord account:</p>
+            <p><a href="{link}" style="background:#2D6A4F;color:#fff;padding:12px 24px;border-radius:8px;text-decoration:none;display:inline-block;font-weight:600">Create my account</a></p>
+            <p>Or choose "Register as a Landlord" and enter the invite code <strong>{code}</strong>.</p>""")
+    return ok({'id': iid, 'code': code, 'link': link, 'emailed': emailed}, status=201)
+
+@app.route('/api/admin/invites/<int:iid>', methods=['DELETE'])
+@require_auth('admin')
+def admin_revoke_invite(iid):
+    _, n = execute("UPDATE invites SET revoked_at=NOW() WHERE id=%s AND used_at IS NULL AND revoked_at IS NULL", (iid,))
+    if not n: return err('That invite was already used or revoked', 409)
+    log_action('ADMIN_REVOKE_INVITE', 'invites', iid)
+    return ok(msg='Invite revoked')
 
 @app.route('/api/admin/tenants', methods=['GET'])
 @require_auth('admin')

@@ -37,7 +37,14 @@ Don't edit files directly on the server — the next deploy would overwrite them
 
 ## How the app works (things not obvious from the code)
 
-- **Sign-up:** anyone can register as a *landlord*. Tenants can't register on their own —
+- **Landlord sign-up is invite-only** while `SIGNUP_MODE=invite` (the default): the admin makes
+  one-time codes on Admin → Invites (`I…`, link `/invite/CODE`), optionally locked to one email
+  and/or "free forever". New landlords get a `TRIAL_DAYS` trial (`landlord_profiles.trial_ends_at`).
+  After it, with no `paid_until` today or later and not `billing_exempt`, `require_auth` answers
+  landlord non-GET requests with 402 (viewing, support, account and PDFs still work). Payment is
+  manual for now: the landlord pays (instructions in `SUBSCRIPTION_PAY_INFO`), the admin sets
+  "Paid until" on Admin → Landlords. Tenants are never charged or blocked.
+- **Tenant sign-up:** tenants can't register on their own —
   they join with their landlord's one join code (`L…`), by typing it, opening `/join/CODE`,
   or scanning its QR (`/api/join/CODE/qr.png`). There are no per-property codes: the
   landlord assigns the unit with a contract. A tenant can join several landlords and rent
