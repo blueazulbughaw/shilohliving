@@ -38,10 +38,10 @@ Don't edit files directly on the server — the next deploy would overwrite them
 ## How the app works (things not obvious from the code)
 
 - **Sign-up:** anyone can register as a *landlord*. Tenants can't register on their own —
-  they join through a landlord code (`L…`) or a property code (`P…`), by typing it, opening
-  `/join/CODE`, or scanning its QR (`/api/join/CODE/qr.png`). A tenant can join several
-  landlords/properties and rent several units (`tenant_landlords`, one row per landlord;
-  `property_id` = the property they asked for).
+  they join with their landlord's one join code (`L…`), by typing it, opening `/join/CODE`,
+  or scanning its QR (`/api/join/CODE/qr.png`). There are no per-property codes: the
+  landlord assigns the unit with a contract. A tenant can join several landlords and rent
+  several units (`tenant_landlords`, one row per landlord).
 - **Notifications:** always go through `push_notification()` in `app.py` — it saves the bell
   notification *and* sends a phone push (Web Push, VAPID keys in `.env`). Don't insert into
   `notifications` directly or from DB triggers (the old bill/payment triggers were dropped

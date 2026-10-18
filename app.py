@@ -225,43 +225,29 @@ def _gen_code(prefix, exists_sql):
 def gen_landlord_code():
     return _gen_code('L', "SELECT id FROM landlord_profiles WHERE landlord_code=%s")
 
-def gen_property_code():
-    return _gen_code('P', "SELECT id FROM properties WHERE join_code=%s")
-
 def resolve_join_code(code):
-    """A landlord code (L...) or a property code (P...) -> (landlord_profile, property or None)."""
+    """A landlord's join code (L + 7 chars) -> their landlord profile, or None."""
     code = (code or '').strip().upper()
     if not re.match(r'^[A-Z0-9]{8}$', code):
-        return None, None
-    if code.startswith('P'):
-        prop = query("SELECT id, name, address, landlord_id FROM properties WHERE join_code=%s AND is_active=1",
-                     (code,), fetchone=True)
-        if not prop:
-            return None, None
-        return query("SELECT * FROM landlord_profiles WHERE id=%s", (prop['landlord_id'],), fetchone=True), prop
-    return query("SELECT * FROM landlord_profiles WHERE landlord_code=%s", (code,), fetchone=True), None
+        return None
+    return query("SELECT * FROM landlord_profiles WHERE landlord_code=%s", (code,), fetchone=True)
 
-def link_tenant_to_landlord(tp_id, lp, prop, tenant_name):
-    """Joins (or re-joins) a tenant to a landlord, remembering the property they asked for.
-    Returns False if they were already an active tenant there (and asked for no new property)."""
-    existing = query("SELECT id, is_active, property_id FROM tenant_landlords WHERE tenant_id=%s AND landlord_id=%s",
+def link_tenant_to_landlord(tp_id, lp, tenant_name):
+    """Joins (or re-joins) a tenant to a landlord. Returns False if they already had."""
+    existing = query("SELECT id, is_active FROM tenant_landlords WHERE tenant_id=%s AND landlord_id=%s",
                      (tp_id, lp['id']), fetchone=True)
-    pid = prop['id'] if prop else None
     if existing:
-        if existing['is_active'] and (not pid or existing['property_id'] == pid):
+        if existing['is_active']:
             return False
-        execute("UPDATE tenant_landlords SET is_active=1, property_id=COALESCE(%s, property_id) WHERE id=%s",
-                (pid, existing['id']))
+        execute("UPDATE tenant_landlords SET is_active=1 WHERE id=%s", (existing['id'],))
     else:
-        execute("INSERT INTO tenant_landlords (tenant_id, landlord_id, property_id) VALUES (%s,%s,%s)",
-                (tp_id, lp['id'], pid))
-    where = f' for {prop["name"]}' if prop else ''
-    push_notification(lp['user_id'], 'New Tenant Joined', f'{tenant_name} joined{where}.', 'system')
+        execute("INSERT INTO tenant_landlords (tenant_id, landlord_id) VALUES (%s,%s)", (tp_id, lp['id']))
+    push_notification(lp['user_id'], 'New Tenant Joined', f'{tenant_name} joined using your code.', 'system')
     ll_user = query("SELECT email FROM users WHERE id=%s", (lp['user_id'],), fetchone=True)
     if ll_user:
         send_email_if_opted_in(lp['user_id'], 'email_new_tenant_joined', ll_user['email'],
             f'New Tenant Joined: {tenant_name}',
-            f'<h2>New Tenant Joined</h2><p>{h(tenant_name)} has joined{h(where)}.</p>'
+            f'<h2>New Tenant Joined</h2><p>{h(tenant_name)} has joined using your code.</p>'
             f'<p><a href="{APP_URL}">View in dashboard</a></p>')
     return True
 
@@ -437,11 +423,11 @@ def register():
 
     if len(full_name) > 150: return err('Name is too long')
     # Anyone can open a landlord account; tenants only join through a landlord's code or link
-    landlord_profile, join_prop = None, None
+    landlord_profile = None
     if role == 'tenant':
         if not lcode: return err('Tenants need a join code from their landlord to sign up')
-        landlord_profile, join_prop = resolve_join_code(lcode)
-        if not landlord_profile: return err('Invalid landlord or property code — check with your landlord', 404)
+        landlord_profile = resolve_join_code(lcode)
+        if not landlord_profile: return err('Invalid join code — check it with your landlord', 404)
 
     uid, _ = execute(
         "INSERT INTO users (email,password_hash,full_name,phone,role,email_verified) VALUES (%s,%s,%s,%s,%s,0)",
@@ -455,7 +441,7 @@ def register():
     elif role == 'tenant':
         tp_id, _ = execute("INSERT INTO tenant_profiles (user_id) VALUES (%s)", (uid,))
         if landlord_profile:
-            link_tenant_to_landlord(tp_id, landlord_profile, join_prop, full_name)
+            link_tenant_to_landlord(tp_id, landlord_profile, full_name)
 
     send_verification_email(uid, email, full_name)
     token = make_token(uid, role)
@@ -466,19 +452,17 @@ def register():
 @app.route('/api/join/<code>', methods=['GET'])
 def join_code_info(code):
     """Public: who a join link/code is for, so the sign-up page can say "You're joining ..."."""
-    lp, prop = resolve_join_code(code)
+    lp = resolve_join_code(code)
     lu = lp and query("SELECT full_name FROM users WHERE id=%s AND is_active=1", (lp['user_id'],), fetchone=True)
     if not lu: return err('This join code is not valid. Check it with your landlord.', 404)
     return ok({'code': code.strip().upper(), 'landlord_name': lu['full_name'],
-               'business_name': lp.get('business_name') or '',
-               'property_name': prop['name'] if prop else None})
+               'business_name': lp.get('business_name') or ''})
 
 
 @app.route('/api/join/<code>/qr.png', methods=['GET'])
 def join_code_qr(code):
     """Public: a QR code of the join link /join/CODE, for landlords to share or print."""
-    lp, _ = resolve_join_code(code)
-    if not lp: return err('Not found', 404)
+    if not resolve_join_code(code): return err('Not found', 404)
     img = qrcode.make(f"{APP_URL}/join/{code.strip().upper()}", image_factory=PyPNGImage,
                       box_size=12, border=2, error_correction=qrcode.constants.ERROR_CORRECT_M)
     buf = io.BytesIO()
@@ -492,19 +476,18 @@ def join_code_qr(code):
 def join_landlord():
     data  = request.get_json() or {}
     lcode = (data.get('landlord_code') or data.get('code') or '').strip().upper()
-    if not lcode: return err('Landlord or property code is required')
+    if not lcode: return err('Join code is required')
 
-    lp, prop = resolve_join_code(lcode)
-    if not lp: return err('Invalid landlord or property code', 404)
+    lp = resolve_join_code(lcode)
+    if not lp: return err('Invalid join code', 404)
 
     tp = get_tenant_profile(g.current_user['id'])
     if not tp: return err('Tenant profile not found', 404)
 
-    if not link_tenant_to_landlord(tp['id'], lp, prop, g.current_user['full_name']):
+    if not link_tenant_to_landlord(tp['id'], lp, g.current_user['full_name']):
         return err('You have already joined this landlord', 409)
     landlord = query("SELECT full_name FROM users WHERE id=%s", (lp['user_id'],), fetchone=True)
-    name = landlord['full_name'] if landlord else 'landlord'
-    if prop: name = f"{prop['name']} ({name})"
+    name = lp.get('business_name') or (landlord['full_name'] if landlord else 'landlord')
     return ok({'message': f'Successfully joined {name}'})
 
 
@@ -712,7 +695,7 @@ def list_announcements():
 
 
 # Announcements a tenant can see: from landlords they've joined, still live, and either for all
-# properties or for a property they rent in (or asked to join). Params: (tenant_profile_id, tenant_profile_id)
+# properties or for a property they rent in. Params: (tenant_profile_id, tenant_profile_id)
 TENANT_ANNOUNCEMENTS_FROM = """
     FROM announcements a
     JOIN landlord_profiles lp ON lp.id = a.landlord_id
@@ -723,9 +706,9 @@ TENANT_ANNOUNCEMENTS_FROM = """
       AND (a.target_all = 1 OR EXISTS (
             SELECT 1 FROM announcement_properties ap
             WHERE ap.announcement_id = a.id
-              AND (ap.property_id = tl.property_id OR ap.property_id IN (
+              AND ap.property_id IN (
                     SELECT un.property_id FROM contracts c JOIN units un ON un.id = c.unit_id
-                    WHERE c.tenant_id = %s AND c.status IN ('active','move_out_pending')))))
+                    WHERE c.tenant_id = %s AND c.status IN ('active','move_out_pending'))))
 """
 
 
@@ -777,11 +760,11 @@ def create_announcement():
             JOIN tenant_profiles tp ON tp.id = tl.tenant_id
             JOIN users u ON u.id = tp.user_id
             WHERE tl.landlord_id = %s AND tl.is_active = 1
-              AND (tl.property_id IN ({marks}) OR EXISTS (
+              AND EXISTS (
                     SELECT 1 FROM contracts c JOIN units un ON un.id = c.unit_id
                     WHERE c.tenant_id = tp.id AND c.status IN ('active','move_out_pending')
-                      AND un.property_id IN ({marks})))
-        """, (lp['id'], *property_ids, *property_ids))
+                      AND un.property_id IN ({marks}))
+        """, (lp['id'], *property_ids))
 
     landlord_name = g.current_user['full_name']
     for t in tenants:
@@ -1167,21 +1150,6 @@ def delete_property(pid):
     lp=get_landlord_profile(g.current_user['id'])
     execute("UPDATE properties SET is_active=0 WHERE id=%s AND landlord_id=%s",(pid,lp['id']))
     return ok(msg='Deleted')
-
-@app.route('/api/properties/<int:pid>/join-code', methods=['POST'])
-@require_auth('landlord')
-def property_join_code(pid):
-    """The property's own join code (made on first use). {"regenerate": true} replaces it, so an
-    old link or printed QR stops working; tenants who already joined are not affected."""
-    lp = get_landlord_profile(g.current_user['id'])
-    p = query("SELECT id, name, join_code FROM properties WHERE id=%s AND landlord_id=%s AND is_active=1",
-              (pid, lp['id']), fetchone=True)
-    if not p: return err('Not found', 404)
-    code = p['join_code']
-    if not code or (request.get_json(silent=True) or {}).get('regenerate'):
-        code = gen_property_code()
-        execute("UPDATE properties SET join_code=%s WHERE id=%s", (code, pid))
-    return ok({'code': code, 'property_name': p['name'], 'join_url': f'{APP_URL}/join/{code}'})
 
 
 # ════════════════════════════════════════════════════════════
@@ -1905,7 +1873,6 @@ def landlord_tenants():
     lp = get_landlord_profile(g.current_user['id'])
     tenants = query("""
         SELECT tp.id, u.id AS user_id, u.full_name, u.email, u.phone, u.is_active, tl.joined_at,
-               rp.name AS requested_property,
                MAX(c.id) AS contract_id,
                MAX(c.status) AS contract_status,
                GROUP_CONCAT(DISTINCT un.unit_number ORDER BY un.unit_number SEPARATOR ', ') AS unit_number,
@@ -1913,13 +1880,12 @@ def landlord_tenants():
         FROM tenant_landlords tl
         JOIN tenant_profiles tp ON tp.id = tl.tenant_id
         JOIN users u ON u.id = tp.user_id
-        LEFT JOIN properties rp ON rp.id = tl.property_id
         LEFT JOIN (contracts c
                    JOIN units un ON un.id = c.unit_id
                    JOIN properties p ON p.id = un.property_id AND p.landlord_id = %s)
                ON c.tenant_id = tp.id AND c.status IN ('active','move_out_pending')
         WHERE tl.landlord_id = %s AND tl.is_active = 1
-        GROUP BY tp.id, u.id, u.full_name, u.email, u.phone, u.is_active, tl.joined_at, rp.name
+        GROUP BY tp.id, u.id, u.full_name, u.email, u.phone, u.is_active, tl.joined_at
         ORDER BY tl.joined_at DESC
     """, (lp['id'], lp['id']))
     return ok(tenants)
@@ -1984,10 +1950,9 @@ def tenant_dashboard():
     if not tp:
         return err('Tenant profile not found. Please sign in again.', 404)
     landlords = query("""SELECT lp.id AS landlord_profile_id, lu.id AS landlord_user_id, lu.full_name AS landlord_name,
-               lp.business_name, tl.joined_at, rp.name AS requested_property
+               lp.business_name, tl.joined_at
         FROM tenant_landlords tl JOIN landlord_profiles lp ON lp.id=tl.landlord_id
         JOIN users lu ON lu.id=lp.user_id
-        LEFT JOIN properties rp ON rp.id=tl.property_id
         WHERE tl.tenant_id=%s AND tl.is_active=1 ORDER BY tl.joined_at""", (tp['id'],))
     contracts = query("""SELECT c.id AS contract_id, c.status AS contract_status, c.monthly_rent, c.start_date,
                c.end_date, c.is_open_term, c.minimum_months, c.contract_doc_url, c.tenant_ack,

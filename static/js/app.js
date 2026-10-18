@@ -257,8 +257,7 @@ function authCard(html) {
 }
 function joinBanner(info) {
   if (!info) return '';
-  const what = info.property_name ? `<strong>${esc(info.property_name)}</strong><br><span>by ${esc(info.business_name || info.landlord_name)}</span>`
-    : `<strong>${esc(info.business_name || info.landlord_name)}</strong>`;
+  const what = `<strong>${esc(info.business_name || info.landlord_name)}</strong>${info.business_name ? `<br><span>${esc(info.landlord_name)}</span>` : ''}`;
   return `<div class="join-banner"><div class="muted-text">You've been invited to join</div><div>${what}</div></div>`;
 }
 let _joinInfo = null;   // the landlord/property a join code points to, once looked up
@@ -622,7 +621,7 @@ async function handlePendingJoin() {
     catch (e) { alert(e.message); return; }
   }
   _joinInfo = null;
-  const name = info.property_name ? `${info.property_name} (${info.business_name || info.landlord_name})` : (info.business_name || info.landlord_name);
+  const name = info.business_name || info.landlord_name;
   openModal('Join landlord', `${joinBanner(info)}<p class="err-msg" id="m-join-err"></p>`,
     `<button class="btn btn-outline" onclick="closeModalDirect()">Not now</button>
      <button class="btn btn-brand" onclick="submitJoinLandlord(${jsArg(code)})">Join ${esc(name)}</button>`);
@@ -712,28 +711,19 @@ function cloudinaryUpload(opts = {}) {
 // ═══════════════════════════════════════════════
 const joinUrl = code => `${location.origin}/join/${code}`;
 const qrSrc = code => `/api/join/${encodeURIComponent(code)}/qr.png`;
-let _invite = null;   // { code, title, kind: 'landlord' | 'property', propertyId }
+let _invite = null;   // { code, title }
 
 async function showLandlordInvite() {
   try {
     const d = await apiFetch('/landlord/join-code');
-    _invite = { code: d.code, title: d.business_name || currentUser.full_name, kind: 'landlord' };
-    renderInvite();
-  } catch (e) { alert(e.message); }
-}
-async function showPropertyInvite(propertyId) {
-  try {
-    const d = await apiFetch('/properties/' + propertyId + '/join-code', { method: 'POST', body: '{}' });
-    _invite = { code: d.code, title: d.property_name, kind: 'property', propertyId };
+    _invite = { code: d.code, title: d.business_name || currentUser.full_name };
     renderInvite();
   } catch (e) { alert(e.message); }
 }
 function renderInvite() {
-  const { code, title, kind } = _invite;
-  openModal(kind === 'property' ? `Invite tenants to ${title}` : 'Invite tenants', `
-    <p class="muted-text center" style="margin-bottom:10px">${kind === 'property'
-      ? 'Tenants who join with this code are linked to you and this property.'
-      : 'Tenants who join with this code are linked to you. A tenant can join more than one landlord or property.'}</p>
+  const { code, title } = _invite;
+  openModal('Invite tenants', `
+    <p class="muted-text center" style="margin-bottom:10px">Tenants who join with this code are linked to you. A tenant can join more than one landlord.</p>
     <div class="center">
       <button type="button" class="qr-btn" id="invite-qr-btn" aria-label="Share the QR code">
         <img id="invite-qr" src="${qrSrc(code)}" alt="QR code to join ${esc(title)}" width="220" height="220"/>
@@ -810,12 +800,10 @@ function printInvite() {
 async function regenerateInviteCode() {
   if (!confirm('Make a new code? The current code, link and any printed QR codes will stop working.')) return;
   try {
-    const d = _invite.kind === 'property'
-      ? await apiFetch('/properties/' + _invite.propertyId + '/join-code', { method: 'POST', body: JSON.stringify({ regenerate: true }) })
-      : await apiFetch('/landlord/join-code', { method: 'POST', body: JSON.stringify({ regenerate: true }) });
+    const d = await apiFetch('/landlord/join-code', { method: 'POST', body: JSON.stringify({ regenerate: true }) });
     _invite.code = d.code;
     renderInvite();
-    if (_invite.kind === 'landlord' && document.getElementById('page-dashboard').classList.contains('active')) loadLandlordDashboard();
+    if (document.getElementById('page-dashboard').classList.contains('active')) loadLandlordDashboard();
   } catch (e) { alert(e.message); }
 }
 
@@ -849,7 +837,6 @@ async function loadLandlordDashboard() {
           <button class="btn btn-brand" onclick="showLandlordInvite()">📱 QR Code &amp; Share Link</button>
           <button class="btn btn-outline" onclick="copyText(joinUrl(${jsArg(d.landlord_code)}), 'Join link copied!')">📋 Copy Join Link</button>
         </div>
-        <p class="hint" style="margin-top:8px">Want tenants linked to a specific building? Use <a href="#" onclick="event.preventDefault();goPage('properties')">a property's own invite</a>.</p>
       </div>
       <div class="grid-2">
         <div class="card"><div class="card-header"><h3>Recent Payments</h3></div>
@@ -883,8 +870,7 @@ async function loadProperties() {
       ${!_props.length ? '<div class="empty-state"><div class="icon">🏢</div><p>No properties yet</p></div>' :
         `<div class="table-wrap"><table><thead><tr><th>Name</th><th>Address</th><th>Units</th><th>Occupied</th><th>Actions</th></tr></thead><tbody>
         ${_props.map(p => `<tr><td><strong>${esc(p.name)}</strong></td><td>${esc(p.address)}${p.city ? ', ' + esc(p.city) : ''}</td><td>${esc(p.unit_count || 0)}</td><td>${esc(p.occupied || 0)}/${esc(p.unit_count || 0)}</td>
-          <td><div class="btn-group"><button class="btn btn-sm btn-brand" onclick="showPropertyInvite(${parseInt(p.id)})">👋 Invite</button>
-          <button class="btn btn-sm btn-outline" onclick="loadUnitsForProperty(${parseInt(p.id)})">Units</button>
+          <td><div class="btn-group"><button class="btn btn-sm btn-outline" onclick="loadUnitsForProperty(${parseInt(p.id)})">Units</button>
           <button class="btn btn-sm btn-red" onclick="deleteProperty(${parseInt(p.id)})">Delete</button></div></td></tr>`).join('')}
         </tbody></table></div>`}
     </div>`;
@@ -988,8 +974,7 @@ async function loadTenants() {
         `<div class="table-wrap"><table><thead><tr><th>Name</th><th>Contact</th><th>Property / Unit</th><th>Contract</th><th>Actions</th></tr></thead><tbody>
         ${tenants.map(t => `<tr><td><strong>${esc(t.full_name)}</strong><br><small class="muted-text">Joined ${fmtDate(t.joined_at)}</small></td>
           <td style="font-size:12px">${esc(t.email)}${t.phone ? '<br>' + esc(t.phone) : ''}</td>
-          <td>${t.unit_number ? `${esc(t.property_name)} — Unit ${esc(t.unit_number)}` :
-            t.requested_property ? `<span class="badge badge-blue">Asked for ${esc(t.requested_property)}</span>` : '<span class="muted-text">Not assigned</span>'}</td>
+          <td>${t.unit_number ? `${esc(t.property_name)} — Unit ${esc(t.unit_number)}` : '<span class="muted-text">Not assigned</span>'}</td>
           <td>${t.contract_status ? badge(t.contract_status) : `<button class="btn btn-sm btn-outline" onclick="showCreateContract(${parseInt(t.id)})">+ Contract</button>`}</td>
           <td><button class="btn btn-sm btn-info" onclick="showNewThread(${parseInt(t.user_id)})">Message</button></td></tr>`).join('')}
         </tbody></table></div>`}
@@ -1044,7 +1029,7 @@ async function showCreateContract(tenantId) {
   if (!tenants.length) { alert('No tenants yet. Invite tenants with your join code first.'); return; }
   openModal('Create Contract', `
     <div class="form-group"><label>Tenant</label><select id="m-c-tenant"><option value="">— Select —</option>
-      ${tenants.map(t => `<option value="${parseInt(t.id)}" ${t.id === tenantId ? 'selected' : ''}>${esc(t.full_name)} (${esc(t.email)})${t.requested_property ? ' — asked for ' + esc(t.requested_property) : ''}</option>`).join('')}</select></div>
+      ${tenants.map(t => `<option value="${parseInt(t.id)}" ${t.id === tenantId ? 'selected' : ''}>${esc(t.full_name)} (${esc(t.email)})</option>`).join('')}</select></div>
     <div class="form-group"><label>Unit (vacant)</label><select id="m-c-unit" onchange="contractUnitPicked()"><option value="">— Select —</option>
       ${vacantUnits.map(u => `<option value="${parseInt(u.id)}" data-rent="${esc(u.rent_amount)}">${esc(u.property_name)} — Unit ${esc(u.unit_number)} (₱${fmt(u.rent_amount)}/mo)</option>`).join('')}</select></div>
     <div class="grid-2">
@@ -1815,12 +1800,12 @@ async function loadTenantDashboard() {
                     ${!c.tenant_ack ? `<button class="btn btn-sm btn-green" onclick="acknowledgeContract(${parseInt(c.contract_id)})">✓ Acknowledge</button>` : '<span class="badge badge-green">Acknowledged</span>'}
                   </div></div>` : ''}
             </div>`).join('')
-          : `<p class="muted-text">${l.requested_property ? `You asked to join <strong>${esc(l.requested_property)}</strong>. ` : ''}Your landlord hasn't assigned you a unit yet.</p>`}
+          : `<p class="muted-text">Your landlord hasn't assigned you a unit yet.</p>`}
         </div>`).join('')}
       ${!landlords.length ? `<div class="card"><div class="empty-state"><div class="icon">🏠</div>
         <p>You haven't joined a landlord yet.</p>
         <button class="btn btn-brand" onclick="showJoinLandlord()" style="margin-top:12px">🔑 Enter a Join Code</button></div></div>`
-        : `<div style="margin-bottom:16px"><button class="btn btn-outline btn-sm" onclick="showJoinLandlord()">+ Join Another Landlord or Property</button></div>`}
+        : `<div style="margin-bottom:16px"><button class="btn btn-outline btn-sm" onclick="showJoinLandlord()">+ Join Another Landlord</button></div>`}
       <div class="card"><div class="card-header"><h3>Recent Bills</h3><button class="btn btn-sm btn-outline" onclick="goPage('t-bills')">View All</button></div>
         ${!_bills.length ? '<p class="muted-text">No bills yet</p>' :
           `<div class="table-wrap"><table><thead><tr><th>Description</th><th>Property</th><th>Amount</th><th>Due</th><th>Status</th><th>Action</th></tr></thead><tbody>
@@ -1835,8 +1820,8 @@ async function acknowledgeContract(contractId) {
   catch (e) { alert(e.message); }
 }
 function showJoinLandlord() {
-  openModal('Join a Landlord or Property', `
-    <div class="info-box">Enter the code from your landlord (it starts with L or P), or scan their QR code with your phone camera.</div>
+  openModal('Join a Landlord', `
+    <div class="info-box">Enter the code from your landlord, or scan their QR code with your phone camera.</div>
     <div class="form-group"><label>Join Code</label><input type="text" id="m-join-code" maxlength="8" class="code-input" placeholder="e.g. L3KX9MFA"/></div>
     <p class="err-msg" id="m-join-err"></p>`,
     `<button class="btn btn-outline" onclick="closeModalDirect()">Cancel</button>
@@ -2045,8 +2030,8 @@ async function loadTenantSettings() {
     const prefs = await apiFetch('/notification-preferences');
     pg.innerHTML = `
       ${pushCardHtml()}
-      <div class="card"><div class="card-header"><h3>🔑 Join Another Landlord or Property</h3></div>
-        <p class="muted-text">Renting from more than one landlord, or another of your landlord's properties? Enter their join code.</p>
+      <div class="card"><div class="card-header"><h3>🔑 Join Another Landlord</h3></div>
+        <p class="muted-text">Renting from more than one landlord? Enter the new landlord's join code.</p>
         <button class="btn btn-brand" style="margin-top:10px" onclick="showJoinLandlord()">Enter a Join Code</button></div>
       <div class="card"><div class="card-header"><h3>📧 Email Notifications</h3></div>
         ${prefRowsHtml([
