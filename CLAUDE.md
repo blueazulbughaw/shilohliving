@@ -71,6 +71,15 @@ Don't edit files directly on the server — the next deploy would overwrite them
 - Uploads (contracts, payment proofs) go to Cloudinary from the browser with an unsigned
   preset; the API only accepts URLs from our Cloudinary cloud (`CLOUDINARY_CLOUD`).
 
+## Running it locally
+
+`scripts/dev.sh` runs the real app at http://localhost:5000 with its own database: WAMP's
+MariaDB started as a private server (data in `.localdb/`, port 3310, root without password,
+no Windows service), `db/schema_base.sql` (live structure before migrations, no data) + all
+`migrations/`, then sample data from `scripts/seed_local.py` (accounts and passwords printed on
+first run, e.g. `landlord@local.test` / `Landlord#1`). Emails are not sent. `--reset` starts
+over with fresh sample data. Never point it at the live database.
+
 ## Config
 
 All secrets and URLs come from `.env` (see `.env.example`). `APP_URL` is used for links in

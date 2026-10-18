@@ -10,3 +10,6 @@ venv/
 # Logs / runtime
 *.log
 tmp/
+
+# Local dev database (scripts/dev.sh)
+.localdb/

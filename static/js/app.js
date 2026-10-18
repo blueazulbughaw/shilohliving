@@ -476,6 +476,7 @@ async function logout(expired) {
   localStorage.removeItem('shiloh_token');
   localStorage.removeItem('shiloh_user');
   token = null; currentUser = null;
+  history.replaceState(null, '', '/');
   clearInterval(window._notifTimer);
   closeModalDirect();
   showLogin(expired === true ? 'Your session has ended. Please sign in again.' : null);
@@ -589,14 +590,38 @@ function buildNav() {
     el.onclick = () => { goPage(item.id); closeSidebar(); };
     nav.appendChild(el);
   });
-  const first = PENDING_OPEN_PAGE && NAV[PENDING_OPEN_PAGE] ? PENDING_OPEN_PAGE : items[0] && items[0].id;
+  // A tapped notification wins, then the page in the address (refresh), then the first page
+  const opened = PENDING_OPEN_PAGE && NAV[PENDING_OPEN_PAGE];
+  if (opened) goPage(PENDING_OPEN_PAGE);
   PENDING_OPEN_PAGE = null;
-  if (first) goPage(first);
+  if (!opened && !restoreRoute() && items[0]) goPage(items[0].id);
 }
 // Opens a page by id (sidebar, notifications, quick actions)
 function goPage(id) {
   const item = NAV[id];
   if (item) showView(id, item.fn);
+}
+
+// Each screen has an address (#/tenants, #/tenant/5 ...) so a refresh reopens it.
+// Views inside a page open on top of their parent page, so back still works after a refresh.
+const SUB_ROUTES = {
+  tenant: { parent: 'tenants', open: id => openTenantProfile(id) },
+  units: { parent: 'properties', open: id => openPropertyUnits(id) },
+  water: { parent: 'water', open: id => viewWaterSession(id) },
+  chat: { parent: 'admin-chat', open: id => openAdminChat(id) },
+};
+function restoreRoute() {
+  const m = location.hash.match(/^#\/([\w-]+)(?:\/(\d+))?$/);
+  if (!m) return false;
+  if (m[2]) {
+    const r = SUB_ROUTES[m[1]];
+    if (!r || !NAV[r.parent]) return false;
+    goPage(r.parent); r.open(parseInt(m[2]));
+    return true;
+  }
+  if (!NAV[m[1]]) return false;
+  goPage(m[1]);
+  return true;
 }
 
 // ── BACK BUTTON ──
@@ -606,12 +631,13 @@ function goPage(id) {
 let _navEntries = [];   // index -> { page, render }
 let _navIdx = -1;
 let _modalEntry = false;
-function showView(page, render) {
+function showView(page, render, route) {
   _navEntries = _navEntries.slice(0, _navIdx + 1);
   _navEntries.push({ page, render });
   _navIdx = _navEntries.length - 1;
-  if (_navIdx === 0) history.replaceState({ nav: 0 }, '');
-  else history.pushState({ nav: _navIdx }, '');
+  const url = '#/' + (route || page);
+  if (_navIdx === 0) history.replaceState({ nav: 0 }, '', url);
+  else history.pushState({ nav: _navIdx }, '', url);
   renderView();
 }
 function renderView() {
@@ -1006,7 +1032,7 @@ async function loadUnits() {
     </div>`;
   } catch (e) { pg.innerHTML = errHtml(e); }
 }
-function openPropertyUnits(propId) { showView('units', () => loadUnitsForProperty(propId)); }
+function openPropertyUnits(propId) { showView('units', () => loadUnitsForProperty(propId), 'units/' + propId); }
 async function loadUnitsForProperty(propId) {
   const pg = document.getElementById('page-units'); pg.innerHTML = loadingHtml;
   try {
@@ -1147,7 +1173,7 @@ async function archiveTenant(tpId) {
 // TENANT PROFILE (CRM) — everything about one tenant, in collapsible, sortable sections
 // ═══════════════════════════════════════════════
 let _profile = null;   // { data, sort: {section: 'desc'|'asc'}, billType }
-function openTenantProfile(tpId) { showView('tenants', () => loadTenantProfile(tpId)); }
+function openTenantProfile(tpId) { showView('tenants', () => loadTenantProfile(tpId), 'tenant/' + tpId); }
 async function loadTenantProfile(tpId) {
   const pg = document.getElementById('page-tenants'); pg.innerHTML = loadingHtml;
   try {
@@ -1782,7 +1808,7 @@ async function submitNewWaterSession() {
   catch (e) { errEl.textContent = e.message; }
 }
 let _water = null;   // { session, units }
-function viewWaterSession(sid) { showView('water', () => openWaterSession(sid)); }
+function viewWaterSession(sid) { showView('water', () => openWaterSession(sid), 'water/' + sid); }
 async function openWaterSession(sid) {
   const pg = document.getElementById('page-water'); pg.innerHTML = loadingHtml;
   try {
@@ -2482,7 +2508,7 @@ async function loadAdminChat() {
     const chats = await apiFetch('/support-chat');
     const open = chats.filter(c => c.status === 'open');
     const other = chats.filter(c => c.status !== 'open');
-    const item = c => `<div class="thread-list-item ${c.unread_count > 0 ? 'unread' : ''}" onclick="showView('admin-chat', () => adminOpenChat(${parseInt(c.id)}))">
+    const item = c => `<div class="thread-list-item ${c.unread_count > 0 ? 'unread' : ''}" onclick="openAdminChat(${parseInt(c.id)})">
         <div class="thread-avatar">${esc((c.user_name || '?')[0].toUpperCase())}</div>
         <div class="thread-info">
           <div class="tname">${esc(c.user_name)} <span class="badge badge-gray">${esc(c.user_role)}</span> ${c.status !== 'open' ? badge(c.status) : ''} ${c.unread_count > 0 ? `<span class="badge badge-red">${parseInt(c.unread_count)}</span>` : ''}</div>
@@ -2500,6 +2526,7 @@ async function loadAdminChat() {
       ${other.length ? `<div class="card"><div class="card-header"><h3>Closed / Converted</h3></div>${other.map(item).join('')}</div>` : ''}`;
   } catch (e) { pg.innerHTML = errHtml(e); }
 }
+function openAdminChat(chatId) { showView('admin-chat', () => adminOpenChat(chatId), 'chat/' + chatId); }
 async function adminOpenChat(chatId) {
   const pg = document.getElementById('page-admin-chat'); pg.innerHTML = loadingHtml;
   try {
