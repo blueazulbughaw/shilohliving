@@ -638,7 +638,7 @@ def me():
                 WHERE tl.tenant_id = %s AND tl.is_active = 1
             """, (tp['id'],))
             profile = {'landlords': landlords}
-    return ok({'id': u['id'], 'email': u['email'], 'full_name': u['full_name'],
+    return ok({'id': u['id'], 'email': u['email'], 'full_name': u['full_name'], 'phone': u.get('phone'),
                'role': u['role'], 'email_verified': bool(u.get('email_verified', 0)),
                'profile': profile})
 
@@ -1689,32 +1689,71 @@ def create_bill():
     notify_new_bill(contract_id, description, amount, due_date)
     return ok({'bill_id':bid},status=201)
 
+def _rent_month(data):
+    today = date.today()
+    try:
+        m, y = int(data.get('month') or today.month), int(data.get('year') or today.year)
+        return date(y, m, 1)
+    except (TypeError, ValueError):
+        raise ValueError('Pick a valid month')
+
+def rent_candidates(lp, first):
+    """Active contracts (rent billing on for the property) running during that month, and
+    whether that month's rent bill already exists."""
+    last = (first.replace(day=28) + timedelta(days=4)).replace(day=1) - timedelta(days=1)
+    rows = query("""SELECT c.id AS contract_id, c.monthly_rent, c.start_date, c.end_date, un.unit_number,
+               p.id AS property_id, p.name AS property_name, p.features, u.full_name AS tenant_name,
+               EXISTS (SELECT 1 FROM bills b WHERE b.contract_id=c.id AND b.bill_type='rent'
+                       AND ((b.bill_month=%s AND b.bill_year=%s)
+                            OR (b.bill_month IS NULL AND b.description LIKE 'Monthly Rent%%'
+                                AND YEAR(b.created_at)=%s AND MONTH(b.created_at)=%s))) AS billed
+        FROM contracts c JOIN units un ON un.id=c.unit_id JOIN properties p ON p.id=un.property_id
+        JOIN tenant_profiles tp ON tp.id=c.tenant_id JOIN users u ON u.id=tp.user_id
+        WHERE p.landlord_id=%s AND p.is_active=1 AND c.status IN ('active','move_out_pending')
+          AND c.start_date <= %s AND (c.end_date IS NULL OR c.end_date >= %s)
+        ORDER BY p.name, un.unit_number""",
+        (first.month, first.year, first.year, first.month, lp['id'], last, first))
+    out = []
+    for r in rows:
+        r['billed'] = bool(r['billed'])
+        r['rent_billing'] = property_features(r.pop('features'))['rent_billing']
+        out.append(r)
+    return out
+
+def rent_due_date(lp, first):
+    due = first.replace(day=min(int(lp.get('rent_due_day') or 7), 28))
+    return max(due, date.today()) if first <= date.today() else due
+
+@app.route('/api/bills/monthly-preview', methods=['GET'])
+@require_auth('landlord')
+def monthly_preview():
+    lp = get_landlord_profile(g.current_user['id'])
+    try: first = _rent_month(request.args)
+    except ValueError as e: return err(str(e))
+    return ok({'month': first.month, 'year': first.year, 'due_date': rent_due_date(lp, first).isoformat(),
+               'rent_due_day': lp.get('rent_due_day') or 7, 'contracts': rent_candidates(lp, first)})
+
 @app.route('/api/bills/generate-monthly', methods=['POST'])
 @require_auth('landlord')
 def generate_monthly_bills():
-    """This month's rent bill for each of the landlord's active contracts (open-term included)
-    that doesn't have one yet. Due on the 7th, or today if that's already past."""
-    lp=get_landlord_profile(g.current_user['id'])
-    today=date.today()
-    contracts=query("""SELECT c.id, c.monthly_rent, p.features FROM contracts c
-        JOIN units un ON un.id=c.unit_id JOIN properties p ON p.id=un.property_id
-        WHERE p.landlord_id=%s AND p.is_active=1 AND c.status='active' AND c.start_date <= CURDATE()
-          AND (c.end_date IS NULL OR c.end_date >= CURDATE())
-          AND NOT EXISTS (SELECT 1 FROM bills b WHERE b.contract_id=c.id AND b.bill_type='rent'
-                          AND ((b.bill_month=%s AND b.bill_year=%s)
-                               OR (b.bill_month IS NULL AND b.description LIKE 'Monthly Rent%%'
-                                   AND YEAR(b.created_at)=%s AND MONTH(b.created_at)=%s)))""",
-        (lp['id'], today.month, today.year, today.year, today.month))
-    contracts=[c for c in contracts if property_features(c['features'])['rent_billing']]
-    due=max(today, today.replace(day=7)).isoformat()
-    description=f"Monthly Rent — {today.strftime('%B %Y')}"
-    for c in contracts:
+    """Rent bills for one month (this month unless month/year are given), for the chosen contracts
+    (all that still need one unless contract_ids is given). Never bills a month twice."""
+    lp = get_landlord_profile(g.current_user['id'])
+    data = request.get_json(silent=True) or {}
+    try: first = _rent_month(data)
+    except ValueError as e: return err(str(e))
+    wanted = data.get('contract_ids')
+    picked = [c for c in rent_candidates(lp, first)
+              if not c['billed'] and c['rent_billing'] and (wanted is None or c['contract_id'] in wanted)]
+    due = rent_due_date(lp, first).isoformat()
+    description = f"Monthly Rent — {first.strftime('%B %Y')}"
+    for c in picked:
         execute("""INSERT INTO bills (contract_id,description,bill_type,bill_month,bill_year,amount,due_date)
                    VALUES (%s,%s,'rent',%s,%s,%s,%s)""",
-                (c['id'], description, today.month, today.year, c['monthly_rent'], due))
-        notify_new_bill(c['id'], description, c['monthly_rent'], due)
-    log_action('GENERATE_MONTHLY_BILLS', 'bills', None, f'{len(contracts)} bills')
-    return ok({'bills_generated':len(contracts)})
+                (c['contract_id'], description, first.month, first.year, c['monthly_rent'], due))
+        notify_new_bill(c['contract_id'], description, c['monthly_rent'], due)
+    log_action('GENERATE_MONTHLY_BILLS', 'bills', None, f'{len(picked)} bills for {first:%Y-%m}')
+    return ok({'bills_generated': len(picked)})
 
 
 # ════════════════════════════════════════════════════════════
@@ -1920,6 +1959,12 @@ def tenant_board():
         if not t['is_active']:
             lu = last_by_tenant.get(t['tenant_id']) or {}
             past.append({**t, 'units': lu.get('units'), 'moved_out': lu.get('moved_out')})
+    progress, total_required = checklist_progress(lp['id'])
+    blank = {'done': 0, 'total': total_required, 'to_review': 0}
+    for c in current:
+        c['checklist'] = progress.get(c['tenant_id'], blank)
+    for t in linked:
+        t['checklist'] = progress.get(t['tenant_id'], blank)
     return ok({'properties': props,
                'unassigned': [t for t in linked if t['is_active'] and t['tenant_id'] not in housed],
                'past': sorted(past, key=lambda t: t['left_at'] or datetime.min, reverse=True)})
@@ -2126,6 +2171,8 @@ UPLOAD_KINDS = {
     'payment_proof': ('tenant', {'image/jpeg', 'image/png', 'image/webp', 'image/heic', 'application/pdf'}),
     'contract': ('landlord', {'application/pdf', 'image/jpeg', 'image/png'}),
     'repair_proof': ('landlord', {'image/jpeg', 'image/png', 'image/webp', 'image/heic', 'application/pdf'}),
+    'tenant_document': ('tenant', {'image/jpeg', 'image/png', 'image/webp', 'image/heic', 'application/pdf'}),
+    'onboarding_photo': ('landlord', {'image/jpeg', 'image/png', 'image/webp', 'image/heic', 'application/pdf'}),
 }
 FILE_EXT = {'image/jpeg': '.jpg', 'image/png': '.png', 'image/webp': '.webp', 'image/heic': '.heic', 'application/pdf': '.pdf'}
 FILE_URL = re.compile(r'^/api/files/([A-Za-z0-9_-]{20,64})$')
@@ -2185,7 +2232,12 @@ def file_parties(url):
         SELECT tp.user_id, lp.user_id FROM move_out_checklists m JOIN contracts c ON c.id=m.contract_id
           JOIN tenant_profiles tp ON tp.id=c.tenant_id JOIN units un ON un.id=c.unit_id
           JOIN properties p ON p.id=un.property_id JOIN landlord_profiles lp ON lp.id=p.landlord_id
-         WHERE m.repair_proof_url=%s""", (url, url, url))
+         WHERE m.repair_proof_url=%s
+        UNION ALL
+        SELECT tp.user_id, lp.user_id FROM tenant_requirements tr
+          JOIN onboarding_requirements r ON r.id=tr.requirement_id
+          JOIN tenant_profiles tp ON tp.id=tr.tenant_id JOIN landlord_profiles lp ON lp.id=r.landlord_id
+         WHERE tr.file_url=%s""", (url, url, url, url))
     return {u for r in rows for u in (r['tenant_user'], r['landlord_user'])}
 
 @app.route('/api/files', methods=['POST'])
@@ -2221,6 +2273,242 @@ def get_file(token):
     name = re.sub(r'[^\w.\- ]', '_', row['original_name'] or ('file' + FILE_EXT.get(row['mime'], '')))
     return Response(data, mimetype=row['mime'],
                     headers={'Content-Disposition': f'inline; filename="{name}"', 'Cache-Control': 'private, no-store'})
+
+
+# ════════════════════════════════════════════════════════════
+# MOVE-IN CHECKLIST — what a landlord asks every new tenant for
+# ════════════════════════════════════════════════════════════
+# A landlord's list starts from these (like US rental applications, plus what PH landlords ask);
+# they edit it in Settings. kind: document (tenant uploads), info (tenant answers), landlord (landlord ticks).
+DEFAULT_REQUIREMENTS = [
+    ('Valid government ID', 'Passport, driver\'s license, UMID, PhilSys ID or similar.', 'document', 1),
+    ('Proof of income', 'Last 3 payslips, certificate of employment, or recent bank statements.', 'document', 1),
+    ('Previous landlord reference or rent receipts', 'A reference from your last landlord, or your last 3 rent receipts.', 'document', 0),
+    ('NBI or police clearance', '', 'document', 0),
+    ('Emergency contact', 'Name, relationship and phone number.', 'info', 1),
+    ('Everyone who will live in the unit', 'Names and ages of all occupants.', 'info', 1),
+    ('Pets and vehicles', 'Type of pet; vehicle make and plate number. Write "none" if none.', 'info', 0),
+    ('Lease signed by both sides', '', 'landlord', 1),
+    ('Security deposit and advance rent received', '', 'landlord', 1),
+    ('Move-in inspection photos', 'Photos of the unit\'s condition on move-in day.', 'landlord', 0),
+    ('Keys and gate access handed over', '', 'landlord', 1),
+]
+REQ_KINDS = ('document', 'info', 'landlord')
+
+def landlord_requirements(lp_id):
+    """The landlord's active list, created from the defaults the first time it's needed."""
+    if not query("SELECT 1 FROM onboarding_requirements WHERE landlord_id=%s LIMIT 1", (lp_id,), fetchone=True):
+        for i, (label, desc, kind, req) in enumerate(DEFAULT_REQUIREMENTS):
+            execute("""INSERT INTO onboarding_requirements (landlord_id,label,description,kind,required,sort_order)
+                       VALUES (%s,%s,%s,%s,%s,%s)""", (lp_id, label, desc or None, kind, req, i))
+    return query("""SELECT id,label,description,kind,required,sort_order FROM onboarding_requirements
+                    WHERE landlord_id=%s AND is_active=1 ORDER BY sort_order, id""", (lp_id,))
+
+def tenant_checklist(tp_id, lp_id):
+    reqs = landlord_requirements(lp_id)
+    rows = {r['requirement_id']: r for r in query(
+        "SELECT * FROM tenant_requirements WHERE tenant_id=%s", (tp_id,))}
+    items = []
+    for r in reqs:
+        st = rows.get(r['id']) or {}
+        items.append({**r, 'status': st.get('status', 'pending'), 'answer': st.get('answer'),
+                      'file_url': st.get('file_url'), 'note': st.get('note'),
+                      'submitted_at': st.get('submitted_at'), 'reviewed_at': st.get('reviewed_at')})
+    need = [i for i in items if i['required']]
+    done = [i for i in need if i['status'] in ('approved', 'waived')]
+    return {'items': items, 'done': len(done), 'total': len(need),
+            'to_review': sum(1 for i in items if i['status'] == 'submitted')}
+
+def checklist_progress(lp_id):
+    """{tenant_profile_id: {'done', 'total', 'to_review'}} for the tenant board."""
+    total = query("SELECT COUNT(*) AS n FROM onboarding_requirements WHERE landlord_id=%s AND is_active=1 AND required=1",
+                  (lp_id,), fetchone=True)['n']
+    rows = query("""SELECT tr.tenant_id,
+               SUM(r.required=1 AND tr.status IN ('approved','waived')) AS done,
+               SUM(tr.status='submitted') AS to_review
+        FROM tenant_requirements tr JOIN onboarding_requirements r ON r.id=tr.requirement_id
+        WHERE r.landlord_id=%s AND r.is_active=1 GROUP BY tr.tenant_id""", (lp_id,))
+    return {r['tenant_id']: {'done': int(r['done'] or 0), 'total': total, 'to_review': int(r['to_review'] or 0)}
+            for r in rows}, total
+
+def upsert_tenant_requirement(tp_id, req_id, **fields):
+    cols = ', '.join(fields)
+    marks = ', '.join(['%s'] * len(fields))
+    updates = ', '.join(f'{k}=VALUES({k})' for k in fields)
+    execute(f"""INSERT INTO tenant_requirements (tenant_id, requirement_id, {cols}) VALUES (%s,%s,{marks})
+                ON DUPLICATE KEY UPDATE {updates}""", (tp_id, req_id, *fields.values()))
+
+# ── landlord: the list (Settings) ──
+@app.route('/api/landlord/requirements', methods=['GET'])
+@require_auth('landlord')
+def list_requirements():
+    return ok(landlord_requirements(get_landlord_profile(g.current_user['id'])['id']))
+
+def _req_fields(data, partial):
+    f = {}
+    if 'label' in data or not partial:
+        label = (data.get('label') or '').strip()
+        if not label: raise ValueError('Give the requirement a name')
+        f['label'] = label[:255]
+    if 'description' in data: f['description'] = (data.get('description') or '').strip()[:500] or None
+    if 'kind' in data or not partial:
+        if data.get('kind', 'document') not in REQ_KINDS: raise ValueError('Unknown type')
+        f['kind'] = data.get('kind', 'document')
+    if 'required' in data or not partial: f['required'] = 1 if data.get('required', True) else 0
+    return f
+
+@app.route('/api/landlord/requirements', methods=['POST'])
+@require_auth('landlord')
+def create_requirement():
+    lp = get_landlord_profile(g.current_user['id'])
+    landlord_requirements(lp['id'])   # make sure the defaults exist first
+    try: f = _req_fields(request.get_json() or {}, partial=False)
+    except ValueError as e: return err(str(e))
+    nxt = query("SELECT COALESCE(MAX(sort_order),0)+1 AS n FROM onboarding_requirements WHERE landlord_id=%s",
+                (lp['id'],), fetchone=True)['n']
+    rid, _ = execute("""INSERT INTO onboarding_requirements (landlord_id,label,description,kind,required,sort_order)
+                        VALUES (%s,%s,%s,%s,%s,%s)""",
+                     (lp['id'], f['label'], f.get('description'), f['kind'], f['required'], nxt))
+    return ok({'id': rid}, status=201)
+
+@app.route('/api/landlord/requirements/<int:rid>', methods=['PATCH', 'DELETE'])
+@require_auth('landlord')
+def change_requirement(rid):
+    lp = get_landlord_profile(g.current_user['id'])
+    if not query("SELECT 1 FROM onboarding_requirements WHERE id=%s AND landlord_id=%s", (rid, lp['id']), fetchone=True):
+        return err('Not found', 404)
+    if request.method == 'DELETE':   # kept for tenants' history, just no longer asked
+        execute("UPDATE onboarding_requirements SET is_active=0 WHERE id=%s", (rid,))
+        return ok(msg='Removed')
+    data = request.get_json() or {}
+    try: f = _req_fields(data, partial=True)
+    except ValueError as e: return err(str(e))
+    if 'move' in data:   # -1 up / +1 down in the list
+        reqs = landlord_requirements(lp['id'])
+        ids = [r['id'] for r in reqs]
+        i = ids.index(rid); j = i + (1 if data['move'] > 0 else -1)
+        if 0 <= j < len(ids):
+            ids[i], ids[j] = ids[j], ids[i]
+            for n, x in enumerate(ids):
+                execute("UPDATE onboarding_requirements SET sort_order=%s WHERE id=%s", (n, x))
+    if f:
+        execute(f"UPDATE onboarding_requirements SET {', '.join(k + '=%s' for k in f)} WHERE id=%s", (*f.values(), rid))
+    return ok(msg='Saved')
+
+# ── landlord: one tenant's checklist ──
+def _landlord_tenant(tp_id):
+    lp = get_landlord_profile(g.current_user['id'])
+    link = query("""SELECT tl.is_active, tp.user_id FROM tenant_landlords tl JOIN tenant_profiles tp ON tp.id=tl.tenant_id
+                    WHERE tl.tenant_id=%s AND tl.landlord_id=%s""", (tp_id, lp['id']), fetchone=True)
+    return lp, link
+
+@app.route('/api/landlord/tenants/<int:tp_id>/checklist', methods=['GET'])
+@require_auth('landlord')
+def landlord_tenant_checklist(tp_id):
+    lp, link = _landlord_tenant(tp_id)
+    if not link: return err('Tenant not found', 404)
+    return ok(tenant_checklist(tp_id, lp['id']))
+
+@app.route('/api/landlord/tenants/<int:tp_id>/checklist/<int:rid>', methods=['PATCH'])
+@require_auth('landlord')
+def review_checklist_item(tp_id, rid):
+    """approve / reject (with a note) / waive / reset an item; landlord items are ticked off with
+    status=approved, optionally with a photo or PDF."""
+    lp, link = _landlord_tenant(tp_id)
+    if not link: return err('Tenant not found', 404)
+    req = query("SELECT * FROM onboarding_requirements WHERE id=%s AND landlord_id=%s", (rid, lp['id']), fetchone=True)
+    if not req: return err('Not found', 404)
+    data = request.get_json() or {}
+    status = data.get('status')
+    if status not in ('approved', 'rejected', 'waived', 'pending'): return err('Unknown status')
+    fields = {'status': status, 'note': (data.get('note') or '').strip()[:500] or None,
+              'reviewed_at': datetime.now(), 'reviewed_by': g.current_user['id']}
+    if req['kind'] == 'landlord' and 'file_url' in data:
+        cur = query("SELECT file_url FROM tenant_requirements WHERE tenant_id=%s AND requirement_id=%s", (tp_id, rid), fetchone=True)
+        if not upload_ok(data['file_url'], 'onboarding_photo', (cur or {}).get('file_url')):
+            return err('Invalid file. Please upload it with the file picker.')
+        fields['file_url'] = data['file_url'] or None
+    upsert_tenant_requirement(tp_id, rid, **fields)
+    if status == 'rejected' and req['kind'] != 'landlord':
+        push_notification(link['user_id'], f'Please redo: {req["label"]}',
+                          fields['note'] or 'Your landlord asked you to send this again.', 'system', page='t-checklist')
+    return ok(msg='Saved')
+
+# ── tenant: my checklist(s) ──
+@app.route('/api/tenant/checklist', methods=['GET'])
+@require_auth('tenant')
+def my_checklists():
+    tp = get_tenant_profile(g.current_user['id'])
+    out = []
+    for l in query("""SELECT lp.id, lp.business_name, lu.full_name AS landlord_name FROM tenant_landlords tl
+                      JOIN landlord_profiles lp ON lp.id=tl.landlord_id JOIN users lu ON lu.id=lp.user_id
+                      WHERE tl.tenant_id=%s AND tl.is_active=1""", (tp['id'],)):
+        out.append({'landlord_id': l['id'], 'landlord': l['business_name'] or l['landlord_name'],
+                    **tenant_checklist(tp['id'], l['id'])})
+    return ok(out)
+
+@app.route('/api/tenant/checklist/<int:rid>', methods=['POST'])
+@require_auth('tenant')
+def submit_checklist_item(rid):
+    tp = get_tenant_profile(g.current_user['id'])
+    req = query("""SELECT r.*, lp.user_id AS landlord_user_id FROM onboarding_requirements r
+                   JOIN landlord_profiles lp ON lp.id=r.landlord_id
+                   JOIN tenant_landlords tl ON tl.landlord_id=r.landlord_id AND tl.tenant_id=%s AND tl.is_active=1
+                   WHERE r.id=%s AND r.is_active=1""", (tp['id'], rid), fetchone=True)
+    if not req or req['kind'] == 'landlord': return err('Not found', 404)
+    cur = query("SELECT status, file_url FROM tenant_requirements WHERE tenant_id=%s AND requirement_id=%s",
+                (tp['id'], rid), fetchone=True) or {}
+    if cur.get('status') in ('approved', 'waived'): return err('This one is already done', 409)
+    data = request.get_json() or {}
+    fields = {'status': 'submitted', 'submitted_at': datetime.now(), 'note': None}
+    if req['kind'] == 'document':
+        url = data.get('file_url')
+        if not url or not upload_ok(url, 'tenant_document', cur.get('file_url')):
+            return err('Please upload the file with the file picker.')
+        fields['file_url'] = url
+    else:
+        answer = (data.get('answer') or '').strip()
+        if not answer: return err('Please fill this in')
+        fields['answer'] = answer[:2000]
+    upsert_tenant_requirement(tp['id'], rid, **fields)
+    push_notification(req['landlord_user_id'], f'{g.current_user["full_name"]} sent: {req["label"]}',
+                      'Open their profile to review it.', 'system')
+    return ok(msg='Sent to your landlord')
+
+
+# ════════════════════════════════════════════════════════════
+# ACCOUNT & LANDLORD SETTINGS
+# ════════════════════════════════════════════════════════════
+@app.route('/api/auth/profile', methods=['PATCH'])
+@require_auth()
+def update_profile():
+    """Account page: name and phone (and business name for landlords). Email has its own
+    verified flow (/auth/change-email)."""
+    data = request.get_json() or {}
+    u = g.current_user
+    name = (data.get('full_name') or '').strip()
+    if not name: return err('Name is required')
+    if len(name) > 150: return err('Name is too long')
+    phone = (data.get('phone') or '').strip()[:30] or None
+    execute("UPDATE users SET full_name=%s, phone=%s WHERE id=%s", (name, phone, u['id']))
+    if u['role'] == 'landlord' and 'business_name' in data:
+        execute("UPDATE landlord_profiles SET business_name=%s WHERE user_id=%s",
+                ((data.get('business_name') or '').strip()[:255] or None, u['id']))
+    return ok(msg='Saved')
+
+@app.route('/api/landlord/settings', methods=['GET', 'PATCH'])
+@require_auth('landlord')
+def landlord_settings():
+    lp = get_landlord_profile(g.current_user['id'])
+    if request.method == 'PATCH':
+        data = request.get_json() or {}
+        if 'rent_due_day' in data:
+            try: day = int(data['rent_due_day'])
+            except (TypeError, ValueError): return err('Due day must be a number')
+            if not 1 <= day <= 28: return err('Due day must be 1 to 28')
+            execute("UPDATE landlord_profiles SET rent_due_day=%s WHERE id=%s", (day, lp['id']))
+        return ok(msg='Saved')
+    return ok({'rent_due_day': lp.get('rent_due_day') or 7})
 
 
 # ════════════════════════════════════════════════════════════

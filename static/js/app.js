@@ -591,26 +591,32 @@ function buildNav() {
   const role = currentUser.role; let items = [];
   if (role === 'landlord') items = [
     { id: 'dashboard', icon: '📊', label: 'Dashboard', fn: loadLandlordDashboard },
-    { id: 'properties', icon: '🏢', label: 'Properties', fn: loadProperties },
-    { id: 'units', icon: '🚪', label: 'Units', fn: loadUnits },
+    { id: 'properties', icon: '🏢', label: 'Properties & Units', fn: loadProperties },
     { id: 'tenants', icon: '👥', label: 'Tenants', fn: loadTenants },
     { id: 'contracts', icon: '📋', label: 'Contracts', fn: loadContracts },
+    { group: 'gen-bills', icon: '⚡', label: 'Generate Bills', children: [
+      { id: 'gen-rent', icon: '🏠', label: 'Monthly Rent', fn: loadGenerateRent },
+      { id: 'water', icon: '💧', label: 'Water Bills', fn: loadWaterBilling },
+    ] },
     { id: 'bills', icon: '💰', label: 'Bills', fn: loadBills },
-    { id: 'water', icon: '💧', label: 'Water Billing', fn: loadWaterBilling },
     { id: 'payments', icon: '💳', label: 'Payments', fn: loadPayments },
     { id: 'announcements', icon: '📣', label: 'Announcements', fn: loadLandlordAnnouncements },
     { id: 'messages', icon: '💬', label: 'Messages', fn: loadMessages },
     { id: 'reminders', icon: '🔔', label: 'Reminders', fn: loadReminders },
     { id: 'support', icon: '🎫', label: 'Support', fn: () => loadSupport('landlord') },
     { id: 'l-settings', icon: '⚙️', label: 'Settings', fn: loadLandlordSettings },
+    { id: 'account', icon: '👤', label: 'Account', fn: loadAccount },
+    { id: 'billing', icon: '🧾', label: 'Billing & Plan', fn: loadBillingPlan },
   ];
   else if (role === 'tenant') items = [
     { id: 't-dashboard', icon: '📊', label: 'My Home', fn: loadTenantDashboard },
+    { id: 't-checklist', icon: '✅', label: 'Move-in Checklist', fn: loadTenantChecklist },
     { id: 't-contract', icon: '📋', label: 'My Contracts', fn: loadTenantContracts },
     { id: 't-bills', icon: '💰', label: 'My Bills', fn: loadTenantBills },
     { id: 't-announcements', icon: '📣', label: 'Announcements', fn: loadTenantAnnouncements },
     { id: 't-messages', icon: '💬', label: 'Messages', fn: loadTenantMessages },
     { id: 't-settings', icon: '⚙️', label: 'Settings', fn: loadTenantSettings },
+    { id: 'account', icon: '👤', label: 'Account', fn: loadAccount },
     { id: 't-support', icon: '🎫', label: 'Support', fn: () => loadSupport('tenant') },
   ];
   else if (role === 'admin') items = [
@@ -621,16 +627,32 @@ function buildNav() {
     { id: 'admin-tickets', icon: '🎫', label: 'Support Tickets', fn: loadAdminTickets },
     { id: 'admin-chat', icon: '💬', label: 'Live Chat', fn: loadAdminChat },
     { id: 'admin-audit', icon: '📝', label: 'Audit Log', fn: loadAdminAudit },
+    { id: 'account', icon: '👤', label: 'Account', fn: loadAccount },
   ];
   NAV = {};
-  items.forEach(item => {
+  const navItem = (item, parent) => {
     NAV[item.id] = item;
     const el = document.createElement('div');
-    el.className = 'nav-item'; el.id = 'nav-' + item.id;
+    el.className = 'nav-item' + (parent ? ' nav-child' : ''); el.id = 'nav-' + item.id;
     el.innerHTML = `<span class="nav-icon">${item.icon}</span><span>${esc(item.label)}</span>`;
     el.onclick = () => { goPage(item.id); closeSidebar(); };
-    nav.appendChild(el);
+    return el;
+  };
+  items.forEach(item => {
+    if (!item.group) { nav.appendChild(navItem(item)); return; }
+    // A group (e.g. Generate Bills): tap to open its sub-menu
+    const wrap = document.createElement('div');
+    wrap.className = 'nav-group-wrap'; wrap.id = 'navgroup-' + item.group;
+    const head = document.createElement('div');
+    head.className = 'nav-item nav-group';
+    head.innerHTML = `<span class="nav-icon">${item.icon}</span><span>${esc(item.label)}</span><span class="nav-caret">›</span>`;
+    head.onclick = () => wrap.classList.toggle('open');
+    const kids = document.createElement('div'); kids.className = 'nav-children';
+    item.children.forEach(c => kids.appendChild(navItem(c, item)));
+    wrap.append(head, kids);
+    nav.appendChild(wrap);
   });
+  items = items.flatMap(i => i.group ? i.children : [i]);
   // A tapped notification wins, then the page in the address (refresh), then the first page
   const opened = PENDING_OPEN_PAGE && NAV[PENDING_OPEN_PAGE];
   if (opened) goPage(PENDING_OPEN_PAGE);
@@ -647,7 +669,6 @@ function goPage(id) {
 // Views inside a page open on top of their parent page, so back still works after a refresh.
 const SUB_ROUTES = {
   tenant: { parent: 'tenants', open: id => openTenantProfile(id) },
-  units: { parent: 'properties', open: id => openPropertyUnits(id) },
   water: { parent: 'water', open: id => viewWaterSession(id) },
   chat: { parent: 'admin-chat', open: id => openAdminChat(id) },
 };
@@ -705,6 +726,7 @@ function setPage(id) {
   const pg = document.getElementById('page-' + id); if (pg) pg.classList.add('active');
   document.querySelectorAll('.nav-item').forEach(n => n.classList.remove('active'));
   const ni = document.getElementById('nav-' + id); if (ni) ni.classList.add('active');
+  const grp = ni && ni.closest('.nav-group-wrap'); if (grp) grp.classList.add('open');
   const labels = { 't-dashboard': 'My Home', 'admin-stats': 'Platform Overview', 'admin-chat': 'Live Support Chat' };
   document.getElementById('topbar-title').textContent = labels[id] || (NAV[id] && NAV[id].label) || '';
 }
@@ -976,9 +998,9 @@ async function loadLandlordDashboard() {
     pg.innerHTML = `${remBanners}
       <div class="stats-grid">
         ${stat(s.total_properties || 0, 'Properties', 'properties')}
-        ${stat(s.total_units || 0, 'Units', 'units')}
-        ${stat(s.occupied_units || 0, 'Occupied', 'units')}
-        ${stat(s.vacant_units || 0, 'Vacant', 'units')}
+        ${stat(s.total_units || 0, 'Units', 'properties')}
+        ${stat(s.occupied_units || 0, 'Occupied', 'properties')}
+        ${stat(s.vacant_units || 0, 'Vacant', 'properties')}
         ${stat(s.total_tenants || 0, 'Tenants', 'tenants')}
         ${stat(s.pending_payments || 0, 'Payments to Review', 'payments')}
         ${stat('₱' + fmt(s.outstanding_amount || 0), 'Unpaid Bills', 'bills')}
@@ -1033,22 +1055,35 @@ async function refreshPropertyFeatureNav(props) {
 async function loadProperties() {
   const pg = document.getElementById('page-properties'); pg.innerHTML = loadingHtml;
   try {
-    const [props, defs] = await Promise.all([apiFetch('/properties'), featureDefs()]);
+    const [props, defs, units] = await Promise.all([apiFetch('/properties'), featureDefs(), apiFetch('/units')]);
     refreshPropertyFeatureNav(props);
+    const unitsOf = pid => units.filter(u => u.property_id === pid).sort(byUnit);
     pg.innerHTML = `<div class="card"><div class="card-header"><h3>Properties (${_props.length})</h3>
       <button class="btn btn-brand" onclick="showPropertySetup()">+ Add Property</button></div>
-      ${!_props.length ? '<div class="empty-state"><div class="icon">🏢</div><p>No properties yet</p></div>' :
-        `<div class="table-wrap"><table><thead><tr><th>Name</th><th>Address</th><th>Units</th><th>Occupied</th><th>Actions</th></tr></thead><tbody>
-        ${_props.map(p => `<tr><td><strong>${esc(p.name)}</strong>
-            <div class="feature-tags">${defs.filter(f => hasFeature(p, f.key)).map(f => `<span>${esc(f.label)}</span>`).join('')}</div></td>
-          <td>${esc(p.address)}${p.city ? ', ' + esc(p.city) : ''}</td><td>${esc(p.unit_count || 0)}</td><td>${esc(p.occupied || 0)}/${esc(p.unit_count || 0)}</td>
-          <td><div class="btn-group"><button class="btn btn-sm btn-brand" onclick="showPropertySetup(${parseInt(p.id)})">⚙️ Setup</button>
-          <button class="btn btn-sm btn-outline" onclick="openPropertyUnits(${parseInt(p.id)})">Units</button>
-          <button class="btn btn-sm btn-red" onclick="deleteProperty(${parseInt(p.id)})">Delete</button></div></td></tr>`).join('')}
-        </tbody></table></div>`}
-    </div>`;
+      <p class="muted-text">Tap a property to see and add its units.</p></div>
+      ${!_props.length ? '<div class="card"><div class="empty-state"><div class="icon">🏢</div><p>No properties yet</p></div></div>' :
+        _props.map(p => { const us = unitsOf(p.id); return `
+        <details class="card group-card prop-card" data-prop="${parseInt(p.id)}" ${_openProps.has(p.id) ? 'open' : ''}
+            ontoggle="this.open ? _openProps.add(${parseInt(p.id)}) : _openProps.delete(${parseInt(p.id)})">
+          <summary class="group-head">
+            <span style="min-width:0"><h3>🏢 ${esc(p.name)}</h3>
+              <span class="muted-text small">${esc(p.address)}${p.city ? ', ' + esc(p.city) : ''}</span>
+              <div class="feature-tags">${defs.filter(f => hasFeature(p, f.key)).map(f => `<span>${esc(f.label)}</span>`).join('')}</div></span>
+            <span class="row-flags"><span class="muted-text small">${esc(p.occupied || 0)}/${esc(p.unit_count || 0)} occupied</span>${chevron}</span>
+          </summary>
+          ${us.length ? `<div class="unit-lines">${us.map(u => `<div class="unit-line">
+              <span class="row-unit">Unit ${esc(u.unit_number)}</span>
+              <span class="unit-facts">${u.bedrooms != null ? esc(u.bedrooms) + ' bed · ' : ''}${u.floor_num != null ? 'floor ' + esc(u.floor_num) + ' · ' : ''}₱${fmt(u.rent_amount)}/mo</span>
+              ${badge(u.status)}</div>`).join('')}</div>` : '<p class="muted-text">No units yet.</p>'}
+          <div class="btn-group" style="margin-top:12px">
+            <button class="btn btn-sm btn-brand" onclick="showAddUnit(${parseInt(p.id)})">+ Add Unit</button>
+            <button class="btn btn-sm btn-outline" onclick="showPropertySetup(${parseInt(p.id)})">⚙️ Setup</button>
+            <button class="btn btn-sm btn-red" onclick="deleteProperty(${parseInt(p.id)})">Delete</button>
+          </div>
+        </details>`; }).join('')}`;
   } catch (e) { pg.innerHTML = errHtml(e); }
 }
+const _openProps = new Set();   // which properties are expanded (kept while you move around)
 // Add a property, or change one's details and which features it uses
 async function showPropertySetup(propId) {
   let defs;
@@ -1086,37 +1121,6 @@ async function deleteProperty(id) {
 // ═══════════════════════════════════════════════
 // UNITS
 // ═══════════════════════════════════════════════
-const unitRow = (u, withProp) => `<tr>${withProp ? `<td>${esc(u.property_name || '—')}</td>` : ''}<td><strong>${esc(u.unit_number)}</strong></td>
-  ${withProp ? '' : `<td>${esc(u.floor_num ?? '—')}</td>`}<td>${esc(u.bedrooms ?? '—')}</td><td>₱${fmt(u.rent_amount)}/mo</td><td>${badge(u.status)}</td></tr>`;
-async function loadUnits() {
-  const pg = document.getElementById('page-units'); pg.innerHTML = loadingHtml;
-  try {
-    const [units, props] = await Promise.all([apiFetch('/units'), apiFetch('/properties')]);
-    _props = props;
-    pg.innerHTML = `<div class="card"><div class="card-header"><h3>All Units (${units.length})</h3>
-      <button class="btn btn-brand" onclick="showAddUnit()">+ Add Unit</button></div>
-      ${!units.length ? '<div class="empty-state"><p>No units yet</p></div>' :
-        `<div class="table-wrap"><table><thead><tr><th>Property</th><th>Unit</th><th>Beds</th><th>Rent</th><th>Status</th></tr></thead><tbody>
-        ${units.map(u => unitRow(u, true)).join('')}</tbody></table></div>`}
-    </div>`;
-  } catch (e) { pg.innerHTML = errHtml(e); }
-}
-function openPropertyUnits(propId) { showView('units', () => loadUnitsForProperty(propId), 'units/' + propId); }
-async function loadUnitsForProperty(propId) {
-  const pg = document.getElementById('page-units'); pg.innerHTML = loadingHtml;
-  try {
-    const [units, props] = await Promise.all([apiFetch('/units?property_id=' + propId), apiFetch('/properties')]);
-    _props = props;
-    const prop = props.find(p => p.id === propId) || {};
-    pg.innerHTML = `<div class="card"><div class="card-header"><h3>Units — ${esc(prop.name)}</h3>
-      <div class="btn-group"><button class="btn btn-outline" onclick="goPage('units')">All Units</button>
-      <button class="btn btn-brand" onclick="showAddUnit(${parseInt(propId)})">+ Add Unit</button></div></div>
-      ${!units.length ? '<div class="empty-state"><p>No units</p></div>' :
-        `<div class="table-wrap"><table><thead><tr><th>Unit</th><th>Floor</th><th>Beds</th><th>Rent</th><th>Status</th></tr></thead><tbody>
-        ${units.map(u => unitRow(u, false)).join('')}</tbody></table></div>`}
-    </div>`;
-  } catch (e) { pg.innerHTML = errHtml(e); }
-}
 function showAddUnit(propId) {
   if (!_props.length) { alert('Add a property first.'); return; }
   openModal('Add Unit', `
@@ -1140,7 +1144,7 @@ async function submitAddUnit() {
   };
   document.getElementById('m-unit-err').textContent = '';
   if (!body.unit_number || !body.rent_amount) { document.getElementById('m-unit-err').textContent = 'Unit number and rent are required'; return; }
-  try { await apiFetch('/units', { method: 'POST', body: JSON.stringify(body) }); closeModalDirect(); loadUnitsForProperty(parseInt(body.property_id)); }
+  try { await apiFetch('/units', { method: 'POST', body: JSON.stringify(body) }); closeModalDirect(); _openProps.add(parseInt(body.property_id)); loadProperties(); }
   catch (e) { document.getElementById('m-unit-err').textContent = e.message; }
 }
 
@@ -1166,7 +1170,7 @@ function renderTenantBoard() {
   const tenantLine = (c) => `
     <details class="row-toggle">
       <summary><span class="row-main"><span class="row-unit">${esc(c._unit)}</span><span class="row-name">${esc(c.full_name)}</span></span>
-        <span class="row-flags">${c.status === 'move_out_pending' ? '<span class="badge badge-orange">Moving out</span>' : ''}
+        <span class="row-flags">${checklistFlag(c.checklist)}${c.status === 'move_out_pending' ? '<span class="badge badge-orange">Moving out</span>' : ''}
           ${c.overdue > 0 ? `<span class="badge badge-red">${parseInt(c.overdue)} overdue</span>` : ''}${chevron}</span></summary>
       <div class="row-body">
         <div class="field-grid">
@@ -1208,7 +1212,7 @@ function renderTenantBoard() {
     ${waiting.length ? `<div class="card group-card">
       <div class="group-head"><h3>🕓 Joined — waiting for a unit</h3><span class="muted-text">${waiting.length}</span></div>
       ${waiting.map(t => `<details class="row-toggle">
-        <summary><span class="row-main"><span class="row-name">${esc(t.full_name)}</span></span><span class="row-flags">${chevron}</span></summary>
+        <summary><span class="row-main"><span class="row-name">${esc(t.full_name)}</span></span><span class="row-flags">${checklistFlag(t.checklist)}${chevron}</span></summary>
         <div class="row-body">
           <div class="field-grid">${field('Contact', `${esc(t.email)}${t.phone ? '<br>' + esc(t.phone) : ''}`)}${field('Joined', fmtDate(t.joined_at))}</div>
           <div class="btn-group" style="margin-top:12px">
@@ -1232,6 +1236,13 @@ function renderTenantBoard() {
   const s = document.getElementById('tenant-search');
   if (q && s) { s.focus(); s.setSelectionRange(s.value.length, s.value.length); }
 }
+// "✓ 3/7" move-in checklist progress, plus how many items wait for the landlord's review
+function checklistFlag(cl) {
+  if (!cl || !cl.total) return '';
+  const done = cl.done >= cl.total;
+  return `${cl.to_review ? `<span class="badge badge-yellow">${cl.to_review} to review</span>` : ''}
+    <span class="badge ${done ? 'badge-green' : 'badge-gray'}" title="Move-in checklist">✓ ${cl.done}/${cl.total}</span>`;
+}
 async function archiveTenant(tpId) {
   if (!confirm('Move this tenant to Past Tenants? Their records stay; they can no longer be messaged. They can rejoin with your code.')) return;
   try { await apiFetch(`/landlord/tenants/${tpId}/archive`, { method: 'POST' }); loadTenants(); }
@@ -1246,7 +1257,9 @@ function openTenantProfile(tpId) { showView('tenants', () => loadTenantProfile(t
 async function loadTenantProfile(tpId) {
   const pg = document.getElementById('page-tenants'); pg.innerHTML = loadingHtml;
   try {
-    const data = await apiFetch(`/landlord/tenants/${tpId}/profile`);
+    const [data, checklist] = await Promise.all([apiFetch(`/landlord/tenants/${tpId}/profile`),
+      apiFetch(`/landlord/tenants/${tpId}/checklist`).catch(() => null)]);
+    data.checklist = checklist;
     _profile = { data, sort: { contracts: 'desc', bills: 'desc', payments: 'desc', water: 'desc', threads: 'desc' }, billType: 'all' };
     renderTenantProfile();
   } catch (e) { pg.innerHTML = errHtml(e); }
@@ -1268,6 +1281,7 @@ function setBillType(t) { _profile.billType = t; document.getElementById('ps-bil
 const step = (label, d, done) => `<span class="tl-step ${done ? 'done' : ''}">${label}${d ? ' · ' + fmtDate(d) : ''}</span>`;
 function profileSection(section) {
   const { data, sort } = _profile;
+  if (section === 'checklist') return checklistReviewHtml();
   if (section === 'contracts') {
     const list = sortedBy(data.contracts, 'start_date', sort.contracts);
     return list.length ? list.map(c => `<div class="record">
@@ -1329,7 +1343,7 @@ function renderTenantProfile() {
   const { data } = _profile; const t = data.tenant; const s = data.summary;
   const current = !!t.is_active;
   const sec = (key, title, count, open) => `<details class="card profile-section" ${open ? 'open' : ''}>
-      <summary class="group-head"><h3>${title} <span class="muted-text">(${count})</span></h3><span class="row-flags">${sortControl(key)}${chevron}</span></summary>
+      <summary class="group-head"><h3>${title} <span class="muted-text">(${count})</span></h3><span class="row-flags">${key === 'checklist' ? '' : sortControl(key)}${chevron}</span></summary>
       <div id="ps-${key}">${profileSection(key)}</div></details>`;
   document.getElementById('page-tenants').innerHTML = `
     <div class="card">
@@ -1349,6 +1363,7 @@ function renderTenantProfile() {
       <div class="stat-card"><div class="value">${s.on_time_rate === null ? '—' : s.on_time_rate + '%'}</div><div class="label">Paid on Time</div></div>
       <div class="stat-card"><div class="value">${parseInt(s.overdue_bills)}</div><div class="label">Overdue Bills</div></div>
     </div>
+    ${data.checklist ? sec('checklist', '✅ Move-in checklist', `${data.checklist.done}/${data.checklist.total}`, data.checklist.done < data.checklist.total || data.checklist.to_review > 0) : ''}
     ${sec('bills', '💰 Bills', data.bills.length, true)}
     ${sec('payments', '💳 Payments', data.payments.length, false)}
     ${sec('contracts', '📋 Contracts', data.contracts.length, true)}
@@ -1566,7 +1581,7 @@ async function loadBills() {
   try {
     const bills = await apiFetch('/bills');
     pg.innerHTML = `<div class="card"><div class="card-header"><h3>Bills</h3>
-      <div class="btn-group"><button class="btn btn-outline" onclick="generateMonthly()">⚡ Generate Monthly Rent</button>
+      <div class="btn-group"><button class="btn btn-outline" onclick="goPage('gen-rent')">⚡ Generate Bills</button>
       <button class="btn btn-brand" onclick="showCreateBill()">+ Add Bill</button></div></div>
       ${!bills.length ? '<div class="empty-state"><p>No bills yet</p></div>' :
         `<div class="table-wrap"><table><thead><tr><th>Tenant</th><th>Type</th><th>Description</th><th>Amount</th><th>Due</th><th>Status</th><th>Documents</th></tr></thead><tbody>
@@ -1578,11 +1593,6 @@ async function loadBills() {
         </tbody></table></div>`}
     </div>`;
   } catch (e) { pg.innerHTML = errHtml(e); }
-}
-async function generateMonthly() {
-  if (!confirm("Create this month's rent bill for each of your active contracts that doesn't have one yet?")) return;
-  try { const d = await apiFetch('/bills/generate-monthly', { method: 'POST' }); alert(`Done! ${d.bills_generated} bill(s) created and tenants notified.`); loadBills(); }
-  catch (e) { alert(e.message); }
 }
 async function showCreateBill() {
   let contracts;
@@ -2180,10 +2190,14 @@ let _bills = [];
 async function loadTenantDashboard() {
   const pg = document.getElementById('page-t-dashboard'); pg.innerHTML = loadingHtml;
   try {
-    const d = await apiFetch('/tenant/dashboard');
+    const [d, lists] = await Promise.all([apiFetch('/tenant/dashboard'), apiFetch('/tenant/checklist').catch(() => [])]);
     const landlords = d.landlords || []; _bills = d.bills || []; const unreadAnn = d.unread_announcements || 0;
+    const todo = lists.filter(l => l.done < l.total);
     const due = _bills.filter(b => b.status !== 'paid' && !b.payment_id);
     pg.innerHTML = `
+      ${todo.map(l => `<div class="reminder-banner"><span style="font-size:20px">✅</span>
+        <div style="flex:1"><strong>Move-in checklist for ${esc(l.landlord)}</strong>${progressBar(l.done, l.total)}
+        <div style="margin-top:6px"><button class="btn btn-sm btn-brand" onclick="goPage('t-checklist')">Open checklist</button></div></div></div>`).join('')}
       ${unreadAnn > 0 ? `<div class="reminder-banner"><span style="font-size:20px">📣</span>
         <div><strong>${unreadAnn} unread announcement${unreadAnn > 1 ? 's' : ''}</strong>
         <div style="margin-top:6px"><button class="btn btn-sm btn-brand" onclick="goPage('t-announcements')">View</button></div></div></div>` : ''}
@@ -2426,27 +2440,6 @@ function prefRowsHtml(rows, prefs) {
       <label class="toggle"><input type="checkbox" ${prefs[row.key] || prefs[row.key] === undefined ? 'checked' : ''}
           onchange="saveSinglePref('${row.key}', this.checked)"/><span class="toggle-slider"></span></label></div>`).join('');
 }
-function accountCardHtml(roleLabel) {
-  return `<div class="card">
-      <div class="card-header"><h3>👤 My Account</h3></div>
-      <div class="pref-row"><span class="pref-label">Name</span><strong>${esc(currentUser.full_name)}</strong></div>
-      <div class="pref-row"><span class="pref-label">Email</span><strong class="break">${esc(currentUser.email)}</strong></div>
-      <div class="pref-row"><span class="pref-label">Role</span><strong>${roleLabel}</strong></div>
-      <div class="btn-group" style="margin-top:16px">
-        <button class="btn btn-outline" onclick="showChangeEmail()">✉️ Change Email Address</button>
-        <button class="btn btn-outline" onclick="logout()">Sign Out</button>
-      </div>
-    </div>
-    <div class="card">
-      <div class="card-header"><h3>🔒 Password &amp; Security</h3></div>
-      <p class="muted-text">Changing your password signs you out on every other phone or computer.</p>
-      <div class="btn-group" style="margin-top:12px">
-        <button class="btn btn-brand" onclick="showChangePassword()">Change Password</button>
-        <button class="btn btn-outline" onclick="signOutOthers()">Sign Out Other Devices</button>
-      </div>
-      <p class="hint" style="margin-top:10px">Forgot it? Sign out and tap <em>Forgot your password?</em> to get a reset link by email.</p>
-    </div>`;
-}
 function showChangePassword() {
   openModal('Change Password', `
     <form onsubmit="event.preventDefault();submitChangePassword()">
@@ -2483,6 +2476,230 @@ async function signOutOthers() {
     alert('✅ Signed out on your other devices.');
   } catch (e) { alert(e.message); }
 }
+// ═══════════════════════════════════════════════
+// GENERATE BILLS → MONTHLY RENT — pick a month, see who gets billed, then create the bills
+// ═══════════════════════════════════════════════
+let _rentMonth = null;   // { month, year }
+async function loadGenerateRent() {
+  const pg = document.getElementById('page-gen-rent'); pg.innerHTML = loadingHtml;
+  const now = new Date();
+  if (!_rentMonth) _rentMonth = { month: now.getMonth() + 1, year: now.getFullYear() };
+  try {
+    const d = await apiFetch(`/bills/monthly-preview?month=${_rentMonth.month}&year=${_rentMonth.year}`);
+    const todo = d.contracts.filter(c => !c.billed && c.rent_billing);
+    const monthOpts = [-1, 0, 1, 2].map(k => {
+      const x = new Date(now.getFullYear(), now.getMonth() + k, 1);
+      const m = x.getMonth() + 1, y = x.getFullYear();
+      return `<option value="${y}-${m}" ${m === d.month && y === d.year ? 'selected' : ''}>${MONTHS[m - 1]} ${y}</option>`;
+    }).join('');
+    pg.innerHTML = `<div class="card">
+        <div class="card-header"><h3>🏠 Monthly Rent</h3>
+          <select class="month-select" onchange="const [y,m]=this.value.split('-');_rentMonth={year:+y,month:+m};loadGenerateRent()">${monthOpts}</select></div>
+        <p class="muted-text">Creates the rent bill for each tenant below and notifies them. Due on <strong>${fmtDate(d.due_date + 'T00:00:00')}</strong>
+          (day ${esc(d.rent_due_day)} — change it in <a href="#" onclick="event.preventDefault();goPage('l-settings')">Settings</a>).
+          A month is never billed twice.</p>
+      </div>
+      <div class="card">
+        ${!d.contracts.length ? '<div class="empty-state"><p>No active contracts for this month.</p></div>' : `
+        <div class="rent-list">
+          ${d.contracts.map(c => `<label class="rent-row ${c.billed || !c.rent_billing ? 'muted-row' : ''}">
+              <input type="checkbox" class="rent-pick" value="${parseInt(c.contract_id)}" ${!c.billed && c.rent_billing ? 'checked' : 'disabled'} onchange="rentPickCount()"/>
+              <span class="rent-who"><strong>${esc(c.tenant_name)}</strong><small class="muted-text">${esc(c.property_name)} · Unit ${esc(c.unit_number)}</small></span>
+              <span class="rent-amt">₱${fmt(c.monthly_rent)}
+                ${c.billed ? '<span class="badge badge-green">Billed</span>' : !c.rent_billing ? '<span class="badge badge-gray">Rent billing off</span>' : ''}</span>
+            </label>`).join('')}
+        </div>
+        <div class="btn-group" style="margin-top:14px">
+          <button class="btn btn-brand" id="rent-go" onclick="submitGenerateRent()" ${todo.length ? '' : 'disabled'}>⚡ Generate <span id="rent-count">${todo.length}</span> bill(s)</button>
+          <button class="btn btn-outline" onclick="goPage('bills')">View Bills</button>
+        </div>`}
+      </div>`;
+  } catch (e) { pg.innerHTML = errHtml(e); }
+}
+function rentPickCount() {
+  const n = document.querySelectorAll('.rent-pick:checked').length;
+  document.getElementById('rent-count').textContent = n;
+  document.getElementById('rent-go').disabled = !n;
+}
+async function submitGenerateRent() {
+  const ids = [...document.querySelectorAll('.rent-pick:checked')].map(cb => parseInt(cb.value));
+  if (!ids.length) return;
+  if (!confirm(`Create ${ids.length} rent bill(s) for ${MONTHS[_rentMonth.month - 1]} ${_rentMonth.year} and notify the tenants?`)) return;
+  try {
+    const d = await apiFetch('/bills/generate-monthly', { method: 'POST', body: JSON.stringify({ ..._rentMonth, contract_ids: ids }) });
+    alert(`✅ ${d.bills_generated} rent bill(s) created. Tenants were notified.`);
+    loadGenerateRent();
+  } catch (e) { alert(e.message); }
+}
+
+// ═══════════════════════════════════════════════
+// ACCOUNT — the person's own details, email, password, sign-out (both roles)
+// ═══════════════════════════════════════════════
+async function loadAccount() {
+  const pg = document.getElementById('page-account'); pg.innerHTML = loadingHtml;
+  try {
+    const me = await apiFetch('/auth/me');
+    currentUser = Object.assign({}, currentUser, me);
+    const landlord = me.role === 'landlord';
+    pg.innerHTML = `
+      <div class="card"><div class="card-header"><h3>👤 Profile</h3></div>
+        <div class="form-group"><label>Full Name</label><input type="text" id="acc-name" maxlength="150" value="${esc(me.full_name)}" autocomplete="name"/></div>
+        <div class="form-group"><label>Phone</label><input type="tel" id="acc-phone" maxlength="30" value="${esc(me.phone || '')}" autocomplete="tel"/></div>
+        ${landlord ? `<div class="form-group"><label>Business Name</label><input type="text" id="acc-biz" maxlength="255" value="${esc((me.profile || {}).business_name || '')}" autocomplete="organization"/>
+          <small class="hint">Shown to tenants and on bills and receipts.</small></div>` : ''}
+        <button class="btn btn-brand" onclick="saveAccount()">Save</button>
+        <p class="small-msg" id="acc-msg"></p>
+      </div>
+      <div class="card"><div class="card-header"><h3>✉️ Email</h3></div>
+        <div class="pref-row"><span class="pref-label">Sign-in email</span><strong class="break">${esc(me.email)}</strong></div>
+        <button class="btn btn-outline" style="margin-top:12px" onclick="showChangeEmail()">Change Email Address</button>
+      </div>
+      <div class="card">
+        <div class="card-header"><h3>🔒 Password &amp; Security</h3></div>
+        <p class="muted-text">Changing your password signs you out on every other phone or computer.</p>
+        <div class="btn-group" style="margin-top:12px">
+          <button class="btn btn-brand" onclick="showChangePassword()">Change Password</button>
+          <button class="btn btn-outline" onclick="signOutOthers()">Sign Out Other Devices</button>
+        </div>
+        <p class="hint" style="margin-top:10px">Forgot it? Sign out and tap <em>Forgot your password?</em> to get a reset link by email.</p>
+      </div>
+      <div class="card"><button class="btn btn-outline" onclick="logout()">Sign Out</button></div>`;
+  } catch (e) { pg.innerHTML = errHtml(e); }
+}
+async function saveAccount() {
+  const msg = document.getElementById('acc-msg');
+  const body = { full_name: document.getElementById('acc-name').value.trim(), phone: document.getElementById('acc-phone').value.trim() };
+  const biz = document.getElementById('acc-biz'); if (biz) body.business_name = biz.value.trim();
+  try {
+    await apiFetch('/auth/profile', { method: 'PATCH', body: JSON.stringify(body) });
+    currentUser.full_name = body.full_name;
+    localStorage.setItem('shiloh_user', JSON.stringify(currentUser));
+    document.getElementById('sidebar-name').textContent = body.full_name;
+    document.getElementById('sidebar-avatar').textContent = (body.full_name || 'U')[0].toUpperCase();
+    msg.className = 'small-msg ok'; msg.textContent = '✅ Saved';
+  } catch (e) { msg.className = 'small-msg bad'; msg.textContent = e.message; }
+}
+
+// ═══════════════════════════════════════════════
+// BILLING & PLAN — the landlord's own Shiloh Living plan (charging is off until configured)
+// ═══════════════════════════════════════════════
+async function loadBillingPlan() {
+  const pg = document.getElementById('page-billing'); pg.innerHTML = loadingHtml;
+  try {
+    const me = await apiFetch('/auth/me');
+    const sub = (me.profile || {}).subscription || {};
+    const days = n => `${esc(n)} day${n === 1 ? '' : 's'}`;
+    let plan;
+    if (!sub.enforced) plan = `<div class="plan-state"><span class="badge badge-green">Early access</span>
+        <p>Shiloh Living is free while we're in early access — you won't be charged.</p>
+        <p class="muted-text">When paid plans start, your plan, how to pay and your receipts will show up here. We'll tell you well before anything changes.</p></div>`;
+    else if (sub.state === 'exempt') plan = `<div class="plan-state"><span class="badge badge-blue">Free forever</span><p>Your account is free — nothing to pay.</p></div>`;
+    else if (sub.state === 'paid') plan = `<div class="plan-state"><span class="badge badge-green">Paid</span><p>Paid until <strong>${fmtDate(sub.paid_until)}</strong> (${days(sub.days_left)} left).</p></div>`;
+    else if (sub.state === 'trial') plan = `<div class="plan-state"><span class="badge badge-yellow">Free trial</span><p><strong>${days(sub.days_left)} left</strong> — ends ${fmtDateTime(sub.trial_ends_at)}.</p></div>`;
+    else plan = `<div class="plan-state"><span class="badge badge-red">Trial ended</span><p>You can still view everything, but changes are paused until you subscribe.</p></div>`;
+    pg.innerHTML = `
+      <div class="card"><div class="card-header"><h3>💳 Your Plan</h3></div>${plan}</div>
+      ${sub.enforced && sub.state !== 'exempt' ? `<div class="card"><div class="card-header"><h3>How to pay</h3></div>
+        <p>${esc(sub.pay_info)}</p>
+        <button class="btn btn-brand" style="margin-top:10px" onclick="goPage('support')">💬 Send your payment screenshot to Support</button></div>` : ''}
+      <div class="card"><div class="card-header"><h3>🧾 Payment History</h3></div>
+        <div class="empty-state"><p>No payments yet.</p></div></div>`;
+  } catch (e) { pg.innerHTML = errHtml(e); }
+}
+
+// ═══════════════════════════════════════════════
+// SETTINGS (landlord) — notifications, invite, rent due day, move-in checklist
+// ═══════════════════════════════════════════════
+const REQ_KIND = { document: '📎 Tenant uploads a file', info: '✍️ Tenant answers', landlord: '✔️ You tick it off' };
+async function loadLandlordSettings() {
+  const pg = document.getElementById('page-l-settings'); pg.innerHTML = loadingHtml;
+  try {
+    const [prefs, st, reqs] = await Promise.all([apiFetch('/notification-preferences'), apiFetch('/landlord/settings'), apiFetch('/landlord/requirements')]);
+    pg.innerHTML = `
+      ${pushCardHtml()}
+      <div class="card"><div class="card-header"><h3>👋 Invite Tenants</h3></div>
+        <p class="muted-text">Your join code, link and QR code. Make a new code there if the old one got shared too widely.</p>
+        <button class="btn btn-brand" style="margin-top:10px" onclick="showLandlordInvite()">Open Invite</button></div>
+      <div class="card"><div class="card-header"><h3>💰 Billing</h3></div>
+        <div class="form-group" style="max-width:260px"><label>Rent is due on day</label>
+          <input type="number" id="set-due-day" min="1" max="28" value="${esc(st.rent_due_day)}"/>
+          <small class="hint">Of each month (1–28). Used by Generate Bills → Monthly Rent.</small></div>
+        <button class="btn btn-brand" onclick="saveDueDay()">Save</button> <span class="small-msg" id="due-msg"></span>
+      </div>
+      <div class="card"><div class="card-header"><h3>📋 Move-in Checklist</h3>
+          <button class="btn btn-sm btn-brand" onclick="editRequirement()">+ Add Item</button></div>
+        <p class="muted-text">What every new tenant needs to give you or finish before moving in. Tenants see it in their app; you review it on their profile.</p>
+        <div id="req-list">${requirementsHtml(reqs)}</div>
+      </div>
+      <div class="card"><div class="card-header"><h3>📧 Email Notifications</h3></div>
+        ${prefRowsHtml([
+          { key: 'email_tenant_message', label: 'Message received from a tenant' },
+          { key: 'email_contract_acknowledged', label: 'Tenant acknowledges a signed contract' },
+          { key: 'email_payment_submitted', label: 'Tenant submits a payment proof' },
+          { key: 'email_new_tenant_joined', label: 'New tenant joins using your code' },
+        ], prefs)}
+        <div id="pref-save-msg" class="small-msg ok" style="display:none">✅ Saved</div>
+      </div>
+      <p class="hint center">Your name, email and password are on the <a href="#" onclick="event.preventDefault();goPage('account')">Account</a> page.</p>`;
+    window._reqs = reqs;
+    wirePushCard();
+  } catch (e) { pg.innerHTML = errHtml(e); }
+}
+function requirementsHtml(reqs) {
+  return reqs.length ? reqs.map((r, i) => `<div class="req-row">
+      <div class="req-main"><strong>${esc(r.label)}</strong> ${r.required ? '' : '<span class="badge badge-gray">Optional</span>'}
+        <small class="muted-text">${REQ_KIND[r.kind]}${r.description ? ' · ' + esc(r.description) : ''}</small></div>
+      <div class="btn-group req-actions">
+        <button class="btn btn-sm btn-outline" title="Move up" onclick="moveRequirement(${parseInt(r.id)},-1)" ${i === 0 ? 'disabled' : ''}>↑</button>
+        <button class="btn btn-sm btn-outline" title="Move down" onclick="moveRequirement(${parseInt(r.id)},1)" ${i === reqs.length - 1 ? 'disabled' : ''}>↓</button>
+        <button class="btn btn-sm btn-outline" onclick="editRequirement(${parseInt(r.id)})">Edit</button>
+        <button class="btn btn-sm btn-red" onclick="removeRequirement(${parseInt(r.id)})">Remove</button>
+      </div></div>`).join('') : '<p class="muted-text">No items. Tap “+ Add Item”.</p>';
+}
+async function reloadRequirements() {
+  window._reqs = await apiFetch('/landlord/requirements');
+  document.getElementById('req-list').innerHTML = requirementsHtml(window._reqs);
+}
+function editRequirement(id) {
+  const r = (window._reqs || []).find(x => x.id === id) || { kind: 'document', required: 1 };
+  openModal(id ? 'Edit Checklist Item' : 'Add Checklist Item', `
+    <div class="form-group"><label>What you need</label><input type="text" id="rq-label" maxlength="255" value="${esc(r.label || '')}" placeholder="e.g. Valid government ID"/></div>
+    <div class="form-group"><label>Details for the tenant (optional)</label><input type="text" id="rq-desc" maxlength="500" value="${esc(r.description || '')}"/></div>
+    <div class="form-group"><label>How it's done</label><select id="rq-kind">
+      ${Object.entries(REQ_KIND).map(([k, l]) => `<option value="${k}" ${r.kind === k ? 'selected' : ''}>${l}</option>`).join('')}</select></div>
+    <div class="form-group check-box"><label><input type="checkbox" id="rq-req" ${r.required ? 'checked' : ''}/> <span>Required</span></label></div>
+    <p class="err-msg" id="rq-err"></p>`,
+    `<button class="btn btn-outline" onclick="closeModalDirect()">Cancel</button>
+     <button class="btn btn-brand" onclick="saveRequirement(${id ? parseInt(id) : 'null'})">Save</button>`);
+}
+async function saveRequirement(id) {
+  const body = { label: document.getElementById('rq-label').value.trim(), description: document.getElementById('rq-desc').value.trim(),
+    kind: document.getElementById('rq-kind').value, required: document.getElementById('rq-req').checked };
+  try {
+    await apiFetch(id ? `/landlord/requirements/${id}` : '/landlord/requirements', { method: id ? 'PATCH' : 'POST', body: JSON.stringify(body) });
+    closeModalDirect(); reloadRequirements();
+  } catch (e) { document.getElementById('rq-err').textContent = e.message; }
+}
+async function moveRequirement(id, dir) {
+  try { await apiFetch(`/landlord/requirements/${id}`, { method: 'PATCH', body: JSON.stringify({ move: dir }) }); reloadRequirements(); }
+  catch (e) { alert(e.message); }
+}
+async function removeRequirement(id) {
+  if (!confirm('Remove this item? Tenants who already sent it keep their records.')) return;
+  try { await apiFetch(`/landlord/requirements/${id}`, { method: 'DELETE' }); reloadRequirements(); }
+  catch (e) { alert(e.message); }
+}
+async function saveDueDay() {
+  const msg = document.getElementById('due-msg');
+  try {
+    await apiFetch('/landlord/settings', { method: 'PATCH', body: JSON.stringify({ rent_due_day: document.getElementById('set-due-day').value }) });
+    msg.className = 'small-msg ok'; msg.textContent = '✅ Saved';
+  } catch (e) { msg.className = 'small-msg bad'; msg.textContent = e.message; }
+}
+
+// ═══════════════════════════════════════════════
+// SETTINGS (tenant)
+// ═══════════════════════════════════════════════
 async function loadTenantSettings() {
   const pg = document.getElementById('page-t-settings'); pg.innerHTML = loadingHtml;
   try {
@@ -2504,32 +2721,113 @@ async function loadTenantSettings() {
         ], prefs)}
         <div id="pref-save-msg" class="small-msg ok" style="display:none">✅ Saved</div>
       </div>
-      ${accountCardHtml('Tenant')}`;
+      <p class="hint center">Your name, email and password are on the <a href="#" onclick="event.preventDefault();goPage('account')">Account</a> page.</p>`;
     wirePushCard();
   } catch (e) { pg.innerHTML = errHtml(e); }
 }
-async function loadLandlordSettings() {
-  const pg = document.getElementById('page-l-settings'); pg.innerHTML = loadingHtml;
+
+// ═══════════════════════════════════════════════
+// MOVE-IN CHECKLIST — tenant side
+// ═══════════════════════════════════════════════
+const REQ_STATUS = { pending: ['To do', 'gray'], submitted: ['Sent — waiting for review', 'yellow'], approved: ['Done', 'green'],
+  rejected: ['Please redo', 'red'], waived: ['Not needed', 'blue'] };
+const reqBadge = s => `<span class="badge badge-${REQ_STATUS[s][1]}">${REQ_STATUS[s][0]}</span>`;
+const progressBar = (done, total) => `<div class="progress"><span style="width:${total ? Math.round(100 * done / total) : 100}%"></span></div>
+  <div class="muted-text small">${done} of ${total} required item${total === 1 ? '' : 's'} done</div>`;
+async function loadTenantChecklist() {
+  const pg = document.getElementById('page-t-checklist'); pg.innerHTML = loadingHtml;
   try {
-    const prefs = await apiFetch('/notification-preferences');
-    pg.innerHTML = `
-      ${pushCardHtml()}
-      <div class="card"><div class="card-header"><h3>👋 Invite Tenants</h3></div>
-        <p class="muted-text">Your join code, link and QR code. Make a new code there if the old one got shared too widely.</p>
-        <button class="btn btn-brand" style="margin-top:10px" onclick="showLandlordInvite()">Open Invite</button></div>
-      <div class="card"><div class="card-header"><h3>📧 Email Notifications</h3></div>
-        ${prefRowsHtml([
-          { key: 'email_tenant_message', label: 'Message received from a tenant' },
-          { key: 'email_contract_acknowledged', label: 'Tenant acknowledges a signed contract' },
-          { key: 'email_payment_submitted', label: 'Tenant submits a payment proof' },
-          { key: 'email_new_tenant_joined', label: 'New tenant joins using your code' },
-        ], prefs)}
-        <div id="pref-save-msg" class="small-msg ok" style="display:none">✅ Saved</div>
-      </div>
-      ${accountCardHtml('Landlord')}`;
-    wirePushCard();
+    const lists = await apiFetch('/tenant/checklist');
+    pg.innerHTML = !lists.length ? '<div class="card"><div class="empty-state"><p>Join a landlord to see their move-in checklist.</p></div></div>'
+      : lists.map(l => `<div class="card">
+        <div class="card-header"><h3>📋 ${esc(l.landlord)}</h3></div>
+        ${progressBar(l.done, l.total)}
+        ${l.items.map(i => {
+          const open = i.status !== 'approved' && i.status !== 'waived';
+          return `<div class="record">
+            <div class="record-top"><strong>${esc(i.label)}${i.required ? '' : ' <span class="muted-text small">(optional)</span>'}</strong>${reqBadge(i.status)}</div>
+            ${i.description ? `<div class="record-meta">${esc(i.description)}</div>` : ''}
+            ${i.status === 'rejected' && i.note ? `<div class="warn-box">Your landlord: ${esc(i.note)}</div>` : ''}
+            ${i.kind === 'document' ? `<div class="btn-group" style="margin-top:8px">
+                ${i.file_url ? `<button class="btn btn-sm btn-outline" onclick="openDoc(${jsArg(i.file_url)})">📄 View what you sent</button>` : ''}
+                ${open ? `<button class="btn btn-sm btn-brand" onclick="sendChecklistFile(${parseInt(i.id)}, this)">📎 ${i.file_url ? 'Send a new file' : 'Upload'}</button>` : ''}
+              </div>`
+            : i.kind === 'info' ? (open ? `<textarea id="ans-${parseInt(i.id)}" rows="2" style="margin-top:8px" placeholder="Type here…">${esc(i.answer || '')}</textarea>
+                <button class="btn btn-sm btn-brand" style="margin-top:6px" onclick="sendChecklistAnswer(${parseInt(i.id)})">Send</button>`
+                : `<div class="record-meta" style="white-space:pre-wrap">${esc(i.answer || '')}</div>`)
+            : `<div class="record-meta">Your landlord checks this one off${i.file_url ? ` · <a href="#" onclick="event.preventDefault();openDoc(${jsArg(i.file_url)})">view</a>` : ''}.</div>`}
+          </div>`; }).join('')}
+      </div>`).join('');
   } catch (e) { pg.innerHTML = errHtml(e); }
 }
+async function sendChecklistFile(rid, btn) {
+  try {
+    const up = await uploadFile('tenant_document', UPLOAD_ACCEPT, btn);
+    if (!up) return;
+    await apiFetch(`/tenant/checklist/${rid}`, { method: 'POST', body: JSON.stringify({ file_url: up.url }) });
+    loadTenantChecklist();
+  } catch (e) { alert(e.message); loadTenantChecklist(); }
+}
+async function sendChecklistAnswer(rid) {
+  const answer = document.getElementById('ans-' + rid).value.trim();
+  if (!answer) { alert('Please fill this in first.'); return; }
+  try { await apiFetch(`/tenant/checklist/${rid}`, { method: 'POST', body: JSON.stringify({ answer }) }); loadTenantChecklist(); }
+  catch (e) { alert(e.message); }
+}
+
+// ═══════════════════════════════════════════════
+// MOVE-IN CHECKLIST — landlord reviews it on the tenant's profile
+// ═══════════════════════════════════════════════
+function checklistReviewHtml() {
+  const cl = _profile.data.checklist;
+  if (!cl) return '<p class="muted-text">—</p>';
+  const tp = parseInt(_profile.data.tenant.tenant_id);
+  const current = !!_profile.data.tenant.is_active;
+  return progressBar(cl.done, cl.total) + cl.items.map(i => {
+    const id = parseInt(i.id);
+    const act = (s, label, cls) => `<button class="btn btn-sm ${cls}" onclick="reviewChecklist(${tp},${id},'${s}')">${label}</button>`;
+    let actions = '';
+    if (current) {
+      if (i.kind === 'landlord') actions = i.status === 'approved' ? act('pending', 'Undo', 'btn-outline')
+        : act('approved', '✓ Mark done', 'btn-green') + `<button class="btn btn-sm btn-outline" onclick="checklistPhoto(${tp},${id},this)">📎 Add photo/file &amp; mark done</button>` + act('waived', 'Not needed', 'btn-outline');
+      else if (i.status === 'submitted') actions = act('approved', '✓ Approve', 'btn-green') + act('rejected', 'Ask to redo', 'btn-warn') + act('waived', 'Not needed', 'btn-outline');
+      else if (i.status === 'pending' || i.status === 'rejected') actions = act('waived', 'Not needed', 'btn-outline');
+      else actions = act('pending', 'Undo', 'btn-outline');
+    }
+    return `<div class="record">
+      <div class="record-top"><strong>${esc(i.label)}${i.required ? '' : ' <span class="muted-text small">(optional)</span>'}</strong>${reqBadge(i.status)}</div>
+      <div class="record-meta">${REQ_KIND[i.kind]}${i.submitted_at ? ' · sent ' + fmtDateTime(i.submitted_at) : ''}${i.reviewed_at ? ' · reviewed ' + fmtDateTime(i.reviewed_at) : ''}
+        ${i.note ? `<br>Note: ${esc(i.note)}` : ''}</div>
+      ${i.answer ? `<div class="answer-box">${esc(i.answer)}</div>` : ''}
+      <div class="btn-group" style="margin-top:6px">
+        ${i.file_url ? `<button class="btn btn-sm btn-outline" onclick="openDoc(${jsArg(i.file_url)})">📄 View file</button>` : ''}${actions}</div>
+    </div>`;
+  }).join('');
+}
+async function refreshProfileChecklist(tp) {
+  _profile.data.checklist = await apiFetch(`/landlord/tenants/${tp}/checklist`);
+  document.getElementById('ps-checklist').innerHTML = checklistReviewHtml();
+  const head = document.querySelector('#ps-checklist')?.closest('details')?.querySelector('h3 .muted-text');
+  if (head) head.textContent = `(${_profile.data.checklist.done}/${_profile.data.checklist.total})`;
+}
+async function reviewChecklist(tp, rid, status) {
+  let note = '';
+  if (status === 'rejected') {
+    note = prompt('What should the tenant fix or send again?', '');
+    if (note === null) return;
+  }
+  try { await apiFetch(`/landlord/tenants/${tp}/checklist/${rid}`, { method: 'PATCH', body: JSON.stringify({ status, note }) }); refreshProfileChecklist(tp); }
+  catch (e) { alert(e.message); }
+}
+async function checklistPhoto(tp, rid, btn) {
+  try {
+    const up = await uploadFile('onboarding_photo', UPLOAD_ACCEPT, btn);
+    if (!up) return;
+    await apiFetch(`/landlord/tenants/${tp}/checklist/${rid}`, { method: 'PATCH', body: JSON.stringify({ status: 'approved', file_url: up.url }) });
+    refreshProfileChecklist(tp);
+  } catch (e) { alert(e.message); }
+}
+
 async function saveSinglePref(key, value) {
   try {
     await apiFetch('/notification-preferences', { method: 'PATCH', body: JSON.stringify({ [key]: value ? 1 : 0 }) });
