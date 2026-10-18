@@ -151,6 +151,8 @@ code{background:var(--bg);padding:2px 6px;border-radius:4px;font-size:12px}
 .page{padding:20px 24px;display:none}
 .page.active{display:block}
 @media(max-width:768px){.page{padding:14px 12px calc(80px + env(safe-area-inset-bottom))}}
+#plan-banner{padding:16px 24px 0}#plan-banner>div{margin:0}
+@media(max-width:768px){#plan-banner{padding:12px 12px 0}}
 
 /* ── STATS ── */
 .stats-grid{display:grid;grid-template-columns:repeat(auto-fill,minmax(140px,1fr));gap:12px;margin-bottom:16px}
