@@ -597,7 +597,6 @@ function buildNav() {
       { id: 'gen-rent', icon: '🏠', label: 'Monthly Rent', fn: loadGenerateRent },
       { id: 'water', icon: '💧', label: 'Water Bills', fn: loadWaterBilling },
     ] },
-    { id: 'bills', icon: '💰', label: 'Bills', fn: loadBills },
     { id: 'announcements', icon: '📣', label: 'Announcements', fn: loadLandlordAnnouncements },
     { id: 'messages', icon: '💬', label: 'Messages', fn: loadMessages },
     { id: 'reminders', icon: '🔔', label: 'Reminders', fn: loadReminders },
@@ -661,7 +660,7 @@ function buildNav() {
 }
 // Opens a page by id (sidebar, notifications, quick actions)
 // Pages that moved (old notifications and bookmarks still point at them)
-const MOVED_PAGES = { payments: 'dashboard', contracts: 'tenants', units: 'properties' };
+const MOVED_PAGES = { payments: 'dashboard', contracts: 'tenants', units: 'properties', bills: 'tenants' };
 function goPage(id) {
   const item = NAV[id] || NAV[MOVED_PAGES[id]];
   if (!NAV[id] && item) id = MOVED_PAGES[id];
@@ -1157,7 +1156,7 @@ async function loadLandlordDashboard() {
         ${stat(s.vacant_units || 0, 'Vacant', 'properties')}
         ${stat(s.total_tenants || 0, 'Tenants', 'tenants')}
         <div class="stat-card" role="button" onclick="document.getElementById('review-card').scrollIntoView({behavior:'smooth'})"><div class="value">${esc(s.pending_payments || 0)}</div><div class="label">Payments to Review</div></div>
-        ${stat('₱' + fmt(s.outstanding_amount || 0), 'Unpaid Bills', 'bills')}
+        ${stat('₱' + fmt(s.outstanding_amount || 0), 'Unpaid Bills', 'tenants')}
         ${stat(d.unread_threads || 0, 'Unread Messages', 'messages')}
       </div>
       <div class="card" id="review-card"><div class="card-header"><h3>💳 Payments to review (${(d.to_review || []).length})</h3></div>
@@ -1182,7 +1181,7 @@ async function loadLandlordDashboard() {
           <div class="quick-actions">
             <button class="btn btn-brand" onclick="goPage('announcements')">📣 Send Announcement</button>
             <button class="btn btn-outline" onclick="goPage('messages')">💬 View Messages</button>
-            <button class="btn btn-outline" onclick="goPage('bills')">💰 Manage Bills</button>
+            <button class="btn btn-outline" onclick="goPage('gen-rent')">⚡ Generate Bills</button>
             <button class="btn btn-outline" onclick="goPage('tenants')">👥 Tenants &amp; Records</button>
           </div>
         </div>
@@ -1214,6 +1213,7 @@ async function loadProperties() {
   try {
     const [props, defs, units] = await Promise.all([apiFetch('/properties'), featureDefs(), apiFetch('/units')]);
     refreshPropertyFeatureNav(props);
+    window._units = units;
     const unitsOf = pid => units.filter(u => u.property_id === pid).sort(byUnit);
     pg.innerHTML = `<div class="card"><div class="card-header"><h3>Properties (${_props.length})</h3>
       <button class="btn btn-brand" onclick="showPropertySetup()">+ Add Property</button></div>
@@ -1230,8 +1230,8 @@ async function loadProperties() {
           </summary>
           ${us.length ? `<div class="unit-lines">${us.map(u => `<div class="unit-line">
               <span class="row-unit">Unit ${esc(u.unit_number)}</span>
-              <span class="unit-facts">${u.bedrooms != null ? esc(u.bedrooms) + ' bed · ' : ''}${u.floor_num != null ? 'floor ' + esc(u.floor_num) + ' · ' : ''}₱${fmt(u.rent_amount)}/mo</span>
-              ${badge(u.status)}</div>`).join('')}</div>` : '<p class="muted-text">No units yet.</p>'}
+              <span class="unit-facts">${u.bedrooms != null ? esc(u.bedrooms) + ' bed · ' : ''}₱${fmt(u.rent_amount)}/mo · ${u.lease_term_months ? (u.lease_term_months % 12 ? u.lease_term_months + ' mo' : u.lease_term_months / 12 + ' yr') + ' lease' : 'open contract'}</span>
+              ${badge(u.status)}<button class="btn btn-sm btn-outline" onclick="showAddUnit(${parseInt(p.id)}, ${parseInt(u.id)})">Edit</button></div>`).join('')}</div>` : '<p class="muted-text">No units yet.</p>'}
           <div class="btn-group" style="margin-top:12px">
             <button class="btn btn-sm btn-brand" onclick="showAddUnit(${parseInt(p.id)})">+ Add Unit</button>
             <button class="btn btn-sm btn-outline" onclick="showPropertySetup(${parseInt(p.id)})">⚙️ Setup</button>
@@ -1281,31 +1281,45 @@ async function deleteProperty(id) {
 // ═══════════════════════════════════════════════
 // UNITS
 // ═══════════════════════════════════════════════
-function showAddUnit(propId) {
+const LEASE_OPTIONS = [['', 'Open contract (no end date)'], ['6', '6 months'], ['12', '1 year'], ['24', '2 years'], ['other', 'Other…']];
+function showAddUnit(propId, unitId) {
   if (!_props.length) { alert('Add a property first.'); return; }
-  openModal('Add Unit', `
-    <div class="form-group"><label>Property</label><select id="m-unit-prop">${_props.map(p => `<option value="${parseInt(p.id)}" ${p.id === propId ? 'selected' : ''}>${esc(p.name)}</option>`).join('')}</select></div>
-    <div class="form-group"><label>Unit Number</label><input type="text" id="m-unit-num" maxlength="20" placeholder="101, 2A…"/></div>
-    <div class="grid-2"><div class="form-group"><label>Floor</label><input type="number" id="m-unit-floor"/></div>
-    <div class="form-group"><label>Bedrooms</label><input type="number" id="m-unit-beds" min="0"/></div></div>
-    <div class="grid-2"><div class="form-group"><label>Bathrooms</label><input type="number" id="m-unit-baths" min="0"/></div>
-    <div class="form-group"><label>Area m²</label><input type="number" id="m-unit-area" min="0"/></div></div>
-    <div class="form-group"><label>Monthly Rent ₱</label><input type="number" id="m-unit-rent" min="0" step="0.01" inputmode="decimal"/></div>
+  const u = (window._units || []).find(x => x.id === unitId) || {};
+  const term = u.lease_term_months == null ? '' : String(u.lease_term_months);
+  const known = LEASE_OPTIONS.some(([v]) => v === term);
+  openModal(unitId ? `Edit Unit ${u.unit_number}` : 'Add Unit', `
+    <div class="form-group"><label>Property</label><select id="m-unit-prop" ${unitId ? 'disabled' : ''}>${_props.map(p => `<option value="${parseInt(p.id)}" ${p.id === (u.property_id || propId) ? 'selected' : ''}>${esc(p.name)}</option>`).join('')}</select></div>
+    <div class="form-group"><label>Unit Number</label><input type="text" id="m-unit-num" maxlength="20" placeholder="101, 2A…" value="${esc(u.unit_number || '')}"/></div>
+    <div class="grid-2"><div class="form-group"><label>Floor</label><input type="number" id="m-unit-floor" value="${esc(u.floor_num ?? '')}"/></div>
+    <div class="form-group"><label>Bedrooms</label><input type="number" id="m-unit-beds" min="0" value="${esc(u.bedrooms ?? '')}"/></div></div>
+    <div class="grid-2"><div class="form-group"><label>Bathrooms</label><input type="number" id="m-unit-baths" min="0" value="${esc(u.bathrooms ?? '')}"/></div>
+    <div class="form-group"><label>Area m²</label><input type="number" id="m-unit-area" min="0" value="${esc(u.area_sqm ?? '')}"/></div></div>
+    <div class="form-group"><label>Monthly Rent ₱</label><input type="number" id="m-unit-rent" min="0" step="0.01" inputmode="decimal" value="${esc(u.rent_amount ?? '')}"/></div>
+    <div class="form-group"><label>Usual lease</label>
+      <select id="m-unit-lease" onchange="document.getElementById('m-unit-lease-other').hidden=this.value!=='other'">
+        ${LEASE_OPTIONS.map(([v, l]) => `<option value="${v}" ${(known ? term === v : v === 'other') ? 'selected' : ''}>${l}</option>`).join('')}</select>
+      <input type="number" id="m-unit-lease-other" min="1" max="120" placeholder="Months" style="margin-top:8px" value="${known ? '' : esc(term)}" ${known ? 'hidden' : ''}/>
+      <small class="hint">New contracts for this unit start with this.</small></div>
     <p class="err-msg" id="m-unit-err"></p>`,
     `<button class="btn btn-outline" onclick="closeModalDirect()">Cancel</button>
-     <button class="btn btn-brand" onclick="submitAddUnit()">Add</button>`);
+     <button class="btn btn-brand" onclick="submitAddUnit(${unitId ? parseInt(unitId) : 'null'})">${unitId ? 'Save' : 'Add'}</button>`);
 }
-async function submitAddUnit() {
+async function submitAddUnit(unitId) {
   const v = id => document.getElementById(id).value;
+  const lease = v('m-unit-lease') === 'other' ? v('m-unit-lease-other') : v('m-unit-lease');
   const body = {
     property_id: v('m-unit-prop'), unit_number: v('m-unit-num').trim(),
     floor_num: v('m-unit-floor') || null, bedrooms: v('m-unit-beds') || null,
-    bathrooms: v('m-unit-baths') || null, area_sqm: v('m-unit-area') || null, rent_amount: v('m-unit-rent')
+    bathrooms: v('m-unit-baths') || null, area_sqm: v('m-unit-area') || null, rent_amount: v('m-unit-rent'),
+    lease_term_months: lease || null
   };
-  document.getElementById('m-unit-err').textContent = '';
-  if (!body.unit_number || !body.rent_amount) { document.getElementById('m-unit-err').textContent = 'Unit number and rent are required'; return; }
-  try { await apiFetch('/units', { method: 'POST', body: JSON.stringify(body) }); closeModalDirect(); _openProps.add(parseInt(body.property_id)); loadProperties(); }
-  catch (e) { document.getElementById('m-unit-err').textContent = e.message; }
+  const errEl = document.getElementById('m-unit-err'); errEl.textContent = '';
+  if (!body.unit_number || !body.rent_amount) { errEl.textContent = 'Unit number and rent are required'; return; }
+  try {
+    if (unitId) { delete body.property_id; await apiFetch('/units/' + unitId, { method: 'PATCH', body: JSON.stringify(body) }); }
+    else await apiFetch('/units', { method: 'POST', body: JSON.stringify(body) });
+    closeModalDirect(); _openProps.add(parseInt(v('m-unit-prop'))); loadProperties();
+  } catch (e) { errEl.textContent = e.message; }
 }
 
 // ═══════════════════════════════════════════════
@@ -1445,14 +1459,14 @@ function profileSection(section) {
   if (section === 'contracts') {
     const list = sortedBy(data.contracts, 'start_date', sort.contracts);
     _contracts = list.map(c => ({ ...c, tenant_name: data.tenant.full_name, tenant_id: data.tenant.tenant_id }));
-    return (data.tenant.is_active ? `<button class="btn btn-sm btn-brand" style="margin-bottom:6px" onclick="showCreateContract(${parseInt(data.tenant.tenant_id)})">+ New Contract</button>` : '')
-      + (list.length ? _contracts.map(c => contractCard(c, true)).join('') : '<p class="muted-text">No contracts.</p>');
+    return list.length ? _contracts.map(c => contractCard(c, true)).join('') : '<p class="muted-text">No contracts.</p>';
   }
   if (section === 'files') return filesSectionHtml();
   if (section === 'bills') {
     const types = ['all', 'rent', 'water', 'electricity', 'other'];
     const list = sortedBy(data.bills.filter(b => _profile.billType === 'all' || b.bill_type === _profile.billType), 'due_date', sort.bills);
-    return `<div class="chip-row">${types.map(t => `<button class="chip ${_profile.billType === t ? 'active' : ''}" onclick="setBillType('${t}')">${t === 'all' ? 'All' : t[0].toUpperCase() + t.slice(1)}</button>`).join('')}</div>
+    return `${data.tenant.is_active ? `<button class="btn btn-sm btn-brand" style="margin-bottom:8px" onclick="showCreateBill(${parseInt(data.tenant.tenant_id)})">+ Add Bill</button>` : ''}
+      <div class="chip-row">${types.map(t => `<button class="chip ${_profile.billType === t ? 'active' : ''}" onclick="setBillType('${t}')">${t === 'all' ? 'All' : t[0].toUpperCase() + t.slice(1)}</button>`).join('')}</div>
       ${list.length ? list.map(b => {
         const approved = b.payment_status === 'approved';
         return `<div class="record">
@@ -1499,34 +1513,171 @@ function profileSection(section) {
 function renderTenantProfile() {
   const { data } = _profile; const t = data.tenant; const s = data.summary;
   const current = !!t.is_active;
-  const sec = (key, title, count, open) => `<details class="card profile-section" ${open ? 'open' : ''}>
-      <summary class="group-head"><h3>${title} <span class="muted-text">(${count})</span></h3><span class="row-flags">${key === 'checklist' ? '' : sortControl(key)}${chevron}</span></summary>
+  const live = data.contracts.filter(c => c.status === 'active' || c.status === 'move_out_pending');
+  const leaving = live.filter(c => c.status === 'move_out_pending');
+  const sec = (key, title, count, open, noSort) => `<details class="card profile-section" ${open ? 'open' : ''}>
+      <summary class="group-head"><h3>${title} <span class="muted-text">(${count})</span></h3><span class="row-flags">${noSort ? '' : sortControl(key)}${chevron}</span></summary>
       <div id="ps-${key}">${profileSection(key)}</div></details>`;
+  const rentLine = c => `<div class="rent-line">
+      <span>🏠 <strong>${esc(c.property_name)} — Unit ${esc(c.unit_number)}</strong>
+        <small class="muted-text">since ${fmtDate(c.move_in_date || c.start_date)} · ₱${fmt(c.monthly_rent)}/mo · ${c.is_open_term ? 'open contract' : 'until ' + fmtDate(c.end_date)}</small></span>
+      ${c.status === 'active' && current ? `<button class="btn btn-sm btn-red" onclick="showMoveOut(${parseInt(c.id)})">Move Out</button>` : badge(c.status)}
+    </div>`;
   document.getElementById('page-tenants').innerHTML = `
-    <div class="card">
+    <div class="card profile-card">
       <div class="profile-head">
         <div class="thread-avatar big">${esc((t.full_name || '?')[0].toUpperCase())}</div>
-        <div style="min-width:0"><h2 class="profile-name">${esc(t.full_name)}</h2>
+        <div style="min-width:0;flex:1"><h2 class="profile-name">${esc(t.full_name)}</h2>
           <div class="muted-text">${esc(t.email)}${t.phone ? ' · ' + esc(t.phone) : ''}</div>
           <div class="btn-group" style="margin-top:6px">${current ? '<span class="badge badge-green">Current tenant</span>' : '<span class="badge badge-gray">Past tenant</span>'}
             <span class="muted-text small">Joined ${fmtDate(t.joined_at)}${t.left_at ? ' · left ' + fmtDate(t.left_at) : ''}</span></div></div>
       </div>
-      ${current ? `<div class="btn-group" style="margin-top:14px"><button class="btn btn-sm btn-brand" onclick="showNewThread(${parseInt(t.user_id)})">💬 Message</button></div>`
+      ${live.length ? `<div class="rent-lines">${live.map(rentLine).join('')}</div>` : current ? '<p class="muted-text" style="margin-top:12px">No unit yet.</p>' : ''}
+      ${current ? `<div class="btn-group" style="margin-top:12px">
+          <button class="btn btn-sm btn-brand" onclick="showNewThread(${parseInt(t.user_id)})">💬 Message</button>
+          <button class="btn btn-sm btn-outline" onclick="showCreateContract(${parseInt(t.tenant_id)})">+ New Contract</button></div>`
         : '<div class="info-box">Records only — this tenant has moved out and can\'t be messaged.</div>'}
+      ${leaving.map(c => `<div class="leaving-facts">
+          <div><span class="field-label">30-day notice</span>
+            <strong>${c.notice_given_at ? '✓ Received ' + fmtDate(c.notice_given_at) : '✗ Not received yet'}</strong></div>
+          <div><span class="field-label">Last day${leaving.length > 1 ? ' · Unit ' + esc(c.unit_number) : ''}</span>
+            <strong>${fmtDate(c.move_out_date)}${daysLeft(c.move_out_date)}</strong></div>
+        </div>`).join('')}
     </div>
+    ${leaving.map(c => `<div class="card moveout-card" id="mo-card-${parseInt(c.id)}">${loadingHtml}</div>`).join('')}
     <div class="stats-grid">
       <div class="stat-card"><div class="value">₱${fmt(s.total_paid)}</div><div class="label">Total Paid</div></div>
       <div class="stat-card"><div class="value">₱${fmt(s.unpaid)}</div><div class="label">Unpaid</div></div>
       <div class="stat-card"><div class="value">${s.on_time_rate === null ? '—' : s.on_time_rate + '%'}</div><div class="label">Paid on Time</div></div>
       <div class="stat-card"><div class="value">${parseInt(s.overdue_bills)}</div><div class="label">Overdue Bills</div></div>
     </div>
-    ${data.checklist ? sec('checklist', '✅ Move-in checklist', `${data.checklist.done}/${data.checklist.total}`, data.checklist.done < data.checklist.total || data.checklist.to_review > 0) : ''}
     ${sec('bills', '💰 Bills', data.bills.length, true)}
     ${sec('payments', '💳 Payments', data.payments.length, data.payments.some(p => p.status === 'pending'))}
-    ${sec('contracts', '📋 Contracts', data.contracts.length, true)}
+    ${sec('contracts', '📋 Contracts', data.contracts.length, false)}
     ${sec('files', '🗂️ Files', tenantFiles(data).length, false)}
     ${sec('water', '💧 Water readings', data.water.length, false)}
-    ${sec('threads', '💬 Conversations', data.threads.length, false)}`;
+    ${sec('threads', '💬 Conversations', data.threads.length, false)}
+    ${data.checklist ? sec('checklist', '✅ Move-in checklist', `${data.checklist.done}/${data.checklist.total}`, false, true) : ''}`;
+  leaving.forEach(c => loadMoveOutCard(c.id));
+}
+const daysLeft = d => {
+  if (!d) return '';
+  const n = Math.round((new Date(String(d).replace(/ 00:00:00 GMT$/, '') + (String(d).length <= 10 ? 'T00:00:00' : '')) - new Date(new Date().toDateString())) / 86400000);
+  return isNaN(n) ? '' : n > 0 ? ` <span class="muted-text small">(${n} day${n === 1 ? '' : 's'} left)</span>` : n === 0 ? ' <span class="badge badge-orange">today</span>' : '';
+};
+const isoDate = d => {
+  if (!d) return '';
+  const x = new Date(d);
+  return isNaN(x) ? '' : x.toISOString().slice(0, 10);
+};
+
+// ═══════════════════════════════════════════════
+// MOVE-OUT CARD (top of the tenant's profile while they're moving out):
+// notice + last day, the move-out checklist, the deposit and its acknowledgement
+// ═══════════════════════════════════════════════
+const _moveOut = {};
+async function loadMoveOutCard(cid) {
+  const el = document.getElementById('mo-card-' + cid); if (!el) return;
+  try { _moveOut[cid] = await apiFetch(`/contracts/${cid}/move-out`); el.innerHTML = moveOutCardHtml(cid); }
+  catch (e) { el.innerHTML = errHtml(e); }
+}
+function moveOutCardHtml(cid) {
+  const { contract: c, checklist: m, items, deposit } = _moveOut[cid];
+  const id = parseInt(cid);
+  const need = items.filter(i => i.required), done = need.filter(i => i.done).length;
+  const returned = m.refund_amount ?? deposit.to_return;
+  const methods = ['Cash', 'GCash', 'Maya', 'Bank transfer', 'Check'];
+  return `
+    <div class="card-header"><h3>🚚 Moving out — ${esc(c.property_name)} Unit ${esc(c.unit_number)}</h3>
+      <span class="badge badge-orange">Last day ${fmtDate(c.move_out_date)}</span></div>
+
+    <h4 class="section-title">Notice &amp; last day</h4>
+    <div class="grid-2">
+      <div class="form-group check-box"><label><input type="checkbox" id="mo-notice-${id}" ${c.notice_given_at ? 'checked' : ''}
+          onchange="document.getElementById('mo-notice-date-${id}').disabled=!this.checked"/> <span>30-day notice received</span></label>
+        <input type="date" id="mo-notice-date-${id}" style="margin-top:8px" value="${esc(isoDate(c.notice_given_at))}" ${c.notice_given_at ? '' : 'disabled'}/></div>
+      <div class="form-group"><label>Last day</label><input type="date" id="mo-last-${id}" value="${esc(isoDate(c.move_out_date))}"/></div>
+    </div>
+    <button class="btn btn-sm btn-brand" onclick="saveMoveOutDates(${id})">Save</button>
+
+    <h4 class="section-title">Move-out checklist</h4>
+    ${progressBar(done, need.length)}
+    <div class="offb-list">${items.map(i => `<div class="offb-item">
+        <label class="offb-tick"><input type="checkbox" ${i.done ? 'checked' : ''} onchange="tickOffboarding(${id},${parseInt(i.id)},this.checked)"/>
+          <span>${esc(i.label)}${i.required ? '' : ' <span class="muted-text small">(optional)</span>'}
+            ${i.done && i.done_at ? `<small class="muted-text">done ${fmtDate(i.done_at)}</small>` : ''}</span></label>
+        <span class="btn-group">
+          ${i.file_url ? `<button class="btn btn-sm btn-outline" onclick="openDoc(${jsArg(i.file_url)})">📄</button>` : ''}
+          <button class="btn btn-sm btn-outline" title="Add a photo or file" onclick="offboardingPhoto(${id},${parseInt(i.id)},this)">📎</button></span>
+      </div>`).join('')}</div>
+
+    <h4 class="section-title">Security deposit</h4>
+    <div class="deposit-sum">
+      <div><span class="field-label">Held</span><strong>₱${fmt(deposit.held)}</strong></div>
+      <div><span class="field-label">Deductions</span><strong>₱${fmt(deposit.deducted)}</strong></div>
+      <div><span class="field-label">To return</span><strong>₱${fmt(deposit.to_return)}</strong></div>
+    </div>
+    <div class="grid-2">
+      <div class="form-group"><label>Deductions ₱</label><input type="number" id="mo-ded-${id}" min="0" step="0.01" inputmode="decimal" value="${esc(m.deposit_consumed_amount || 0)}"/></div>
+      <div class="form-group"><label>Reason for deductions</label><input type="text" id="mo-reason-${id}" maxlength="500" value="${esc(m.repair_notes || '')}" placeholder="e.g. Broken screen, unpaid water bill"/></div>
+    </div>
+    <div class="btn-group" style="margin-bottom:12px">
+      ${m.repair_proof_url ? `<button class="btn btn-sm btn-outline" onclick="openDoc(${jsArg(m.repair_proof_url)})">📄 Repair receipts/photos</button>` : ''}
+      <button class="btn btn-sm btn-outline" onclick="moveOutUpload(${id},'repair_proof','repair_proof_url',this)">📎 ${m.repair_proof_url ? 'Replace' : 'Add'} repair receipts/photos</button></div>
+    <div class="grid-2">
+      <div class="form-group"><label>Deposit returned (surrendered) on</label><input type="date" id="mo-ref-date-${id}" value="${esc(isoDate(m.refunded_at))}"/></div>
+      <div class="form-group"><label>Paid by</label><select id="mo-ref-method-${id}"><option value="">—</option>
+        ${methods.map(x => `<option ${m.refund_method === x ? 'selected' : ''}>${x}</option>`).join('')}</select></div>
+    </div>
+    <div class="form-group"><label>Amount returned ₱</label><input type="number" id="mo-ref-amt-${id}" min="0" step="0.01" inputmode="decimal" value="${esc(returned)}"/></div>
+    <button class="btn btn-sm btn-brand" onclick="saveDeposit(${id})">Save deposit</button>
+
+    <h4 class="section-title">Acknowledgement of deposit received</h4>
+    <p class="hint">Print the form, have the tenant sign it when they get their deposit, then upload the signed copy.</p>
+    <div class="btn-group" style="margin-top:8px">
+      <button class="btn btn-sm btn-outline" onclick="openPdf('/api/contracts/${id}/deposit-ack.pdf')">🖨️ Print form</button>
+      <button class="btn btn-sm btn-outline" onclick="moveOutUpload(${id},'deposit_ack','ack_url',this)">📎 ${m.ack_url ? 'Replace' : 'Upload'} signed copy</button>
+      ${m.ack_url ? `<button class="btn btn-sm btn-green" onclick="openDoc(${jsArg(m.ack_url)})">✓ View signed acknowledgement</button>` : ''}
+    </div>
+
+    <div class="moveout-done">
+      ${done < need.length ? `<p class="warn-box">${need.length - done} required checklist item${need.length - done === 1 ? '' : 's'} not done yet.</p>` : ''}
+      <button class="btn btn-green" onclick="completeMoveOut(${id})">✅ Complete Move-Out</button>
+    </div>`;
+}
+async function saveMoveOutDates(cid) {
+  const noticed = document.getElementById('mo-notice-' + cid).checked;
+  const body = { move_out_date: document.getElementById('mo-last-' + cid).value,
+    notice_given_at: noticed ? (document.getElementById('mo-notice-date-' + cid).value || new Date().toISOString().slice(0, 10)) : null };
+  try { await apiFetch(`/contracts/${cid}/move-out`, { method: 'PATCH', body: JSON.stringify(body) }); refreshView(); }
+  catch (e) { alert(e.message); }
+}
+async function tickOffboarding(cid, rid, done) {
+  try { await apiFetch(`/contracts/${cid}/offboarding/${rid}`, { method: 'PATCH', body: JSON.stringify({ done }) }); loadMoveOutCard(cid); }
+  catch (e) { alert(e.message); loadMoveOutCard(cid); }
+}
+async function offboardingPhoto(cid, rid, btn) {
+  try {
+    const up = await uploadFile('offboarding_photo', UPLOAD_ACCEPT, btn);
+    if (!up) return;
+    await apiFetch(`/contracts/${cid}/offboarding/${rid}`, { method: 'PATCH', body: JSON.stringify({ done: true, file_url: up.url }) });
+    loadMoveOutCard(cid);
+  } catch (e) { alert(e.message); }
+}
+async function moveOutUpload(cid, kind, field, btn) {
+  try {
+    const up = await uploadFile(kind, UPLOAD_ACCEPT, btn);
+    if (!up) return;
+    await apiFetch(`/contracts/${cid}/move-out`, { method: 'PATCH', body: JSON.stringify({ [field]: up.url }) });
+    loadMoveOutCard(cid);
+  } catch (e) { alert(e.message); }
+}
+async function saveDeposit(cid) {
+  const v = k => document.getElementById(k + cid).value;
+  const body = { deposit_consumed_amount: v('mo-ded-') || 0, repair_notes: v('mo-reason-'),
+    refunded_at: v('mo-ref-date-') || null, refund_method: v('mo-ref-method-') || null, refund_amount: v('mo-ref-amt-') || null };
+  try { await apiFetch(`/contracts/${cid}/move-out`, { method: 'PATCH', body: JSON.stringify(body) }); loadMoveOutCard(cid); }
+  catch (e) { alert(e.message); }
 }
 
 // ═══════════════════════════════════════════════
@@ -1546,8 +1697,8 @@ function contractCard(c, onProfile) {
       ${c.status === 'active' ? `
         <button class="btn btn-sm btn-outline" onclick="uploadContractDoc(${id})">📤 ${c.contract_doc_url ? 'Re-upload' : 'Upload signed copy'}</button>
         <button class="btn btn-sm btn-warn" onclick="showExtendContract(${id})">Extend</button>
-        <button class="btn btn-sm btn-red" onclick="showMoveOut(${id})">Move Out</button>` : ''}
-      ${c.status === 'move_out_pending' ? `<button class="btn btn-sm btn-warn" onclick="showMoveOutChecklist(${id})">📋 Move-out checklist</button>` : ''}
+` : ''}
+      ${c.status === 'move_out_pending' ? `<span class="muted-text small">Moving out — see the card at the top.</span>` : ''}
     </div></div>`;
 }
 
@@ -1562,10 +1713,10 @@ async function showCreateContract(tenantId) {
     <div class="form-group"><label>Tenant</label><select id="m-c-tenant"><option value="">— Select —</option>
       ${tenants.map(t => `<option value="${parseInt(t.id)}" ${t.id === tenantId ? 'selected' : ''}>${esc(t.full_name)} (${esc(t.email)})</option>`).join('')}</select></div>
     <div class="form-group"><label>Unit (vacant)</label><select id="m-c-unit" onchange="contractUnitPicked()"><option value="">— Select —</option>
-      ${vacantUnits.map(u => `<option value="${parseInt(u.id)}" data-rent="${esc(u.rent_amount)}">${esc(u.property_name)} — Unit ${esc(u.unit_number)} (₱${fmt(u.rent_amount)}/mo)</option>`).join('')}</select></div>
+      ${vacantUnits.map(u => `<option value="${parseInt(u.id)}" data-rent="${esc(u.rent_amount)}" data-lease="${esc(u.lease_term_months ?? '')}">${esc(u.property_name)} — Unit ${esc(u.unit_number)} (₱${fmt(u.rent_amount)}/mo)</option>`).join('')}</select></div>
     <div class="grid-2">
       <div class="form-group"><label>Contract Signed Date</label><input type="date" id="m-c-signed"/></div>
-      <div class="form-group"><label>Lease Start Date</label><input type="date" id="m-c-start"/></div>
+      <div class="form-group"><label>Lease Start Date</label><input type="date" id="m-c-start" onchange="applyLeaseTerm()"/></div>
     </div>
     <div class="form-group"><label>Move-In Date <span class="muted-text">(optional)</span></label><input type="date" id="m-c-movein"/></div>
     <div class="form-group check-box">
@@ -1588,6 +1739,21 @@ function contractUnitPicked() {
   const opt = document.getElementById('m-c-unit').selectedOptions[0];
   const rent = document.getElementById('m-c-rent');
   if (opt && opt.dataset.rent && !rent.value) rent.value = parseFloat(opt.dataset.rent);
+  applyLeaseTerm();
+}
+// The unit's usual lease: open contract, or N months from the start date
+function applyLeaseTerm() {
+  const opt = document.getElementById('m-c-unit').selectedOptions[0];
+  if (!opt || !opt.value) return;
+  const months = parseInt(opt.dataset.lease);
+  const open = document.getElementById('m-c-open');
+  open.checked = !months;
+  document.getElementById('m-c-fixed-fields').style.display = open.checked ? 'none' : '';
+  const start = document.getElementById('m-c-start').value;
+  if (months && start) {
+    const d = new Date(start + 'T00:00:00'); d.setMonth(d.getMonth() + months); d.setDate(d.getDate() - 1);
+    document.getElementById('m-c-end').value = `${d.getFullYear()}-${String(d.getMonth() + 1).padStart(2, '0')}-${String(d.getDate()).padStart(2, '0')}`;
+  }
 }
 async function submitCreateContract() {
   const v = id => document.getElementById(id).value;
@@ -1614,76 +1780,29 @@ async function uploadContractDoc(contractId) {
   } catch (e) { if (e && e.message) alert('Upload failed: ' + e.message); }
 }
 function showMoveOut(contractId) {
-  const c = _contracts.find(x => x.id === contractId) || {};
-  const today = new Date().toISOString().split('T')[0];
-  openModal(`Start Move-Out: ${c.tenant_name || ''}`, `
-    <div class="info-box">This begins the move-out process. The contract stays open until you complete the checklist.</div>
-    <div class="form-group"><label>Move-Out Date</label><input type="date" id="m-mo-date" value="${today}"/></div>
-    <div class="form-group"><label>Notes (optional)</label><textarea id="m-mo-notes" rows="3"></textarea></div>
+  const c = _contracts.find(x => x.id === contractId) || (_profile ? _profile.data.contracts.find(x => x.id === contractId) : null) || {};
+  const today = new Date(); const in30 = new Date(Date.now() + 30 * 86400000);
+  const iso = d => d.toISOString().slice(0, 10);
+  openModal(`Move out: ${c.property_name || ''} Unit ${c.unit_number || ''}`, `
+    <div class="info-box">The tenant stays until their last day. You'll get a move-out card on their profile for the checklist and the deposit.</div>
+    <div class="form-group check-box"><label><input type="checkbox" id="m-mo-notice" checked
+        onchange="document.getElementById('m-mo-notice-date').disabled=!this.checked"/> <span>30-day notice received</span></label>
+      <input type="date" id="m-mo-notice-date" style="margin-top:8px" value="${iso(today)}"/></div>
+    <div class="form-group"><label>Last day</label><input type="date" id="m-mo-date" value="${iso(in30)}"/></div>
+    <div class="form-group"><label>Notes (optional)</label><textarea id="m-mo-notes" rows="2"></textarea></div>
     <p class="err-msg" id="m-mo-err"></p>`,
     `<button class="btn btn-outline" onclick="closeModalDirect()">Cancel</button>
-     <button class="btn btn-warn" onclick="submitMoveOut(${parseInt(contractId)})">Start Move-Out</button>`);
+     <button class="btn btn-red" onclick="submitMoveOut(${parseInt(contractId)})">Start Move-Out</button>`);
 }
 async function submitMoveOut(contractId) {
   const move_out_date = document.getElementById('m-mo-date').value;
+  const notice_given_at = document.getElementById('m-mo-notice').checked ? document.getElementById('m-mo-notice-date').value : null;
   const notes = document.getElementById('m-mo-notes').value;
-  try { await apiFetch('/contracts/' + contractId + '/terminate', { method: 'PATCH', body: JSON.stringify({ move_out_date, notes }) }); closeModalDirect(); refreshView(); }
-  catch (e) { document.getElementById('m-mo-err').textContent = e.message; }
-}
-async function showMoveOutChecklist(contractId) {
+  if (!move_out_date) { document.getElementById('m-mo-err').textContent = 'Set their last day'; return; }
   try {
-    const d = await apiFetch('/contracts/' + contractId + '/move-out');
-    const c = d.contract; const ch = d.checklist || {};
-    const sel = (v, cur) => v === cur ? 'selected' : '';
-    openModal(`📋 Move-Out Checklist — ${c.tenant_name}`, `
-      <div class="muted-text" style="margin-bottom:14px">Unit ${esc(c.unit_number)} · ${esc(c.property_name)} · Move-out: ${fmtDate(c.move_out_date)}</div>
-      <h4 class="section-title">💰 Security Deposit</h4>
-      <div class="pref-row"><span class="pref-label">Deposit was used for repairs/damages?</span>
-        <label class="toggle"><input type="checkbox" id="ch-dep-consumed" ${ch.deposit_consumed ? 'checked' : ''}/><span class="toggle-slider"></span></label></div>
-      <div class="form-group" style="margin-top:10px"><label>Amount Used ₱</label><input type="number" id="ch-dep-amount" value="${esc(ch.deposit_consumed_amount || 0)}" min="0"/></div>
-      <h4 class="section-title">🔧 Repairs</h4>
-      <div class="form-group"><label>Repair Status</label><select id="ch-repair-status">
-          <option value="not_required" ${sel('not_required', ch.repair_status || 'not_required')}>No repairs needed</option>
-          <option value="pending" ${sel('pending', ch.repair_status)}>Pending</option>
-          <option value="cleared" ${sel('cleared', ch.repair_status)}>Cleared</option></select></div>
-      <div class="form-group"><label>Repair Notes</label><textarea id="ch-repair-notes" rows="3">${esc(ch.repair_notes || '')}</textarea></div>
-      <div class="form-group"><label>Proof Documents</label>
-        ${ch.repair_proof_url ? `<div style="margin-bottom:8px"><button class="btn btn-sm btn-outline" onclick="openDoc(${jsArg(ch.repair_proof_url)})">📎 View Current</button></div>` : ''}
-        <button class="btn btn-outline btn-sm" type="button" onclick="uploadMoveOutProof()">📤 Upload Receipts/Photos</button>
-        <input type="hidden" id="ch-proof-url" value="${esc(ch.repair_proof_url || '')}"/>
-        <div id="ch-proof-status" style="font-size:12px;color:var(--success);margin-top:4px"></div></div>
-      <h4 class="section-title">✅ Deposit Status</h4>
-      <div class="form-group"><label>Status</label><select id="ch-deposit-status">
-          <option value="processing" ${sel('processing', ch.deposit_status || 'processing')}>Processing</option>
-          <option value="ready" ${sel('ready', ch.deposit_status)}>Ready for Pickup</option>
-          <option value="released" ${sel('released', ch.deposit_status)}>Released</option></select></div>
-      <p class="err-msg" id="ch-err"></p>`,
-      `<button class="btn btn-outline" onclick="closeModalDirect()">Close</button>
-       <button class="btn btn-warn" onclick="saveMoveOutChecklist(${parseInt(contractId)})">💾 Save</button>
-       ${ch.repair_status !== 'pending' ? `<button class="btn btn-green" onclick="completeMoveOut(${parseInt(contractId)})">✅ Complete Move-Out</button>` : '<span style="font-size:12px;color:var(--danger)">Resolve repairs first</span>'}`);
-  } catch (e) { alert('Could not load checklist: ' + e.message); }
-}
-async function uploadMoveOutProof() {
-  try {
-    const result = await uploadFile('repair_proof', UPLOAD_ACCEPT, document.getElementById('ch-proof-status'));
-    if (!result) return;
-    document.getElementById('ch-proof-url').value = result.url;
-    document.getElementById('ch-proof-status').textContent = '✅ Uploaded';
-  } catch (e) { if (e && e.message) alert('Upload failed: ' + e.message); }
-}
-async function saveMoveOutChecklist(contractId) {
-  const body = {
-    deposit_consumed: document.getElementById('ch-dep-consumed').checked ? 1 : 0,
-    deposit_consumed_amount: document.getElementById('ch-dep-amount').value || 0,
-    repair_status: document.getElementById('ch-repair-status').value,
-    repair_notes: document.getElementById('ch-repair-notes').value,
-    repair_proof_url: document.getElementById('ch-proof-url').value || null,
-    deposit_status: document.getElementById('ch-deposit-status').value
-  };
-  try {
-    await apiFetch('/contracts/' + contractId + '/move-out', { method: 'PATCH', body: JSON.stringify(body) });
+    await apiFetch('/contracts/' + contractId + '/terminate', { method: 'PATCH', body: JSON.stringify({ move_out_date, notice_given_at, notes }) });
     closeModalDirect(); refreshView();
-  } catch (e) { document.getElementById('ch-err').textContent = e.message; }
+  } catch (e) { document.getElementById('m-mo-err').textContent = e.message; }
 }
 async function completeMoveOut(contractId) {
   if (!await confirmAction({ title: 'Complete move-out?', message: 'The contract ends and the unit becomes vacant.', okText: 'Complete Move-Out' })) return;
@@ -1708,33 +1827,15 @@ async function submitExtend(id) {
 // ═══════════════════════════════════════════════
 // BILLS
 // ═══════════════════════════════════════════════
-async function loadBills() {
-  const pg = document.getElementById('page-bills'); pg.innerHTML = loadingHtml;
-  try {
-    const bills = await apiFetch('/bills');
-    pg.innerHTML = `<div class="card"><div class="card-header"><h3>Bills</h3>
-      <div class="btn-group"><button class="btn btn-outline" onclick="goPage('gen-rent')">⚡ Generate Bills</button>
-      <button class="btn btn-brand" onclick="showCreateBill()">+ Add Bill</button></div></div>
-      ${!bills.length ? '<div class="empty-state"><p>No bills yet</p></div>' :
-        `<div class="table-wrap"><table><thead><tr><th>Tenant</th><th>Type</th><th>Description</th><th>Amount</th><th>Due</th><th>Status</th><th>Documents</th></tr></thead><tbody>
-        ${bills.map(b => `<tr><td><strong>${esc(b.tenant_name)}</strong><br><small>${esc(b.property_name)} · ${esc(b.unit_number)}</small></td>
-          <td>${badge(b.bill_type || 'rent')}</td><td>${esc(b.description)}</td>
-          <td>₱${fmt(b.amount)}</td><td>${fmtDate(b.due_date)}</td><td>${badge(b.status)}</td>
-          <td><div class="btn-group"><button class="btn btn-sm btn-outline" onclick="openPdf('/api/bills/${parseInt(b.id)}/pdf')">🧾 PDF</button>
-            ${b.payment_status === 'approved' ? `<button class="btn btn-sm btn-outline" onclick="openPdf('/api/payments/${parseInt(b.payment_id)}/receipt.pdf')">✅ Receipt</button>` : ''}</div></td></tr>`).join('')}
-        </tbody></table></div>`}
-    </div>`;
-  } catch (e) { pg.innerHTML = errHtml(e); }
-}
-async function showCreateBill() {
+async function showCreateBill(tenantId) {
   let contracts;
   try { [contracts, _props] = await Promise.all([apiFetch('/contracts'), apiFetch('/properties')]); } catch (e) { alert(e.message); return; }
-  const active = contracts.filter(c => c.status === 'active' || c.status === 'move_out_pending');
-  if (!active.length) { alert('Create a contract first.'); return; }
+  const active = contracts.filter(c => (c.status === 'active' || c.status === 'move_out_pending') && (!tenantId || c.tenant_id === tenantId));
+  if (!active.length) { alert('Give this tenant a unit (contract) first.'); return; }
   const now = new Date();
   openModal('Create Bill', `
     <div class="form-group"><label>Contract</label><select id="m-b-contract" onchange="billTypesForContract()"><option value="">— Select —</option>
-      ${active.map(c => `<option value="${parseInt(c.id)}" data-prop="${parseInt(c.property_id)}">${esc(c.tenant_name)} — ${esc(c.property_name)} Unit ${esc(c.unit_number)}</option>`).join('')}</select></div>
+      ${active.map(c => `<option value="${parseInt(c.id)}" data-prop="${parseInt(c.property_id)}" ${active.length === 1 ? 'selected' : ''}>${esc(c.tenant_name)} — ${esc(c.property_name)} Unit ${esc(c.unit_number)}</option>`).join('')}</select></div>
     <div class="form-group"><label>Bill Type</label><select id="m-b-type">
       <option value="rent">Rent</option><option value="electricity">Electricity</option><option value="water">Water</option><option value="other">Other</option></select></div>
     <div class="grid-2"><div class="form-group"><label>Month</label><select id="m-b-month">
@@ -1763,7 +1864,7 @@ async function submitCreateBill() {
   };
   try {
     const d = await apiFetch('/bills', { method: 'POST', body: JSON.stringify(body) });
-    loadBills();
+    refreshView();
     openModal('Bill created', `<div class="info-box">The tenant has been notified. You can open the billing statement as a PDF to print or send.</div>`,
       `<button class="btn btn-outline" onclick="closeModalDirect()">Done</button>
        <button class="btn btn-brand" onclick="openPdf('/api/bills/${parseInt(d.bill_id)}/pdf')">🧾 Open / Print PDF</button>`);
@@ -2329,7 +2430,7 @@ async function loadTenantDashboard() {
                 ${field('Monthly Rent', '₱' + fmt(c.monthly_rent))}
                 ${field('Term', c.is_open_term ? 'Open Term' : fmtDate(c.end_date))}
               </div>
-              ${c.contract_status === 'move_out_pending' ? '<div class="warn-box">Move-out in progress.</div>' : ''}
+              ${c.contract_status === 'move_out_pending' ? `<div class="warn-box">Moving out — your last day is <strong>${fmtDate(c.move_out_date)}</strong>.</div>` : ''}
               ${c.contract_doc_url ? `
                 <div class="doc-row"><span>📄 Signed contract available</span>
                   <div class="btn-group">
@@ -2623,7 +2724,7 @@ async function loadGenerateRent() {
         </div>
         <div class="btn-group" style="margin-top:14px">
           <button class="btn btn-brand" id="rent-go" onclick="submitGenerateRent()" ${todo.length ? '' : 'disabled'}>⚡ Generate <span id="rent-count">${todo.length}</span> bill(s)</button>
-          <button class="btn btn-outline" onclick="goPage('bills')">View Bills</button>
+          <button class="btn btn-outline" onclick="goPage('tenants')">View Tenants</button>
         </div>`}
       </div>`;
   } catch (e) { pg.innerHTML = errHtml(e); }
@@ -2726,7 +2827,8 @@ const REQ_KIND = { document: '📎 Tenant uploads a file', info: '✍️ Tenant 
 async function loadLandlordSettings() {
   const pg = document.getElementById('page-l-settings'); pg.innerHTML = loadingHtml;
   try {
-    const [prefs, st, reqs] = await Promise.all([apiFetch('/notification-preferences'), apiFetch('/landlord/settings'), apiFetch('/landlord/requirements')]);
+    const [prefs, st, reqs, outReqs] = await Promise.all([apiFetch('/notification-preferences'), apiFetch('/landlord/settings'),
+      apiFetch('/landlord/requirements?phase=move_in'), apiFetch('/landlord/requirements?phase=move_out')]);
     pg.innerHTML = `
       ${pushCardHtml()}
       <div class="card"><div class="card-header"><h3>👋 Invite Tenants</h3></div>
@@ -2739,9 +2841,14 @@ async function loadLandlordSettings() {
         <button class="btn btn-brand" onclick="saveDueDay()">Save</button> <span class="small-msg" id="due-msg"></span>
       </div>
       <div class="card"><div class="card-header"><h3>📋 Move-in Checklist</h3>
-          <button class="btn btn-sm btn-brand" onclick="editRequirement()">+ Add Item</button></div>
+          <button class="btn btn-sm btn-brand" onclick="editRequirement('move_in')">+ Add Item</button></div>
         <p class="muted-text">What every new tenant needs to give you or finish before moving in. Tenants see it in their app; you review it on their profile.</p>
-        <div id="req-list">${requirementsHtml(reqs)}</div>
+        <div id="req-list-move_in">${requirementsHtml(reqs, 'move_in')}</div>
+      </div>
+      <div class="card"><div class="card-header"><h3>🚚 Move-out Checklist</h3>
+          <button class="btn btn-sm btn-brand" onclick="editRequirement('move_out')">+ Add Item</button></div>
+        <p class="muted-text">What you check off when a tenant leaves. It shows on their profile once you tap Move Out, with the deposit return.</p>
+        <div id="req-list-move_out">${requirementsHtml(outReqs, 'move_out')}</div>
       </div>
       <div class="card"><div class="card-header"><h3>📧 Email Notifications</h3></div>
         ${prefRowsHtml([
@@ -2753,52 +2860,56 @@ async function loadLandlordSettings() {
         <div id="pref-save-msg" class="small-msg ok" style="display:none">✅ Saved</div>
       </div>
       <p class="hint center">Your name, email and password are on the <a href="#" onclick="event.preventDefault();goPage('account')">Account</a> page.</p>`;
-    window._reqs = reqs;
+    window._reqs = { move_in: reqs, move_out: outReqs };
     wirePushCard();
   } catch (e) { pg.innerHTML = errHtml(e); }
 }
-function requirementsHtml(reqs) {
+function requirementsHtml(reqs, phase) {
   return reqs.length ? reqs.map((r, i) => `<div class="req-row">
       <div class="req-main"><strong>${esc(r.label)}</strong> ${r.required ? '' : '<span class="badge badge-gray">Optional</span>'}
-        <small class="muted-text">${REQ_KIND[r.kind]}${r.description ? ' · ' + esc(r.description) : ''}</small></div>
+        <small class="muted-text">${phase === 'move_out' ? '' : REQ_KIND[r.kind]}${r.description ? (phase === 'move_out' ? '' : ' · ') + esc(r.description) : ''}</small></div>
       <div class="btn-group req-actions">
-        <button class="btn btn-sm btn-outline" title="Move up" onclick="moveRequirement(${parseInt(r.id)},-1)" ${i === 0 ? 'disabled' : ''}>↑</button>
-        <button class="btn btn-sm btn-outline" title="Move down" onclick="moveRequirement(${parseInt(r.id)},1)" ${i === reqs.length - 1 ? 'disabled' : ''}>↓</button>
-        <button class="btn btn-sm btn-outline" onclick="editRequirement(${parseInt(r.id)})">Edit</button>
-        <button class="btn btn-sm btn-red" onclick="removeRequirement(${parseInt(r.id)})">Remove</button>
+        <button class="btn btn-sm btn-outline" title="Move up" onclick="moveRequirement('${phase}',${parseInt(r.id)},-1)" ${i === 0 ? 'disabled' : ''}>↑</button>
+        <button class="btn btn-sm btn-outline" title="Move down" onclick="moveRequirement('${phase}',${parseInt(r.id)},1)" ${i === reqs.length - 1 ? 'disabled' : ''}>↓</button>
+        <button class="btn btn-sm btn-outline" onclick="editRequirement('${phase}',${parseInt(r.id)})">Edit</button>
+        <button class="btn btn-sm btn-red" onclick="removeRequirement('${phase}',${parseInt(r.id)})">Remove</button>
       </div></div>`).join('') : '<p class="muted-text">No items. Tap “+ Add Item”.</p>';
 }
-async function reloadRequirements() {
-  window._reqs = await apiFetch('/landlord/requirements');
-  document.getElementById('req-list').innerHTML = requirementsHtml(window._reqs);
+async function reloadRequirements(phase) {
+  window._reqs[phase] = await apiFetch('/landlord/requirements?phase=' + phase);
+  document.getElementById('req-list-' + phase).innerHTML = requirementsHtml(window._reqs[phase], phase);
 }
-function editRequirement(id) {
-  const r = (window._reqs || []).find(x => x.id === id) || { kind: 'document', required: 1 };
-  openModal(id ? 'Edit Checklist Item' : 'Add Checklist Item', `
-    <div class="form-group"><label>What you need</label><input type="text" id="rq-label" maxlength="255" value="${esc(r.label || '')}" placeholder="e.g. Valid government ID"/></div>
-    <div class="form-group"><label>Details for the tenant (optional)</label><input type="text" id="rq-desc" maxlength="500" value="${esc(r.description || '')}"/></div>
-    <div class="form-group"><label>How it's done</label><select id="rq-kind">
-      ${Object.entries(REQ_KIND).map(([k, l]) => `<option value="${k}" ${r.kind === k ? 'selected' : ''}>${l}</option>`).join('')}</select></div>
+function editRequirement(phase, id) {
+  const r = ((window._reqs || {})[phase] || []).find(x => x.id === id) || { kind: phase === 'move_out' ? 'landlord' : 'document', required: 1 };
+  openModal(id ? 'Edit Checklist Item' : `Add ${phase === 'move_out' ? 'Move-out' : 'Move-in'} Item`, `
+    <div class="form-group"><label>${phase === 'move_out' ? 'What to check' : 'What you need'}</label><input type="text" id="rq-label" maxlength="255" value="${esc(r.label || '')}"
+      placeholder="${phase === 'move_out' ? 'e.g. Keys returned' : 'e.g. Valid government ID'}"/></div>
+    <div class="form-group"><label>Details (optional)</label><input type="text" id="rq-desc" maxlength="500" value="${esc(r.description || '')}"/></div>
+    ${phase === 'move_out' ? '' : `<div class="form-group"><label>How it's done</label><select id="rq-kind">
+      ${Object.entries(REQ_KIND).map(([k, l]) => `<option value="${k}" ${r.kind === k ? 'selected' : ''}>${l}</option>`).join('')}</select></div>`}
     <div class="form-group check-box"><label><input type="checkbox" id="rq-req" ${r.required ? 'checked' : ''}/> <span>Required</span></label></div>
     <p class="err-msg" id="rq-err"></p>`,
     `<button class="btn btn-outline" onclick="closeModalDirect()">Cancel</button>
-     <button class="btn btn-brand" onclick="saveRequirement(${id ? parseInt(id) : 'null'})">Save</button>`);
+     <button class="btn btn-brand" onclick="saveRequirement('${phase}',${id ? parseInt(id) : 'null'})">Save</button>`);
 }
-async function saveRequirement(id) {
+async function saveRequirement(phase, id) {
+  const kind = document.getElementById('rq-kind');
   const body = { label: document.getElementById('rq-label').value.trim(), description: document.getElementById('rq-desc').value.trim(),
-    kind: document.getElementById('rq-kind').value, required: document.getElementById('rq-req').checked };
+    required: document.getElementById('rq-req').checked, phase };
+  if (kind) body.kind = kind.value;
   try {
     await apiFetch(id ? `/landlord/requirements/${id}` : '/landlord/requirements', { method: id ? 'PATCH' : 'POST', body: JSON.stringify(body) });
-    closeModalDirect(); reloadRequirements();
+    closeModalDirect(); reloadRequirements(phase);
   } catch (e) { document.getElementById('rq-err').textContent = e.message; }
 }
-async function moveRequirement(id, dir) {
-  try { await apiFetch(`/landlord/requirements/${id}`, { method: 'PATCH', body: JSON.stringify({ move: dir }) }); reloadRequirements(); }
+async function moveRequirement(phase, id, dir) {
+  try { await apiFetch(`/landlord/requirements/${id}`, { method: 'PATCH', body: JSON.stringify({ move: dir }) }); reloadRequirements(phase); }
   catch (e) { alert(e.message); }
 }
-async function removeRequirement(id) {
-  if (!await confirmAction({ title: 'Remove this checklist item?', message: 'New tenants won\'t be asked for it. Tenants who already sent it keep their records.', okText: 'Remove' })) return;
-  try { await apiFetch(`/landlord/requirements/${id}`, { method: 'DELETE' }); reloadRequirements(); }
+async function removeRequirement(phase, id) {
+  if (!await confirmAction({ title: 'Remove this checklist item?', message: phase === 'move_out' ? 'It won\'t be on future move-outs. Past move-outs keep their records.'
+      : 'New tenants won\'t be asked for it. Tenants who already sent it keep their records.', okText: 'Remove' })) return;
+  try { await apiFetch(`/landlord/requirements/${id}`, { method: 'DELETE' }); reloadRequirements(phase); }
   catch (e) { alert(e.message); }
 }
 async function saveDueDay() {

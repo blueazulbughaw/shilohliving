@@ -76,7 +76,9 @@ c_maria = contract('maria@local.test', '10', 12500, months_ago(7))
 c_pedro = contract('pedro@local.test', '2B', 12500, months_ago(6))
 c_ana = contract('ana@local.test', 'V1', 18000, months_ago(5))
 # Pedro is in the middle of moving out
-run("UPDATE contracts SET status='move_out_pending', move_out_date=%s WHERE id=%s", (today + timedelta(days=10), c_pedro))
+run("UPDATE contracts SET status='move_out_pending', move_out_date=%s, notice_given_at=%s WHERE id=%s",
+    (today + timedelta(days=10), today - timedelta(days=20), c_pedro))
+run("UPDATE units SET lease_term_months=12 WHERE property_id=%s", (p2,))   # Garden Villas: 1-year leases
 run("INSERT INTO move_out_checklists (contract_id) VALUES (%s)", (c_pedro,))
 
 def bill(cid, desc, kind, amount, due, month=None, year=None, created=None):

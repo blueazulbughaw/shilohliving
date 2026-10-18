@@ -220,6 +220,47 @@ def bill_pdf(d):
     return bytes(pdf.output())
 
 
+def deposit_ack_pdf(d):
+    """Acknowledgement the tenant signs when their security deposit is returned. d: contract,
+    checklist (move_out_checklists row), held, deducted, returned, landlord."""
+    c, m = d['contract'], d['checklist']
+    pdf = _Doc('Deposit Acknowledgement', f"D-{int(c['id']):05d}", d['landlord'])
+    pdf.alias_nb_pages()
+    term = 'Open term' if c.get('is_open_term') else f"{fdate(c.get('start_date'))} to {fdate(c.get('end_date'))}"
+    pdf.two_columns(
+        [('Tenant', c['tenant_name']),
+         ('Property / Unit', f"{c['property_name']} — Unit {c['unit_number']}\n{c.get('address') or ''}"
+                             + (f", {c['city']}" if c.get('city') else '')),
+         ('Lease', f"{term} · moved out {fdate(c.get('move_out_date'))}")],
+        [('Deposit returned on', fdate(m.get('refunded_at')) if m.get('refunded_at') else '________________'),
+         ('Paid by', m.get('refund_method') or '________________')])
+    rows = [['Security deposit held', peso(d['held'])]]
+    if d['deducted']:
+        rows.append([f"Less: deductions{' — ' + m['repair_notes'] if m.get('repair_notes') else ''}"[:90], '-' + peso(d['deducted'])])
+    pdf.table(['Description', 'Amount'], [138, 40], rows, ['L', 'R'])
+    pdf.total_box('Amount returned to tenant', peso(d['returned']))
+    pdf.ln(4)
+    pdf.set_font('DejaVu', '', 10)
+    pdf.set_text_color(*INK)
+    pdf.multi_cell(0, 5.6,
+        f"I, {c['tenant_name']}, acknowledge that I received {peso(d['returned'])} as the return of my security "
+        f"deposit for {c['property_name']} Unit {c['unit_number']}"
+        + (f", after the deductions listed above" if d['deducted'] else '') +
+        ". I have no further claim on the deposit.", align='L')
+    pdf.ln(16)
+    y = pdf.get_y()
+    for x, label in ((16, 'Tenant signature over printed name'), (110, 'Landlord / representative')):
+        pdf.set_draw_color(*MUTED)
+        pdf.line(x, y, x + 78, y)
+        pdf.set_xy(x, y + 1.5)
+        pdf.set_font('DejaVu', '', 8)
+        pdf.set_text_color(*MUTED)
+        pdf.cell(78, 4, label)
+    pdf.set_xy(16, y + 12)
+    pdf.cell(0, 4, 'Date signed: ____________________')
+    return bytes(pdf.output())
+
+
 def receipt_pdf(d):
     """Acknowledgement receipt for an approved payment. d: payment, bill, tenant, landlord,
     property, unit_number, reviewer_name, balance."""

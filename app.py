@@ -356,7 +356,7 @@ def log_action(action, table_name=None, record_id=None, description=None):
 NOTIF_TYPES = {'bill', 'payment', 'message', 'reminder', 'system', 'announcement', 'contract', 'support'}
 # Which page a notification opens (in the bell and from a phone notification), by role
 NOTIF_PAGES = {
-    'landlord': {'bill': 'bills', 'payment': 'dashboard', 'message': 'messages', 'contract': 'tenants',
+    'landlord': {'bill': 'tenants', 'payment': 'dashboard', 'message': 'messages', 'contract': 'tenants',
                  'announcement': 'announcements', 'support': 'support', 'system': 'tenants', 'reminder': 'reminders'},
     'tenant':   {'bill': 't-bills', 'payment': 't-bills', 'message': 't-messages', 'contract': 't-contract',
                  'announcement': 't-announcements', 'support': 't-support', 'system': 't-dashboard'},
@@ -1313,6 +1313,14 @@ def list_units():
             WHERE p.landlord_id=%s AND p.is_active=1 ORDER BY p.name,u.unit_number""",(lp['id'],))
     return ok(units)
 
+
+def lease_term(value):
+    """'' / None / 'open' -> None (open contract); otherwise whole months 1-120."""
+    if value in (None, '', 'open'): return None
+    months = int(value)
+    if not 1 <= months <= 120: raise ValueError('Lease term must be 1 to 120 months')
+    return months
+
 @app.route('/api/units', methods=['POST'])
 @require_auth('landlord')
 def create_unit():
@@ -1321,9 +1329,11 @@ def create_unit():
     if not prop_id or not unit_number or not rent_amount: return err('property_id, unit_number, rent_amount required')
     p=query("SELECT id FROM properties WHERE id=%s AND landlord_id=%s AND is_active=1",(prop_id,lp['id']),fetchone=True)
     if not p: return err('Property not found',404)
+    try: term=lease_term(data.get('lease_term_months'))
+    except (TypeError, ValueError) as e: return err(str(e) if isinstance(e, ValueError) and 'Lease' in str(e) else 'Lease term must be a number of months')
     try:
-        uid,_=execute("INSERT INTO units (property_id,unit_number,floor_num,bedrooms,bathrooms,area_sqm,rent_amount) VALUES (%s,%s,%s,%s,%s,%s,%s)",
-                      (prop_id,unit_number,data.get('floor_num'),data.get('bedrooms'),data.get('bathrooms'),data.get('area_sqm'),rent_amount))
+        uid,_=execute("INSERT INTO units (property_id,unit_number,floor_num,bedrooms,bathrooms,area_sqm,rent_amount,lease_term_months) VALUES (%s,%s,%s,%s,%s,%s,%s,%s)",
+                      (prop_id,unit_number,data.get('floor_num') or None,data.get('bedrooms') or None,data.get('bathrooms') or None,data.get('area_sqm') or None,rent_amount,term))
     except Exception as e:
         if 'Duplicate' in str(e): return err('Unit number already exists',409)
         raise
@@ -1335,10 +1345,20 @@ def update_unit(uid):
     lp=get_landlord_profile(g.current_user['id']); data=request.get_json() or {}
     u=query("""SELECT u.id FROM units u JOIN properties p ON p.id=u.property_id WHERE u.id=%s AND p.landlord_id=%s""",(uid,lp['id']),fetchone=True)
     if not u: return err('Not found',404)
-    fields={k:v for k,v in data.items() if k in ('unit_number','floor_num','bedrooms','bathrooms','area_sqm','rent_amount','status')}
+    fields={k:(v if v != '' else None) for k,v in data.items() if k in ('unit_number','floor_num','bedrooms','bathrooms','area_sqm','rent_amount','status')}
+    if 'lease_term_months' in data:
+        try: fields['lease_term_months']=lease_term(data['lease_term_months'])
+        except (TypeError, ValueError): return err('Lease term must be 1 to 120 months')
+    if fields.get('status') not in (None,'vacant','occupied','maintenance'): return err('Unknown status')
+    if 'unit_number' in fields and not (fields['unit_number'] or '').strip(): return err('Unit number is required')
+    if 'rent_amount' in fields and positive_amount(fields['rent_amount']) is None: return err('Rent must be more than 0')
     if not fields: return err('No fields')
     set_clause=', '.join(f"{k}=%s" for k in fields)
-    execute(f"UPDATE units SET {set_clause} WHERE id=%s",(*fields.values(),uid))
+    try:
+        execute(f"UPDATE units SET {set_clause} WHERE id=%s",(*fields.values(),uid))
+    except Exception as e:
+        if 'Duplicate' in str(e): return err('Unit number already exists',409)
+        raise
     return ok(msg='Updated')
 
 
@@ -1513,9 +1533,10 @@ def terminate_contract(cid):
     if not c: return err('Not found',404)
     move_out_date = data.get('move_out_date')
     notes         = data.get('notes', '')
+    if not move_out_date: return err('Set their last day')
     execute("""UPDATE contracts SET status='move_out_pending',
-                move_out_date=%s, move_out_notes=%s WHERE id=%s""",
-            (move_out_date or None, notes, cid))
+                move_out_date=%s, move_out_notes=%s, notice_given_at=%s WHERE id=%s""",
+            (move_out_date, notes, data.get('notice_given_at') or None, cid))
     existing = query("SELECT id FROM move_out_checklists WHERE contract_id=%s", (cid,), fetchone=True)
     if not existing:
         execute("INSERT INTO move_out_checklists (contract_id) VALUES (%s)", (cid,))
@@ -1540,8 +1561,15 @@ def get_move_out(cid):
         JOIN properties p ON p.id=un.property_id
         WHERE c.id=%s AND p.landlord_id=%s""", (cid, lp['id']), fetchone=True)
     if not c: return err('Not found', 404)
-    checklist = query("SELECT * FROM move_out_checklists WHERE contract_id=%s", (cid,), fetchone=True)
-    return ok({'contract': c, 'checklist': checklist})
+    checklist = query("SELECT * FROM move_out_checklists WHERE contract_id=%s", (cid,), fetchone=True) or {}
+    done = {r['requirement_id']: r for r in query("SELECT * FROM contract_offboarding WHERE contract_id=%s", (cid,))}
+    items = [{**r, 'done': bool((done.get(r['id']) or {}).get('done')), 'note': (done.get(r['id']) or {}).get('note'),
+              'file_url': (done.get(r['id']) or {}).get('file_url'), 'done_at': (done.get(r['id']) or {}).get('done_at')}
+             for r in landlord_requirements(lp['id'], 'move_out')]
+    deposit = float(c['deposit'] or 0)
+    deducted = float(checklist.get('deposit_consumed_amount') or 0)
+    return ok({'contract': c, 'checklist': checklist, 'items': items,
+               'deposit': {'held': deposit, 'deducted': deducted, 'to_return': max(deposit - deducted, 0)}})
 
 @app.route('/api/contracts/<int:cid>/move-out', methods=['PATCH'])
 @require_auth('landlord')
@@ -1553,12 +1581,25 @@ def update_move_out(cid):
         WHERE c.id=%s AND p.landlord_id=%s""", (cid, lp['id']), fetchone=True)
     if not c: return err('Not found', 404)
 
-    allowed = ['deposit_consumed','deposit_consumed_amount','repair_status',
-               'repair_notes','repair_proof_url','deposit_status','deposit_ready_at']
-    fields  = {k:v for k,v in data.items() if k in allowed}
-    before = query("SELECT deposit_status, repair_proof_url FROM move_out_checklists WHERE contract_id=%s", (cid,), fetchone=True)
+    allowed = ['deposit_consumed','deposit_consumed_amount','repair_status','repair_notes','repair_proof_url',
+               'deposit_status','deposit_ready_at','refund_amount','refunded_at','refund_method','ack_url']
+    fields  = {k:(v if v != '' else None) for k,v in data.items() if k in allowed}
+    before = query("SELECT deposit_status, repair_proof_url, ack_url FROM move_out_checklists WHERE contract_id=%s", (cid,), fetchone=True)
     if not upload_ok(fields.get('repair_proof_url'), 'repair_proof', (before or {}).get('repair_proof_url')):
         return err('Invalid proof. Please upload it with the file picker.')
+    if not upload_ok(fields.get('ack_url'), 'deposit_ack', (before or {}).get('ack_url')):
+        return err('Invalid acknowledgement. Please upload it with the file picker.')
+    if fields.get('refund_method') and fields['refund_method'] not in ('Cash', 'GCash', 'Maya', 'Bank transfer', 'Check'):
+        return err('Unknown refund method')
+    if 'deposit_consumed_amount' in fields: fields['deposit_consumed'] = 1 if float(fields['deposit_consumed_amount'] or 0) > 0 else 0
+    if fields.get('refunded_at') and not fields.get('deposit_status'): fields['deposit_status'] = 'released'
+    # the last day and the 30-day notice live on the contract
+    cfields = {k:(v if v != '' else None) for k,v in data.items() if k in ('move_out_date','notice_given_at','move_out_notes')}
+    if 'move_out_date' in cfields and not cfields['move_out_date']: return err('Set their last day')
+    if cfields:
+        execute(f"UPDATE contracts SET {', '.join(k + '=%s' for k in cfields)} WHERE id=%s", (*cfields.values(), cid))
+    if not before:
+        execute("INSERT INTO move_out_checklists (contract_id) VALUES (%s)", (cid,))
     if fields:
         set_cl = ', '.join(f"{k}=%s" for k in fields)
         execute(f"UPDATE move_out_checklists SET {set_cl}, updated_at=NOW() WHERE contract_id=%s",
@@ -1576,7 +1617,31 @@ def update_move_out(cid):
                 tenant_user['email'], 'Your Deposit is Ready for Pickup',
                 '<h2>Deposit Ready</h2><p>Your landlord has confirmed your security deposit is ready for pickup. Please coordinate with your landlord.</p>')
 
-    return ok(msg='Move-out checklist updated')
+    return ok(msg='Saved')
+
+@app.route('/api/contracts/<int:cid>/offboarding/<int:rid>', methods=['PATCH'])
+@require_auth('landlord')
+def tick_offboarding(cid, rid):
+    """Tick / untick a move-out checklist item, optionally with a note and a photo or PDF."""
+    lp = get_landlord_profile(g.current_user['id'])
+    if not query("""SELECT 1 FROM contracts c JOIN units un ON un.id=c.unit_id JOIN properties p ON p.id=un.property_id
+                    WHERE c.id=%s AND p.landlord_id=%s""", (cid, lp['id']), fetchone=True): return err('Not found', 404)
+    if not query("SELECT 1 FROM onboarding_requirements WHERE id=%s AND landlord_id=%s AND phase='move_out'",
+                 (rid, lp['id']), fetchone=True): return err('Not found', 404)
+    data = request.get_json() or {}
+    cur = query("SELECT file_url FROM contract_offboarding WHERE contract_id=%s AND requirement_id=%s", (cid, rid), fetchone=True) or {}
+    url = data.get('file_url', cur.get('file_url'))
+    if not upload_ok(url, 'offboarding_photo', cur.get('file_url')):
+        return err('Invalid file. Please upload it with the file picker.')
+    done = 1 if data.get('done') else 0
+    execute("""INSERT INTO contract_offboarding (contract_id, requirement_id, done, note, file_url, done_at, done_by)
+               VALUES (%s,%s,%s,%s,%s,%s,%s)
+               ON DUPLICATE KEY UPDATE done=VALUES(done), note=VALUES(note), file_url=VALUES(file_url),
+                                       done_at=VALUES(done_at), done_by=VALUES(done_by)""",
+            (cid, rid, done, (data.get('note') or '').strip()[:500] or None, url or None,
+             datetime.now() if done else None, g.current_user['id'] if done else None))
+    return ok(msg='Saved')
+
 
 @app.route('/api/contracts/<int:cid>/complete-move-out', methods=['POST'])
 @require_auth('landlord')
@@ -2033,7 +2098,7 @@ def tenant_profile(tp_id):
 # ── Printable documents (bill statements, receipts) ──
 # Opened in a new tab / the phone's PDF viewer, which can't send the sign-in header, so the app
 # asks /api/docs/link for a 10-minute link that only works for that one document.
-DOC_PATHS = re.compile(r'^/api/(bills/\d+/pdf|payments/\d+/receipt\.pdf|files/[A-Za-z0-9_-]{20,64})$')
+DOC_PATHS = re.compile(r'^/api/(bills/\d+/pdf|payments/\d+/receipt\.pdf|contracts/\d+/deposit-ack\.pdf|files/[A-Za-z0-9_-]{20,64})$')
 
 def make_doc_token(user_id, path):
     return pyjwt.encode({'sub': str(user_id), 'scope': 'doc', 'path': path,
@@ -2127,6 +2192,24 @@ def receipt_pdf(pid):
     if not doc or not can_see_bill(doc): return err('Receipt not found', 404)
     return pdf_response(pdfs.receipt_pdf(doc), f'Receipt-{doc["payment"]["receipt_no"]}.pdf')
 
+@app.route('/api/contracts/<int:cid>/deposit-ack.pdf', methods=['GET'])
+@require_doc_auth('landlord', 'tenant')
+def deposit_ack_pdf(cid):
+    """The form the tenant signs when they get their deposit back."""
+    c = query("""SELECT c.*, un.unit_number, p.name AS property_name, p.address, p.city,
+               lp.user_id AS landlord_user_id, lp.business_name, lu.full_name AS landlord_name, lu.email AS landlord_email,
+               lu.phone AS landlord_phone, tu.id AS tenant_user_id, tu.full_name AS tenant_name
+        FROM contracts c JOIN units un ON un.id=c.unit_id JOIN properties p ON p.id=un.property_id
+        JOIN landlord_profiles lp ON lp.id=p.landlord_id JOIN users lu ON lu.id=lp.user_id
+        JOIN tenant_profiles tp ON tp.id=c.tenant_id JOIN users tu ON tu.id=tp.user_id WHERE c.id=%s""", (cid,), fetchone=True)
+    if not c or g.current_user['id'] not in (c['landlord_user_id'], c['tenant_user_id']): return err('Not found', 404)
+    m = query("SELECT * FROM move_out_checklists WHERE contract_id=%s", (cid,), fetchone=True) or {}
+    held = float(c['deposit'] or 0); deducted = float(m.get('deposit_consumed_amount') or 0)
+    doc = {'contract': c, 'checklist': m, 'held': held, 'deducted': deducted,
+           'returned': float(m['refund_amount']) if m.get('refund_amount') is not None else max(held - deducted, 0),
+           'landlord': {'display_name': c['business_name'] or c['landlord_name'], 'email': c['landlord_email'], 'phone': c['landlord_phone']}}
+    return pdf_response(pdfs.deposit_ack_pdf(doc), f'Deposit-Acknowledgement-C{cid:05d}.pdf')
+
 def issue_receipt(pid, resend=False):
     """Numbers the receipt, notifies the tenant (phone + bell) and emails the PDF; records when
     it was sent. Never raises - approving must not fail because of email."""
@@ -2181,6 +2264,8 @@ UPLOAD_KINDS = {
     'repair_proof': ('landlord', {'image/jpeg', 'image/png', 'image/webp', 'image/heic', 'application/pdf'}),
     'tenant_document': ('tenant', {'image/jpeg', 'image/png', 'image/webp', 'image/heic', 'application/pdf'}),
     'onboarding_photo': ('landlord', {'image/jpeg', 'image/png', 'image/webp', 'image/heic', 'application/pdf'}),
+    'offboarding_photo': ('landlord', {'image/jpeg', 'image/png', 'image/webp', 'image/heic', 'application/pdf'}),
+    'deposit_ack': ('landlord', {'image/jpeg', 'image/png', 'image/webp', 'image/heic', 'application/pdf'}),
 }
 FILE_EXT = {'image/jpeg': '.jpg', 'image/png': '.png', 'image/webp': '.webp', 'image/heic': '.heic', 'application/pdf': '.pdf'}
 FILE_URL = re.compile(r'^/api/files/([A-Za-z0-9_-]{20,64})$')
@@ -2245,7 +2330,17 @@ def file_parties(url):
         SELECT tp.user_id, lp.user_id FROM tenant_requirements tr
           JOIN onboarding_requirements r ON r.id=tr.requirement_id
           JOIN tenant_profiles tp ON tp.id=tr.tenant_id JOIN landlord_profiles lp ON lp.id=r.landlord_id
-         WHERE tr.file_url=%s""", (url, url, url, url))
+         WHERE tr.file_url=%s
+        UNION ALL
+        SELECT tp.user_id, lp.user_id FROM move_out_checklists m JOIN contracts c ON c.id=m.contract_id
+          JOIN tenant_profiles tp ON tp.id=c.tenant_id JOIN units un ON un.id=c.unit_id
+          JOIN properties p ON p.id=un.property_id JOIN landlord_profiles lp ON lp.id=p.landlord_id
+         WHERE m.ack_url=%s
+        UNION ALL
+        SELECT tp.user_id, lp.user_id FROM contract_offboarding o JOIN contracts c ON c.id=o.contract_id
+          JOIN tenant_profiles tp ON tp.id=c.tenant_id JOIN units un ON un.id=c.unit_id
+          JOIN properties p ON p.id=un.property_id JOIN landlord_profiles lp ON lp.id=p.landlord_id
+         WHERE o.file_url=%s""", (url,) * 6)
     return {u for r in rows for u in (r['tenant_user'], r['landlord_user'])}
 
 @app.route('/api/files', methods=['POST'])
@@ -2301,16 +2396,27 @@ DEFAULT_REQUIREMENTS = [
     ('Move-in inspection photos', 'Photos of the unit\'s condition on move-in day.', 'landlord', 0),
     ('Keys and gate access handed over', '', 'landlord', 1),
 ]
+# The move-out list (off-boarding): all ticked off by the landlord, per contract.
+DEFAULT_MOVE_OUT = [
+    ('Final water and electricity meter readings taken', '', 'landlord', 1),
+    ('All rent and bills paid up to the last day', '', 'landlord', 1),
+    ('Move-out inspection done with the tenant', 'Walk through the unit together and take photos.', 'landlord', 1),
+    ('Keys, gate remote and access cards returned', '', 'landlord', 1),
+    ('Unit cleaned and belongings removed', '', 'landlord', 1),
+    ('Forwarding address and contact number recorded', '', 'landlord', 0),
+    ('Utilities and internet account transferred or closed', '', 'landlord', 0),
+]
 REQ_KINDS = ('document', 'info', 'landlord')
+PHASES = ('move_in', 'move_out')
 
-def landlord_requirements(lp_id):
-    """The landlord's active list, created from the defaults the first time it's needed."""
-    if not query("SELECT 1 FROM onboarding_requirements WHERE landlord_id=%s LIMIT 1", (lp_id,), fetchone=True):
-        for i, (label, desc, kind, req) in enumerate(DEFAULT_REQUIREMENTS):
-            execute("""INSERT INTO onboarding_requirements (landlord_id,label,description,kind,required,sort_order)
-                       VALUES (%s,%s,%s,%s,%s,%s)""", (lp_id, label, desc or None, kind, req, i))
-    return query("""SELECT id,label,description,kind,required,sort_order FROM onboarding_requirements
-                    WHERE landlord_id=%s AND is_active=1 ORDER BY sort_order, id""", (lp_id,))
+def landlord_requirements(lp_id, phase='move_in'):
+    """The landlord's active list for move-in or move-out, created from the defaults the first time."""
+    if not query("SELECT 1 FROM onboarding_requirements WHERE landlord_id=%s AND phase=%s LIMIT 1", (lp_id, phase), fetchone=True):
+        for i, (label, desc, kind, req) in enumerate(DEFAULT_REQUIREMENTS if phase == 'move_in' else DEFAULT_MOVE_OUT):
+            execute("""INSERT INTO onboarding_requirements (landlord_id,label,description,kind,required,sort_order,phase)
+                       VALUES (%s,%s,%s,%s,%s,%s,%s)""", (lp_id, label, desc or None, kind, req, i, phase))
+    return query("""SELECT id,label,description,kind,required,sort_order,phase FROM onboarding_requirements
+                    WHERE landlord_id=%s AND phase=%s AND is_active=1 ORDER BY sort_order, id""", (lp_id, phase))
 
 def tenant_checklist(tp_id, lp_id):
     reqs = landlord_requirements(lp_id)
@@ -2329,13 +2435,13 @@ def tenant_checklist(tp_id, lp_id):
 
 def checklist_progress(lp_id):
     """{tenant_profile_id: {'done', 'total', 'to_review'}} for the tenant board."""
-    total = query("SELECT COUNT(*) AS n FROM onboarding_requirements WHERE landlord_id=%s AND is_active=1 AND required=1",
-                  (lp_id,), fetchone=True)['n']
+    total = query("""SELECT COUNT(*) AS n FROM onboarding_requirements
+                     WHERE landlord_id=%s AND is_active=1 AND required=1 AND phase='move_in'""", (lp_id,), fetchone=True)['n']
     rows = query("""SELECT tr.tenant_id,
                SUM(r.required=1 AND tr.status IN ('approved','waived')) AS done,
                SUM(tr.status='submitted') AS to_review
         FROM tenant_requirements tr JOIN onboarding_requirements r ON r.id=tr.requirement_id
-        WHERE r.landlord_id=%s AND r.is_active=1 GROUP BY tr.tenant_id""", (lp_id,))
+        WHERE r.landlord_id=%s AND r.is_active=1 AND r.phase='move_in' GROUP BY tr.tenant_id""", (lp_id,))
     return {r['tenant_id']: {'done': int(r['done'] or 0), 'total': total, 'to_review': int(r['to_review'] or 0)}
             for r in rows}, total
 
@@ -2350,7 +2456,9 @@ def upsert_tenant_requirement(tp_id, req_id, **fields):
 @app.route('/api/landlord/requirements', methods=['GET'])
 @require_auth('landlord')
 def list_requirements():
-    return ok(landlord_requirements(get_landlord_profile(g.current_user['id'])['id']))
+    phase = request.args.get('phase', 'move_in')
+    if phase not in PHASES: return err('Unknown list')
+    return ok(landlord_requirements(get_landlord_profile(g.current_user['id'])['id'], phase))
 
 def _req_fields(data, partial):
     f = {}
@@ -2369,30 +2477,36 @@ def _req_fields(data, partial):
 @require_auth('landlord')
 def create_requirement():
     lp = get_landlord_profile(g.current_user['id'])
-    landlord_requirements(lp['id'])   # make sure the defaults exist first
-    try: f = _req_fields(request.get_json() or {}, partial=False)
+    data = request.get_json() or {}
+    phase = data.get('phase', 'move_in')
+    if phase not in PHASES: return err('Unknown list')
+    landlord_requirements(lp['id'], phase)   # make sure the defaults exist first
+    if phase == 'move_out': data['kind'] = 'landlord'   # move-out items are ticked off by the landlord
+    try: f = _req_fields(data, partial=False)
     except ValueError as e: return err(str(e))
-    nxt = query("SELECT COALESCE(MAX(sort_order),0)+1 AS n FROM onboarding_requirements WHERE landlord_id=%s",
-                (lp['id'],), fetchone=True)['n']
-    rid, _ = execute("""INSERT INTO onboarding_requirements (landlord_id,label,description,kind,required,sort_order)
-                        VALUES (%s,%s,%s,%s,%s,%s)""",
-                     (lp['id'], f['label'], f.get('description'), f['kind'], f['required'], nxt))
+    nxt = query("SELECT COALESCE(MAX(sort_order),0)+1 AS n FROM onboarding_requirements WHERE landlord_id=%s AND phase=%s",
+                (lp['id'], phase), fetchone=True)['n']
+    rid, _ = execute("""INSERT INTO onboarding_requirements (landlord_id,label,description,kind,required,sort_order,phase)
+                        VALUES (%s,%s,%s,%s,%s,%s,%s)""",
+                     (lp['id'], f['label'], f.get('description'), f['kind'], f['required'], nxt, phase))
     return ok({'id': rid}, status=201)
 
 @app.route('/api/landlord/requirements/<int:rid>', methods=['PATCH', 'DELETE'])
 @require_auth('landlord')
 def change_requirement(rid):
     lp = get_landlord_profile(g.current_user['id'])
-    if not query("SELECT 1 FROM onboarding_requirements WHERE id=%s AND landlord_id=%s", (rid, lp['id']), fetchone=True):
+    req = query("SELECT phase FROM onboarding_requirements WHERE id=%s AND landlord_id=%s", (rid, lp['id']), fetchone=True)
+    if not req:
         return err('Not found', 404)
     if request.method == 'DELETE':   # kept for tenants' history, just no longer asked
         execute("UPDATE onboarding_requirements SET is_active=0 WHERE id=%s", (rid,))
         return ok(msg='Removed')
     data = request.get_json() or {}
+    if req['phase'] == 'move_out': data.pop('kind', None)
     try: f = _req_fields(data, partial=True)
     except ValueError as e: return err(str(e))
     if 'move' in data:   # -1 up / +1 down in the list
-        reqs = landlord_requirements(lp['id'])
+        reqs = landlord_requirements(lp['id'], req['phase'])
         ids = [r['id'] for r in reqs]
         i = ids.index(rid); j = i + (1 if data['move'] > 0 else -1)
         if 0 <= j < len(ids):
@@ -2462,7 +2576,7 @@ def submit_checklist_item(rid):
     req = query("""SELECT r.*, lp.user_id AS landlord_user_id FROM onboarding_requirements r
                    JOIN landlord_profiles lp ON lp.id=r.landlord_id
                    JOIN tenant_landlords tl ON tl.landlord_id=r.landlord_id AND tl.tenant_id=%s AND tl.is_active=1
-                   WHERE r.id=%s AND r.is_active=1""", (tp['id'], rid), fetchone=True)
+                   WHERE r.id=%s AND r.is_active=1 AND r.phase='move_in'""", (tp['id'], rid), fetchone=True)
     if not req or req['kind'] == 'landlord': return err('Not found', 404)
     cur = query("SELECT status, file_url FROM tenant_requirements WHERE tenant_id=%s AND requirement_id=%s",
                 (tp['id'], rid), fetchone=True) or {}
@@ -2770,7 +2884,7 @@ def tenant_dashboard():
         JOIN users lu ON lu.id=lp.user_id
         WHERE tl.tenant_id=%s AND tl.is_active=1 ORDER BY tl.joined_at""", (tp['id'],))
     contracts = query("""SELECT c.id AS contract_id, c.status AS contract_status, c.monthly_rent, c.start_date,
-               c.end_date, c.is_open_term, c.minimum_months, c.contract_doc_url, c.tenant_ack,
+               c.end_date, c.is_open_term, c.minimum_months, c.contract_doc_url, c.tenant_ack, c.move_out_date, c.notice_given_at,
                un.unit_number, p.name AS property_name, p.address, p.landlord_id AS landlord_profile_id
         FROM contracts c JOIN units un ON un.id=c.unit_id JOIN properties p ON p.id=un.property_id
         WHERE c.tenant_id=%s AND c.status IN ('active','move_out_pending')

@@ -54,12 +54,22 @@ Don't edit files directly on the server — the next deploy would overwrite them
   big deletes make you type the name). Accounts and properties are soft-deleted into the admin's
   **Recycle Bin** (`users.deleted_at`, `properties.deleted_at`, restorable); records are never
   erased. Blocked while there are active contracts (`user_delete_info` / `property_delete_info`).
-- **Tenant records:** landlords have no Contracts or Payments pages — contracts (create, extend,
-  move out, signed copy), payments (approve/reject, receipts) and every file live on the tenant's
-  profile; payments waiting for review are on the Dashboard. Old links to those pages land on
-  Tenants / Dashboard (`MOVED_PAGES`).
-- **Move-in checklist:** each landlord's list (`onboarding_requirements`, created from
-  `DEFAULT_REQUIREMENTS` on first use, edited in Settings); kinds document / info / landlord.
+- **Tenant records:** landlords have no Contracts, Payments or Bills pages — contracts (create,
+  extend, signed copy), bills (+ Add Bill), payments (approve/reject, receipts) and every file live
+  on the tenant's profile; payments waiting for review are on the Dashboard. Old links to those
+  pages land on Tenants / Dashboard (`MOVED_PAGES`). Profile order: details card (each rented unit
+  with its Move Out button, notice and last day) → a move-out card per leaving contract → records
+  → move-in checklist last, always closed.
+- **Move-out:** "Move Out" asks for the 30-day notice date and the last day (`contracts.notice_given_at`,
+  `move_out_date`, status `move_out_pending`). The move-out card holds the landlord's move-out
+  checklist (`onboarding_requirements` with `phase='move_out'`, from `DEFAULT_MOVE_OUT`, ticked per
+  contract in `contract_offboarding`), the deposit (deductions, returned on/by/amount in
+  `move_out_checklists`) and the deposit acknowledgement (printable `deposit-ack.pdf`, signed copy
+  uploaded as `deposit_ack`). "Complete Move-Out" ends the contract.
+- **Lease terms:** each unit has a usual lease (`units.lease_term_months`, NULL = open contract,
+  common in the Philippines); a new contract's end date is filled from it.
+- **Move-in checklist:** each landlord's list (`onboarding_requirements` with `phase='move_in'`,
+  created from `DEFAULT_REQUIREMENTS` on first use, edited in Settings next to the move-out list); kinds document / info / landlord.
   Tenants send items on "Move-in Checklist"; landlords approve / ask to redo / waive on the
   tenant's profile (`tenant_requirements`). Files use the private uploads (`tenant_document`,
   `onboarding_photo`).
