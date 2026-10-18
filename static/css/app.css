@@ -440,3 +440,26 @@ tr:hover td{background:#fbfbf8}
 .myrem-day{display:flex;align-items:center;gap:8px;font-size:13px;color:var(--muted)}
 .myrem-day input{width:72px !important;padding:8px 10px !important}
 @media(max-width:640px){.rem-row{grid-template-columns:1fr 1fr}.rem-type{grid-column:1/-1}}
+
+/* Dashboard charts (dataviz: thin columns, hairline grid, text in text colors) */
+.filter-row{display:flex;flex-wrap:wrap;align-items:center;gap:10px;margin-bottom:12px}
+.filter-row .chip-row{margin:0}
+.filter-select{padding:8px 10px;border:1.5px solid var(--border);border-radius:var(--radius);background:var(--surface);color:var(--text);max-width:100%}
+.chart-head{display:flex;flex-wrap:wrap;justify-content:space-between;align-items:flex-start;gap:6px 14px;margin-bottom:8px}
+.chart-headline{font-size:20px;font-weight:700;color:var(--text)}
+.chart-wrap{position:relative;width:100%;overflow:visible}
+.chart-wrap svg{display:block;max-width:100%}
+.ch-grid{stroke:#eceee8;stroke-width:1}
+.ch-base{stroke:#c9cfc4;stroke-width:1}
+.ch-tick,.ch-x{fill:var(--muted);font-size:11px;font-variant-numeric:tabular-nums}
+.ch-sub{font-size:10px}
+.ch-val{fill:var(--text);font-size:11px;font-weight:600}
+.ch-bar{transition:opacity .12s}
+.ch-bar.lift{opacity:.75}
+.ch-hit{fill:transparent;cursor:pointer;outline:none}
+.ch-hit:focus-visible{stroke:var(--brand);stroke-width:1.5}
+.chart-tip{position:absolute;pointer-events:none;background:var(--surface);border:1px solid var(--border);border-radius:var(--radius);
+  box-shadow:0 4px 14px rgba(23,55,45,.12);padding:8px 10px;font-size:12px;line-height:1.5;white-space:nowrap;z-index:5}
+.chart-tip strong{font-size:14px;color:var(--text)}
+.chart-table{margin-top:8px}
+.chart-table summary{cursor:pointer;font-size:13px;color:var(--muted)}

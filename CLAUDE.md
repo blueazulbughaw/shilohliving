@@ -37,7 +37,8 @@ Don't edit files directly on the server — the next deploy would overwrite them
 
 ## How the app works (things not obvious from the code)
 
-- **Landlord sign-up** is open by default; `SIGNUP_MODE=invite` makes it invite-only: the admin
+- **Landlord sign-up** has no button on the sign-in screen: landlords get a link — `/register`
+  (works while sign-up is open) or an invite `/invite/CODE`. It is open by default; `SIGNUP_MODE=invite` makes it invite-only: the admin
   makes one-time codes on Admin → Invites (`I…`, link `/invite/CODE`), optionally locked to one
   email and/or "free forever". New landlords get a `TRIAL_DAYS` trial (`landlord_profiles.trial_ends_at`).
 - **Charging landlords is off until `SUBSCRIPTION_PAY_INFO` is set** (`BILLING_ACTIVE`). Then,
@@ -58,6 +59,10 @@ Don't edit files directly on the server — the next deploy would overwrite them
   runs hourly on the server (installed by `deploy.sh`, log in `~/shilohliving_hub/daily_jobs.log`):
   it marks unpaid bills past due as `overdue` and, from 8 AM local time (`APP_UTC_OFFSET`, default 8 =
   Philippines; the server is on US time), sends each reminder once a day (`bill_reminders_sent`).
+- **Dashboard charts** (`/api/landlord/usage`, `columnChart()` in `app.js`): water = main-meter
+  cubic meters per water session; electricity = amount billed (bills carry no kWh), shown only when
+  a property has Electricity billing on. By month (last 12) / by year, per property. Colors are a
+  validated pair (`CHART_COLORS`); keep the hover tooltip and the "Show as table" view.
 - **Deleting a bill** (tenant profile) is for mistakes: refused once a payment is approved or waiting
   for review. A deleted water bill's reading returns to its session, which reopens (`draft`) so the
   reading can be fixed and billed again; already-billed readings stay locked. "Print bills" on a

@@ -35,21 +35,25 @@ async function apiFetch(path, opts = {}) {
 
 // ═══════════════════════════════════════════════
 // ENTRY LINKS — /join/CODE (tenant join link / QR), old ?register=tenant&code=X links,
-// /invite/CODE (a landlord invite from the admin), and ?open=page from a tapped phone notification
+// /invite/CODE (a landlord invite from the admin), /register (landlord sign-up link — there is no
+// button for it on the sign-in screen), and ?open=page from a tapped phone notification
 // ═══════════════════════════════════════════════
 let PENDING_JOIN_CODE = null;
 let PENDING_OPEN_PAGE = null;
 let PENDING_INVITE_CODE = null;
+let PENDING_LANDLORD_SIGNUP = false;
 (function captureEntryIntent() {
   const params = new URLSearchParams(location.search);
   const m = location.pathname.match(/^\/join\/([A-Za-z0-9]{8})\/?$/);
   const inv = location.pathname.match(/^\/invite\/([A-Za-z0-9]{8})\/?$/);
   if (inv) PENDING_INVITE_CODE = inv[1].toUpperCase();
+  const signup = /^\/register\/?$/.test(location.pathname);
+  if (signup) PENDING_LANDLORD_SIGNUP = true;
   if (m) PENDING_JOIN_CODE = m[1].toUpperCase();
   else if (params.get('register') === 'tenant' && params.get('code')) PENDING_JOIN_CODE = params.get('code').toUpperCase();
   if (params.get('open')) PENDING_OPEN_PAGE = params.get('open');
   if (params.get('notif')) apiFetchQuiet('/notifications/' + parseInt(params.get('notif')) + '/read', { method: 'PATCH' });
-  if (m || inv || params.get('register') || params.get('open') || params.get('source')) history.replaceState(null, '', '/');
+  if (m || inv || signup || params.get('register') || params.get('open') || params.get('source')) history.replaceState(null, '', '/');
 })();
 function apiFetchQuiet(path, opts) { if (token) apiFetch(path, opts).catch(() => { }); }
 
@@ -277,8 +281,7 @@ function showLogin(notice) {
     <p class="err-msg" id="login-err"></p>
     ${_joinInfo ? `<button class="btn-secondary" style="margin-top:14px" onclick="showTenantRegister()">← Create a new tenant account instead</button>` : `
     <div class="auth-divider"><span>New to Shiloh Living?</span></div>
-    <button class="btn-secondary" onclick="showJoinCode()">🔑 I'm a tenant — I have a join code</button>
-    <button class="btn-secondary" style="margin-top:8px" onclick="showLandlordRegister()">🏠 Register as a Landlord</button>`}`);
+    <button class="btn-secondary" onclick="showJoinCode()">🔑 I'm a tenant — I have a join code</button>`}`);
 }
 
 function showJoinCode(prefill, error) {
@@ -1069,7 +1072,6 @@ function renderInvite() {
     <div class="invite-actions">
       <button class="btn btn-brand" onclick="shareJoinLink()">📤 Share Join Link</button>
       <button class="btn btn-outline" onclick="copyText(joinUrl(_invite.code), 'Join link copied!')">📋 Copy Link</button>
-      <button class="btn btn-outline" onclick="shareLoginLink()">🔐 Share Sign-in Link</button>
       <button class="btn btn-outline" onclick="printInvite()">🖨️ Print Poster</button>
     </div>
     <p class="small-msg" id="invite-msg"></p>
@@ -1091,12 +1093,6 @@ async function shareJoinLink() {
   if (!navigator.share) { try { await navigator.clipboard.writeText(url); say('Link copied!'); } catch (_) { say(url); } return; }
   try { await navigator.share({ title: `Join ${_invite.title}`, text: inviteText(), url }); }
   catch (e) { if (e.name !== 'AbortError') say(url); }
-}
-async function shareLoginLink() {
-  const url = location.origin + '/';
-  const text = 'Sign in to Shiloh Living to see your bills and messages:';
-  if (!navigator.share) { copyText(url, 'Sign-in link copied!'); return; }
-  try { await navigator.share({ title: 'Shiloh Living', text, url }); } catch (e) { if (e.name !== 'AbortError') copyText(url); }
 }
 // The phone's long-press "share image" would share this page's address instead of the join
 // link, so tapping shares the picture with the link in the text (or downloads it on a computer).
@@ -1187,9 +1183,168 @@ async function loadLandlordDashboard() {
             <button class="btn btn-outline" onclick="goPage('tenants')">👥 Tenants &amp; Records</button>
           </div>
         </div>
-      </div>`;
+      </div>
+      <div id="usage-section"></div>`;
+    loadUsage();
   } catch (e) { pg.innerHTML = errHtml(e); }
 }
+
+// ── Water & electricity charts (dashboard) ──
+// One filter row (month/year, property) above both charts. Water = main-meter cubic meters per
+// water session; electricity = amount billed (bills have no kWh), only where a property bills it.
+const CHART_COLORS = { water: '#2a78d6', electricity: '#eb6834' };   // validated pair (dataviz)
+let _usage = { view: 'month', property: '', data: null };
+async function loadUsage() {
+  const box = document.getElementById('usage-section'); if (!box) return;
+  try {
+    const d = await apiFetch('/landlord/usage' + (_usage.property ? '?property_id=' + parseInt(_usage.property) : ''));
+    _usage.data = d;
+    if (!d.any_water && !d.any_electricity) { box.innerHTML = ''; return; }
+    const props = d.properties.filter(p => p.water || p.electricity);
+    box.innerHTML = `
+      <h2 class="section-title">📈 Water${d.any_electricity ? ' &amp; Electricity' : ''}</h2>
+      <div class="filter-row">
+        <div class="chip-row" role="group" aria-label="Period">
+          <button class="chip ${_usage.view === 'month' ? 'active' : ''}" onclick="setUsage('view','month')">By month</button>
+          <button class="chip ${_usage.view === 'year' ? 'active' : ''}" onclick="setUsage('view','year')">By year</button>
+        </div>
+        ${props.length > 1 ? `<select class="filter-select" aria-label="Property" onchange="setUsage('property', this.value)">
+          <option value="">All properties</option>
+          ${props.map(p => `<option value="${parseInt(p.id)}" ${String(p.id) === String(_usage.property) ? 'selected' : ''}>${esc(p.name)}</option>`).join('')}
+        </select>` : ''}
+      </div>
+      ${d.any_water ? `<div class="card chart-card" id="chart-water"></div>` : ''}
+      ${d.any_electricity ? `<div class="card chart-card" id="chart-electricity"></div>` : ''}`;
+    drawUsage();
+  } catch (e) { box.innerHTML = ''; }
+}
+function setUsage(key, val) {
+  if (_usage[key] === val) return;
+  _usage[key] = val;
+  if (key === 'property') { const b = document.getElementById('usage-section'); if (b) b.style.opacity = .55; loadUsage().then(() => { if (b) b.style.opacity = ''; }); }
+  else loadUsage();
+}
+const SHORT_MONTHS = ['Jan', 'Feb', 'Mar', 'Apr', 'May', 'Jun', 'Jul', 'Aug', 'Sep', 'Oct', 'Nov', 'Dec'];
+// Last 12 months up to this month (gaps stay empty), or every year with data
+function usagePoints(series) {
+  if (!series) return [];
+  if (_usage.view === 'year') return series.years.map(y => ({ ...y, label: String(y.year) }));
+  const now = new Date(); const out = [];
+  for (let i = 11; i >= 0; i--) {
+    const dt = new Date(now.getFullYear(), now.getMonth() - i, 1);
+    const hit = series.months.find(m => m.year === dt.getFullYear() && m.month === dt.getMonth() + 1);
+    out.push({ ...(hit || {}), year: dt.getFullYear(), month: dt.getMonth() + 1, empty: !hit,
+      label: SHORT_MONTHS[dt.getMonth()], sub: dt.getMonth() === 0 || i === 11 ? String(dt.getFullYear()) : '' });
+  }
+  return out;
+}
+const cubic = n => `${Number(n).toLocaleString(undefined, { maximumFractionDigits: 1 })} cu.m`;
+const peso0 = n => '₱' + Number(n).toLocaleString(undefined, { maximumFractionDigits: 0 });
+function drawUsage() {
+  const d = _usage.data; if (!d) return;
+  const period = _usage.view === 'year' ? 'per year' : 'last 12 months';
+  const w = document.getElementById('chart-water');
+  if (w) {
+    const pts = usagePoints(d.water);
+    const total = pts.reduce((a, p) => a + (p.cubic || 0), 0);
+    usageCard(w, {
+      title: '💧 Water used', subtitle: `Main meter, cubic meters · ${period}`,
+      headline: d.water ? (_usage.view === 'year' ? `${cubic(pts.length ? pts[pts.length - 1].cubic : 0)} in ${pts.length ? pts[pts.length - 1].year : '—'}` : `${cubic(total)} in 12 months`) : '',
+      empty: !d.water ? 'Water billing is off for this property.' : !pts.some(p => p.cubic) ? 'No water readings yet — they appear here after each water session.' : '',
+      pts, key: 'cubic', color: CHART_COLORS.water, fmtVal: cubic, tick: n => compactNum(n),
+      tipLines: p => [`Main bill ${'₱' + fmt(p.main_bill || 0)}`, `Billed to tenants ${'₱' + fmt(p.billed || 0)}`],
+      cols: [['Used', p => cubic(p.cubic || 0)], ['Main bill', p => '₱' + fmt(p.main_bill || 0)], ['Billed to tenants', p => '₱' + fmt(p.billed || 0)]],
+    });
+  }
+  const e = document.getElementById('chart-electricity');
+  if (e) {
+    const pts = usagePoints(d.electricity);
+    const total = pts.reduce((a, p) => a + (p.billed || 0), 0);
+    usageCard(e, {
+      title: '⚡ Electricity billed', subtitle: `Amount billed to tenants · ${period}`,
+      headline: d.electricity ? (_usage.view === 'year' ? `${peso0(pts.length ? pts[pts.length - 1].billed : 0)} in ${pts.length ? pts[pts.length - 1].year : '—'}` : `${peso0(total)} in 12 months`) : '',
+      empty: !d.electricity ? 'Electricity billing is off for this property.' : !pts.some(p => p.billed) ? 'No electricity bills yet.' : '',
+      pts, key: 'billed', color: CHART_COLORS.electricity, fmtVal: n => '₱' + fmt(n), tick: n => '₱' + compactNum(n),
+      tipLines: p => [`${p.bills || 0} bill${p.bills === 1 ? '' : 's'}`],
+      cols: [['Billed', p => '₱' + fmt(p.billed || 0)], ['Bills', p => String(p.bills || 0)]],
+    });
+  }
+}
+function compactNum(n) {
+  if (n >= 1e6) return +(n / 1e6).toFixed(1) + 'M';
+  if (n >= 1e3) return +(n / 1e3).toFixed(1) + 'K';
+  return String(+n.toFixed(1));
+}
+function niceStep(max, count) {
+  const raw = max / count, mag = Math.pow(10, Math.floor(Math.log10(raw)));
+  const f = raw / mag; return (f <= 1 ? 1 : f <= 2 ? 2 : f <= 2.5 ? 2.5 : f <= 5 ? 5 : 10) * mag;
+}
+function usageCard(el, o) {
+  el.innerHTML = `<div class="chart-head"><div><h3>${o.title}</h3><div class="muted-text small">${esc(o.subtitle)}</div></div>
+      ${o.headline && !o.empty ? `<div class="chart-headline">${esc(o.headline)}</div>` : ''}</div>
+    ${o.empty ? `<p class="muted-text" style="padding:18px 0">${esc(o.empty)}</p>` : `<div class="chart-wrap"></div>
+    <details class="chart-table"><summary>Show as table</summary><div class="table-wrap"><table>
+      <thead><tr><th>${_usage.view === 'year' ? 'Year' : 'Month'}</th>${o.cols.map(c => `<th>${esc(c[0])}</th>`).join('')}</tr></thead>
+      <tbody>${o.pts.filter(p => !p.empty).slice().reverse().map(p => `<tr><td>${esc(_usage.view === 'year' ? p.label : SHORT_MONTHS[p.month - 1] + ' ' + p.year)}</td>${o.cols.map(c => `<td>${esc(c[1](p))}</td>`).join('')}</tr>`).join('')}</tbody>
+    </table></div></details>`}`;
+  if (!o.empty) columnChart(el.querySelector('.chart-wrap'), o);
+}
+// Single-series column chart: <=24px columns with 4px rounded tops on one baseline, hairline grid,
+// value labels only on the latest and the highest column, a tooltip per column (hover + keyboard).
+function columnChart(wrap, o) {
+  const pts = o.pts, W = Math.max(280, wrap.clientWidth || 320), H = 200;
+  const L = 44, R = 8, T = 20, B = 34, pw = W - L - R, ph = H - T - B;
+  const vals = pts.map(p => p[o.key] || 0);
+  const step = niceStep(Math.max(...vals, 1), 4), top = Math.ceil(Math.max(...vals, 1) / step) * step;
+  const y = v => T + ph - (v / top) * ph;
+  const band = pw / pts.length, bw = Math.max(6, Math.min(24, band - 8));
+  const last = pts.map((p, i) => p.empty ? -1 : i).filter(i => i >= 0).pop();
+  const maxI = vals.indexOf(Math.max(...vals));
+  let g = '';
+  for (let t = 0; t <= top + 1e-9; t += step) {
+    g += `<line x1="${L}" x2="${W - R}" y1="${y(t)}" y2="${y(t)}" class="${t === 0 ? 'ch-base' : 'ch-grid'}"/>
+      <text x="${L - 6}" y="${y(t) + 4}" text-anchor="end" class="ch-tick">${esc(o.tick(t))}</text>`;
+  }
+  pts.forEach((p, i) => {
+    const cx = L + band * i + band / 2, v = vals[i], h = (v / top) * ph;
+    if (v > 0) {
+      const r = Math.min(4, h, bw / 2), x0 = cx - bw / 2, yb = T + ph, yt = yb - h;
+      g += `<path class="ch-bar" data-i="${i}" fill="${o.color}" d="M${x0},${yb} V${yt + r} Q${x0},${yt} ${x0 + r},${yt} H${x0 + bw - r} Q${x0 + bw},${yt} ${x0 + bw},${yt + r} V${yb} Z"/>`;
+      if (i === last || i === maxI) g += `<text x="${cx}" y="${yt - 6}" text-anchor="middle" class="ch-val">${esc(o.tick(v))}</text>`;
+    }
+    g += `<text x="${cx}" y="${T + ph + 15}" text-anchor="middle" class="ch-x">${esc(p.label)}</text>`;
+    if (p.sub) g += `<text x="${cx}" y="${T + ph + 28}" text-anchor="middle" class="ch-x ch-sub">${esc(p.sub)}</text>`;
+    g += `<rect class="ch-hit" data-i="${i}" x="${L + band * i}" y="${T}" width="${band}" height="${ph + 16}" tabindex="0"
+      aria-label="${esc((p.sub || '') + ' ' + p.label + ': ' + (p.empty ? 'no data' : o.fmtVal(v)))}"/>`;
+  });
+  wrap.innerHTML = `<svg width="${W}" height="${H}" viewBox="0 0 ${W} ${H}" role="img" aria-label="${esc(o.title.replace(/^\S+\s/, ''))} chart">${g}</svg>
+    <div class="chart-tip" hidden></div>`;
+  const tip = wrap.querySelector('.chart-tip');
+  const show = (i, rect) => {
+    const p = pts[i]; tip.replaceChildren();
+    const strong = document.createElement('strong'); strong.textContent = p.empty ? 'No data' : o.fmtVal(vals[i]);
+    const when = document.createElement('div'); when.className = 'muted-text';
+    when.textContent = _usage.view === 'year' ? p.label : `${SHORT_MONTHS[p.month - 1]} ${p.year}`;
+    tip.append(strong, when);
+    const lines = p.empty ? [] : o.tipLines(p);
+    if (_usage.view === 'year' && p.months) lines.push(`${p.months} month${p.months === 1 ? '' : 's'} of data`);
+    lines.forEach(t => { const d = document.createElement('div'); d.textContent = t; tip.append(d); });
+    tip.hidden = false;
+    const wr = wrap.getBoundingClientRect(), rr = rect.getBoundingClientRect();
+    let left = rr.left - wr.left + rr.width / 2 - tip.offsetWidth / 2;
+    tip.style.left = Math.max(0, Math.min(left, wr.width - tip.offsetWidth)) + 'px';
+    tip.style.top = Math.max(0, y(vals[i]) - tip.offsetHeight - 10) + 'px';
+    wrap.querySelectorAll('.ch-bar').forEach(b => b.classList.toggle('lift', b.dataset.i === String(i)));
+  };
+  const hide = () => { tip.hidden = true; wrap.querySelectorAll('.ch-bar.lift').forEach(b => b.classList.remove('lift')); };
+  wrap.querySelectorAll('.ch-hit').forEach(h => {
+    const i = parseInt(h.dataset.i);
+    h.addEventListener('pointerenter', () => show(i, h)); h.addEventListener('focus', () => show(i, h));
+    h.addEventListener('pointerleave', hide); h.addEventListener('blur', hide);
+  });
+}
+let _usageResize;
+window.addEventListener('resize', () => { clearTimeout(_usageResize); _usageResize = setTimeout(() => { if (document.getElementById('usage-section')) drawUsage(); }, 200); });
 
 // ═══════════════════════════════════════════════
 // PROPERTIES
@@ -3513,7 +3668,7 @@ async function submitAdminEditUser(uid, role) {
   if (token && currentUser) { initApp(); return; }
 
   // A landlord invite link opened while signed out: straight to landlord sign-up, code filled in
-  if (PENDING_INVITE_CODE) { showLandlordRegister(); return; }
+  if (PENDING_INVITE_CODE || PENDING_LANDLORD_SIGNUP) { showLandlordRegister(); return; }
 
   // A tenant join link / QR opened while signed out: show who it's for, then sign up
   if (PENDING_JOIN_CODE) {

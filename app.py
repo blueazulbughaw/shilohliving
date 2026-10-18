@@ -3033,6 +3033,51 @@ def landlord_join_code():
                'business_name': lp.get('business_name') or ''})
 
 
+@app.route('/api/landlord/usage', methods=['GET'])
+@require_auth('landlord')
+def landlord_usage():
+    """Water (main meter, per water session) and electricity (billed, only properties that bill it)
+    by month and by year, for the dashboard charts. ?property_id= narrows to one property."""
+    lp = get_landlord_profile(g.current_user['id'])
+    props = query("SELECT id,name,features FROM properties WHERE landlord_id=%s AND is_active=1 AND deleted_at IS NULL ORDER BY name", (lp['id'],))
+    for pr in props:
+        f = property_features(pr.pop('features'))
+        pr['water'], pr['electricity'] = f['water_billing'], f['electricity_billing']
+    pid = request.args.get('property_id', type=int)
+    chosen = [pr for pr in props if not pid or pr['id'] == pid]
+    water_ids = [pr['id'] for pr in chosen if pr['water']]
+    elec_ids = [pr['id'] for pr in chosen if pr['electricity']]
+
+    def series(rows):
+        months = [{'year': int(r['y']), 'month': int(r['m']), **{k: float(r[k] or 0) for k in r if k not in ('y', 'm')}} for r in rows]
+        years = {}
+        for r in months:
+            y = years.setdefault(r['year'], {'year': r['year'], 'months': 0})
+            y['months'] += 1
+            for k, v in r.items():
+                if k not in ('year', 'month'): y[k] = y.get(k, 0) + v
+        return {'months': months, 'years': sorted(years.values(), key=lambda x: x['year'])}
+
+    water = elec = None
+    if water_ids:
+        marks = ','.join(['%s'] * len(water_ids))
+        water = series(query(f"""SELECT wms.session_year AS y, wms.session_month AS m,
+                SUM(wms.overall_consumption) AS cubic, SUM(wms.total_bill) AS main_bill,
+                (SELECT COALESCE(SUM(wmr.total_amount),0) FROM water_meter_readings wmr JOIN water_meter_sessions s2 ON s2.id=wmr.session_id
+                  WHERE s2.property_id IN ({marks}) AND s2.session_year=wms.session_year AND s2.session_month=wms.session_month
+                    AND wmr.bill_id IS NOT NULL) AS billed
+            FROM water_meter_sessions wms WHERE wms.property_id IN ({marks})
+            GROUP BY wms.session_year, wms.session_month ORDER BY y, m""", (*water_ids, *water_ids)))
+    if elec_ids:
+        marks = ','.join(['%s'] * len(elec_ids))
+        elec = series(query(f"""SELECT COALESCE(b.bill_year, YEAR(b.due_date)) AS y, COALESCE(b.bill_month, MONTH(b.due_date)) AS m,
+                SUM(b.amount) AS billed, COUNT(*) AS bills
+            FROM bills b JOIN contracts c ON c.id=b.contract_id JOIN units un ON un.id=c.unit_id
+            WHERE b.bill_type='electricity' AND un.property_id IN ({marks})
+            GROUP BY y, m ORDER BY y, m""", tuple(elec_ids)))
+    return ok({'properties': props, 'water': water, 'electricity': elec,
+               'any_water': any(pr['water'] for pr in props), 'any_electricity': any(pr['electricity'] for pr in props)})
+
 @app.route('/api/landlord/dashboard', methods=['GET'])
 @require_auth('landlord')
 def landlord_dashboard():

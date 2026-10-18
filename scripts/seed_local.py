@@ -121,6 +121,18 @@ for unit, cid, prev, curr, paid in (('10', c_maria, 1520, 1543.5, True), ('2B', 
            VALUES (%s,%s,%s,%s,%s,%s,100,%s,%s)""", (sess, units[unit], prev, curr, used, water, total, b))
     if paid:
         pay(b, round(total, 2), first.replace(day=10))
+# A year of earlier water sessions (main meter only) so the dashboard chart has history
+for n, cu in zip(range(13, 1, -1), (64, 61, 66, 72, 85, 93, 98, 90, 78, 71, 68, 74)):
+    mm = months_ago(n)
+    run("""INSERT INTO water_meter_sessions (property_id,session_month,session_year,prev_reading_date,curr_reading_date,
+           total_bill,overall_consumption,price_per_cubic,pump_total,number_of_units,pump_per_unit,status)
+           VALUES (%s,%s,%s,%s,%s,%s,%s,31.25,400,4,100,'billed')""",
+        (p1, mm.month, mm.year, mm, mm.replace(day=28), round(cu * 31.25, 2), cu))
+# Earlier electricity bills at Garden Villas (paid)
+for n, amt in zip(range(5, 1, -1), (2810.25, 3420.80, 3975.10, 3610.55)):
+    mm = months_ago(n)
+    eb = bill(c_ana, f"Electricity — {mm.strftime('%B %Y')}", 'electricity', amt, mm.replace(day=20), mm.month, mm.year)
+    pay(eb, amt, mm.replace(day=18))
 # An electricity bill at Garden Villas, paid, with a proof waiting for approval on another
 b = bill(c_ana, f"Electricity — {m.strftime('%B %Y')}", 'electricity', 3250.40, first.replace(day=20), m.month, m.year)
 run("""INSERT INTO payments (bill_id,amount_paid,proof_url,status,paid_at) VALUES
