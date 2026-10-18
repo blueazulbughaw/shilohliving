@@ -13,3 +13,4 @@ tmp/
 
 # Local dev database (scripts/dev.sh)
 .localdb/
+uploads/

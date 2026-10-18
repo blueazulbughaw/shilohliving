@@ -2,7 +2,7 @@
 Shiloh Living — Rental Management Platform
 Flask JSON API under /api/* plus the single-page frontend (templates/index.html).
 """
-import os, re, secrets, smtplib, io, json, html, logging
+import os, re, secrets, smtplib, io, json, html, logging, hashlib
 from concurrent.futures import ThreadPoolExecutor
 from datetime import datetime, timedelta, date
 from functools import wraps
@@ -30,6 +30,7 @@ logging.basicConfig(level=logging.INFO)
 
 BASE_DIR = os.path.dirname(os.path.abspath(__file__))
 app = Flask(__name__, template_folder=os.path.join(BASE_DIR, 'templates'))
+app.config['MAX_CONTENT_LENGTH'] = 12 * 1024 * 1024   # uploads are 10 MB max (see save_upload)
 
 SECRET_KEY    = os.environ.get('SECRET_KEY', '')
 if len(SECRET_KEY) < 32 or SECRET_KEY == 'change-me-in-production':
@@ -41,8 +42,6 @@ SMTP_USER     = os.environ.get('SMTP_USER', 'noreply@shilohliving.app')
 SMTP_PASSWORD = os.environ.get('SMTP_PASSWORD', '')
 SUPPORT_EMAIL = os.environ.get('SUPPORT_EMAIL', 'support@shilohliving.app')
 APP_URL       = os.environ.get('APP_URL', 'https://hub.shilohliving.app').rstrip('/')
-# Uploads (contract docs, payment proofs, repair receipts) must come from this Cloudinary account
-CLOUDINARY_URL_PREFIX = 'https://res.cloudinary.com/' + os.environ.get('CLOUDINARY_CLOUD', 'dyyi3mtm0') + '/'
 # Web Push (phone notifications). Without both keys nothing is pushed; the in-app bell still works.
 VAPID_PUBLIC_KEY  = os.environ.get('VAPID_PUBLIC_KEY', '')
 VAPID_PRIVATE_KEY = os.environ.get('VAPID_PRIVATE_KEY', '')
@@ -58,6 +57,10 @@ def not_found(e):
     if request.path.startswith('/api/'):
         return jsonify({'status':'error','message':'API endpoint not found'}), 404
     return send_from_directory(os.path.join(BASE_DIR, 'templates'), 'index.html')
+
+@app.errorhandler(413)
+def too_large(e):
+    return jsonify({'status': 'error', 'message': 'The file is too big (10 MB max)'}), 413
 
 @app.errorhandler(405)
 def method_not_allowed(e):
@@ -126,9 +129,6 @@ def h(value):
     """HTML-escape anything people typed before it goes into an email."""
     return html.escape(str(value if value is not None else ''))
 
-def is_upload_url(url):
-    return isinstance(url, str) and url.startswith(CLOUDINARY_URL_PREFIX)
-
 def positive_amount(value):
     try:
         v = float(value)
@@ -141,7 +141,11 @@ def positive_amount(value):
 def send_email(to_email, subject, html_body, attachments=None):
     """attachments: [(filename, bytes, 'application/pdf')]. Returns True if the mail server took it."""
     if not SMTP_PASSWORD:
-        log.info("Email skipped (no SMTP password): %s", subject)
+        if os.environ.get('DEV_SHOW_EMAILS'):   # scripts/dev.sh: print it so links can be clicked
+            log.info("EMAIL to %s: %s\n%s\nLinks: %s", to_email, subject, re.sub(r'<[^>]+>', ' ', html_body),
+                     ' '.join(re.findall(r'href="([^"]+)"', html_body)))
+        else:
+            log.info("Email skipped (no SMTP password): %s", subject)
         return False
     try:
         msg = MIMEMultipart('mixed')
@@ -207,10 +211,11 @@ def validate_password_strength(pw):
         return 'Password must contain at least one special character (e.g. !@#$%)'
     return None
 
-def make_token(user_id, role):
+def make_token(user_id, role, session_version=0):
     payload = {
         'sub': str(user_id),
         'role': role,
+        'sv': int(session_version or 0),   # see users.session_version
         'exp': datetime.utcnow() + timedelta(hours=JWT_EXPIRES),
         'iat': datetime.utcnow()
     }
@@ -283,6 +288,9 @@ def require_auth(*roles):
             user = query("SELECT * FROM users WHERE id=%s AND is_active=1", (payload['sub'],), fetchone=True)
             if not user:
                 return err('User not found', 401)
+            # Password changed / reset, or "sign out other devices", since this sign-in
+            if int(payload.get('sv', 0)) != int(user.get('session_version') or 0):
+                return err('Your session has ended. Please sign in again.', 401)
             if roles and user['role'] not in roles:
                 return err('Access denied', 403)
             g.current_user = user
@@ -541,7 +549,7 @@ def login():
         return err('Please verify your email before logging in. Check your inbox for the verification link.', 403)
     execute("UPDATE users SET last_login_at=NOW() WHERE id=%s", (user['id'],))
     execute("DELETE FROM login_failures WHERE email=%s", (email,))
-    token = make_token(user['id'], user['role'])
+    token = make_token(user['id'], user['role'], user.get('session_version'))
     return ok({'token': token, 'user': {'id': user['id'], 'email': user['email'],
                'full_name': user['full_name'], 'role': user['role'],
                'email_verified': True}})
@@ -1366,8 +1374,8 @@ def upload_contract_doc(cid):
 
     if not doc_url:
         return err('contract_doc_url is required')
-    if not is_upload_url(doc_url):
-        return err('Invalid document URL. Please upload via the file picker.')
+    if not upload_ok(doc_url, 'contract'):
+        return err('Invalid document. Please upload it with the file picker.')
 
     c = query("""
         SELECT c.id, c.tenant_id FROM contracts c
@@ -1479,9 +1487,9 @@ def update_move_out(cid):
     allowed = ['deposit_consumed','deposit_consumed_amount','repair_status',
                'repair_notes','repair_proof_url','deposit_status','deposit_ready_at']
     fields  = {k:v for k,v in data.items() if k in allowed}
-    if fields.get('repair_proof_url') and not is_upload_url(fields['repair_proof_url']):
-        return err('Invalid proof URL. Please upload via the file picker.')
-    before = query("SELECT deposit_status FROM move_out_checklists WHERE contract_id=%s", (cid,), fetchone=True)
+    before = query("SELECT deposit_status, repair_proof_url FROM move_out_checklists WHERE contract_id=%s", (cid,), fetchone=True)
+    if not upload_ok(fields.get('repair_proof_url'), 'repair_proof', (before or {}).get('repair_proof_url')):
+        return err('Invalid proof. Please upload it with the file picker.')
     if fields:
         set_cl = ', '.join(f"{k}=%s" for k in fields)
         execute(f"UPDATE move_out_checklists SET {set_cl}, updated_at=NOW() WHERE contract_id=%s",
@@ -1662,8 +1670,8 @@ def submit_payment():
     amount_paid = positive_amount(amount_paid)
     if not bill_id or amount_paid is None: return err('bill_id and an amount more than 0 are required')
     if not proof_url: return err('Proof of payment is required')
-    if not is_upload_url(proof_url):
-        return err('Invalid proof URL. Please upload via the file picker.')
+    if not upload_ok(proof_url, 'payment_proof'):
+        return err('Invalid proof of payment. Please upload it with the file picker.')
     b=query("""SELECT b.id, b.status, b.description, c.tenant_id,
                       (SELECT lp.user_id FROM units u JOIN properties p ON p.id=u.property_id
                        JOIN landlord_profiles lp ON lp.id=p.landlord_id WHERE u.id=c.unit_id) AS landlord_user_id
@@ -1907,7 +1915,7 @@ def tenant_profile(tp_id):
 # ── Printable documents (bill statements, receipts) ──
 # Opened in a new tab / the phone's PDF viewer, which can't send the sign-in header, so the app
 # asks /api/docs/link for a 10-minute link that only works for that one document.
-DOC_PATHS = re.compile(r'^/api/(bills/\d+/pdf|payments/\d+/receipt\.pdf)$')
+DOC_PATHS = re.compile(r'^/api/(bills/\d+/pdf|payments/\d+/receipt\.pdf|files/[A-Za-z0-9_-]{20,64})$')
 
 def make_doc_token(user_id, path):
     return pyjwt.encode({'sub': str(user_id), 'scope': 'doc', 'path': path,
@@ -2036,6 +2044,118 @@ def resend_receipt(pid):
         return err('Approved payment not found', 404)
     no = issue_receipt(pid, resend=True)
     return ok({'receipt_no': no}, msg=f'Receipt {no} sent again')
+
+
+# ════════════════════════════════════════════════════════════
+# FILE UPLOADS — private, on our server
+# ════════════════════════════════════════════════════════════
+# Payment proofs, signed contracts and repair receipts are stored in UPLOAD_DIR (inside the app
+# folder, which the web server doesn't serve) and only come back through /api/files/<token>, to
+# the person who uploaded it and the tenant + landlord of the record it's attached to.
+
+UPLOAD_DIR = os.environ.get('UPLOAD_DIR') or os.path.join(BASE_DIR, 'uploads')
+MAX_UPLOAD_BYTES = 10 * 1024 * 1024
+MAX_UPLOADS_PER_DAY = 60
+# kind -> who may upload it, and which file types it takes
+UPLOAD_KINDS = {
+    'payment_proof': ('tenant', {'image/jpeg', 'image/png', 'image/webp', 'image/heic', 'application/pdf'}),
+    'contract': ('landlord', {'application/pdf', 'image/jpeg', 'image/png'}),
+    'repair_proof': ('landlord', {'image/jpeg', 'image/png', 'image/webp', 'image/heic', 'application/pdf'}),
+}
+FILE_EXT = {'image/jpeg': '.jpg', 'image/png': '.png', 'image/webp': '.webp', 'image/heic': '.heic', 'application/pdf': '.pdf'}
+FILE_URL = re.compile(r'^/api/files/([A-Za-z0-9_-]{20,64})$')
+
+def sniff_mime(head):
+    """The real type from the first bytes - never trust the name or the browser's claim."""
+    if head.startswith(b'\xff\xd8\xff'): return 'image/jpeg'
+    if head.startswith(b'\x89PNG\r\n\x1a\n'): return 'image/png'
+    if head[:4] == b'RIFF' and head[8:12] == b'WEBP': return 'image/webp'
+    if head[4:8] == b'ftyp' and head[8:12] in (b'heic', b'heix', b'mif1', b'msf1', b'hevc'): return 'image/heic'
+    if head.startswith(b'%PDF-'): return 'application/pdf'
+    return None
+
+def save_upload(data, kind, owner_user_id, original_name=''):
+    """Stores bytes as a new file; returns its /api/files/<token> URL. Raises ValueError if not allowed."""
+    if kind not in UPLOAD_KINDS:
+        raise ValueError('Unknown upload type')
+    if not data:
+        raise ValueError('The file is empty')
+    if len(data) > MAX_UPLOAD_BYTES:
+        raise ValueError('The file is too big (10 MB max)')
+    mime = sniff_mime(data[:16])
+    if mime not in UPLOAD_KINDS[kind][1]:
+        raise ValueError('Please upload a photo (JPG, PNG, WEBP, HEIC) or a PDF')
+    os.makedirs(UPLOAD_DIR, mode=0o700, exist_ok=True)
+    token = secrets.token_urlsafe(24)
+    with open(os.path.join(UPLOAD_DIR, token + FILE_EXT[mime]), 'wb') as f:
+        f.write(data)
+    execute("""INSERT INTO files (token, owner_user_id, kind, original_name, mime, size_bytes)
+               VALUES (%s,%s,%s,%s,%s,%s)""",
+            (token, owner_user_id, kind, (original_name or '')[:255], mime, len(data)))
+    return f'/api/files/{token}'
+
+def upload_ok(url, kind, current=None):
+    """A record may point at a file the signed-in person just uploaded for this purpose (or keep
+    the one it already has)."""
+    if not url or url == current:
+        return True
+    m = FILE_URL.match(url)
+    return bool(m and query("SELECT 1 FROM files WHERE token=%s AND owner_user_id=%s AND kind=%s",
+                            (m.group(1), g.current_user['id'], kind), fetchone=True))
+
+def file_parties(url):
+    """User ids of the tenant and landlord of every record this file is attached to."""
+    rows = query("""
+        SELECT tp.user_id AS tenant_user, lp.user_id AS landlord_user FROM payments py
+          JOIN bills b ON b.id=py.bill_id JOIN contracts c ON c.id=b.contract_id
+          JOIN tenant_profiles tp ON tp.id=c.tenant_id JOIN units un ON un.id=c.unit_id
+          JOIN properties p ON p.id=un.property_id JOIN landlord_profiles lp ON lp.id=p.landlord_id
+         WHERE py.proof_url=%s
+        UNION ALL
+        SELECT tp.user_id, lp.user_id FROM contracts c
+          JOIN tenant_profiles tp ON tp.id=c.tenant_id JOIN units un ON un.id=c.unit_id
+          JOIN properties p ON p.id=un.property_id JOIN landlord_profiles lp ON lp.id=p.landlord_id
+         WHERE c.contract_doc_url=%s
+        UNION ALL
+        SELECT tp.user_id, lp.user_id FROM move_out_checklists m JOIN contracts c ON c.id=m.contract_id
+          JOIN tenant_profiles tp ON tp.id=c.tenant_id JOIN units un ON un.id=c.unit_id
+          JOIN properties p ON p.id=un.property_id JOIN landlord_profiles lp ON lp.id=p.landlord_id
+         WHERE m.repair_proof_url=%s""", (url, url, url))
+    return {u for r in rows for u in (r['tenant_user'], r['landlord_user'])}
+
+@app.route('/api/files', methods=['POST'])
+@require_auth('landlord', 'tenant')
+def upload_file():
+    kind = request.form.get('kind', '')
+    f = request.files.get('file')
+    if kind not in UPLOAD_KINDS: return err('Unknown upload type')
+    if g.current_user['role'] != UPLOAD_KINDS[kind][0]: return err('Access denied', 403)
+    if not f: return err('Choose a file to upload')
+    recent = query("SELECT COUNT(*) AS n FROM files WHERE owner_user_id=%s AND created_at > NOW() - INTERVAL 1 DAY",
+                   (g.current_user['id'],), fetchone=True)
+    if recent and recent['n'] >= MAX_UPLOADS_PER_DAY:
+        return err('Too many uploads today. Please try again tomorrow.', 429)
+    try:
+        url = save_upload(f.read(MAX_UPLOAD_BYTES + 1), kind, g.current_user['id'], f.filename)
+    except ValueError as e:
+        return err(str(e))
+    return ok({'url': url, 'name': f.filename}, status=201)
+
+@app.route('/api/files/<token>', methods=['GET'])
+@require_doc_auth('landlord', 'tenant')
+def get_file(token):
+    row = query("SELECT * FROM files WHERE token=%s", (token,), fetchone=True)
+    url = f'/api/files/{token}'
+    if not row or (row['owner_user_id'] != g.current_user['id'] and g.current_user['id'] not in file_parties(url)):
+        return err('File not found', 404)
+    path = os.path.join(UPLOAD_DIR, token + FILE_EXT.get(row['mime'], ''))
+    if not os.path.isfile(path):
+        return err('File not found', 404)
+    with open(path, 'rb') as fh:
+        data = fh.read()
+    name = re.sub(r'[^\w.\- ]', '_', row['original_name'] or ('file' + FILE_EXT.get(row['mime'], '')))
+    return Response(data, mimetype=row['mime'],
+                    headers={'Content-Disposition': f'inline; filename="{name}"', 'Cache-Control': 'private, no-store'})
 
 
 # ════════════════════════════════════════════════════════════
@@ -2424,13 +2544,16 @@ def forgot_password():
     if not email:
         return err('Email is required')
     user = query("SELECT id, full_name, email FROM users WHERE email=%s AND is_active=1", (email,), fetchone=True)
-    # Always return ok to avoid email enumeration
-    if user:
+    # Same answer whether or not the email is registered, so nobody can probe for accounts
+    recent = user and query("SELECT 1 FROM password_resets WHERE user_id=%s AND created_at > NOW() - INTERVAL 2 MINUTE",
+                            (user['id'],), fetchone=True)
+    if user and not recent:
         token = secrets.token_urlsafe(32)
         expires = datetime.utcnow() + timedelta(hours=1)
         execute("DELETE FROM password_resets WHERE user_id=%s", (user['id'],))
+        # Only a hash is stored, so a copy of the database can't be used to reset passwords
         execute("INSERT INTO password_resets (user_id, token, expires_at) VALUES (%s,%s,%s)",
-                (user['id'], token, expires))
+                (user['id'], token_hash(token), expires))
         link = APP_URL + "/?type=reset&token=" + token
         body = (
             "<h2>Password Reset Request</h2>"
@@ -2456,16 +2579,58 @@ def reset_password():
     pw_err = validate_password_strength(password)
     if pw_err:
         return err(pw_err)
-    row = query("SELECT * FROM password_resets WHERE token=%s", (token,), fetchone=True)
+    row = query("SELECT * FROM password_resets WHERE token=%s", (token_hash(token),), fetchone=True)
     if not row:
         return err('Invalid or expired reset link', 400)
     if datetime.utcnow() > row['expires_at']:
-        execute("DELETE FROM password_resets WHERE token=%s", (token,))
+        execute("DELETE FROM password_resets WHERE id=%s", (row['id'],))
         return err('Reset link has expired. Please request a new one.', 400)
-    execute("UPDATE users SET password_hash=%s WHERE id=%s",
-            (hash_password(password), row['user_id']))
+    set_password(row['user_id'], password)
     execute("DELETE FROM password_resets WHERE user_id=%s", (row['user_id'],))
-    return ok(msg='Password reset successfully! You can now log in.')
+    execute("DELETE FROM login_failures WHERE email=(SELECT email FROM users WHERE id=%s)", (row['user_id'],))
+    return ok(msg='Password reset successfully! You can now sign in.')
+
+
+def token_hash(token):
+    return hashlib.sha256(token.encode()).hexdigest()
+
+def set_password(user_id, new_password):
+    """New password, and every existing sign-in of this account ends."""
+    execute("UPDATE users SET password_hash=%s, session_version=session_version+1 WHERE id=%s",
+            (hash_password(new_password), user_id))
+    u = query("SELECT email, full_name FROM users WHERE id=%s", (user_id,), fetchone=True)
+    if u:
+        send_email(u['email'], 'Your Shiloh Living password was changed',
+                   f'<p>Hi {h(u["full_name"])},</p><p>The password for your Shiloh Living account was just changed, '
+                   f'and you were signed out on your other devices.</p>'
+                   f'<p>If this wasn\'t you, reset your password right away from the sign-in page: '
+                   f'<a href="{APP_URL}">{APP_URL}</a></p>')
+
+def fresh_token():
+    u = query("SELECT id, role, session_version FROM users WHERE id=%s", (g.current_user['id'],), fetchone=True)
+    return make_token(u['id'], u['role'], u['session_version'])
+
+@app.route('/api/auth/change-password', methods=['POST'])
+@require_auth()
+def change_password():
+    """Signed-in password change. Other devices are signed out; this one gets a new sign-in."""
+    data = request.get_json() or {}
+    current, new = data.get('current_password', ''), data.get('new_password', '')
+    if not check_password(current, g.current_user['password_hash']):
+        return err('Your current password is incorrect')
+    pw_err = validate_password_strength(new)
+    if pw_err: return err(pw_err)
+    if current == new: return err('Choose a password different from the current one')
+    set_password(g.current_user['id'], new)
+    log_action('CHANGE_PASSWORD', 'users', g.current_user['id'])
+    return ok({'token': fresh_token()}, msg='Password changed. You were signed out on your other devices.')
+
+@app.route('/api/auth/sign-out-others', methods=['POST'])
+@require_auth()
+def sign_out_others():
+    execute("UPDATE users SET session_version=session_version+1 WHERE id=%s", (g.current_user['id'],))
+    log_action('SIGN_OUT_OTHERS', 'users', g.current_user['id'])
+    return ok({'token': fresh_token()}, msg='Signed out on all your other devices.')
 
 @app.route('/api/auth/resend-verification-by-email', methods=['POST'])
 def resend_verification_by_email():
@@ -2678,7 +2843,7 @@ def admin_reset_password(uid):
     new_password = data.get('password', '')
     pw_err = validate_password_strength(new_password)
     if pw_err: return err(pw_err)
-    execute("UPDATE users SET password_hash=%s WHERE id=%s", (hash_password(new_password), uid))
+    set_password(uid, new_password)
     log_action('ADMIN_RESET_PASSWORD', 'users', uid)
     return ok(msg='Password reset')
 

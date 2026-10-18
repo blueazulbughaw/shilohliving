@@ -68,8 +68,16 @@ Don't edit files directly on the server — the next deploy would overwrite them
   through `jsArg()` inside `onclick="…"` (see the top of `static/js/app.js`).
 - **Look:** the styling deliberately matches the marketing site (`../shilohliving-site`,
   paper/green/lime palette, DM Sans + Manrope). Keep the two in step.
-- Uploads (contracts, payment proofs) go to Cloudinary from the browser with an unsigned
-  preset; the API only accepts URLs from our Cloudinary cloud (`CLOUDINARY_CLOUD`).
+- **Uploads** (payment proofs, signed contracts, repair receipts) go to our server, not a
+  public host: `POST /api/files` (signed in, right role per kind, type checked from the file's
+  bytes, 10 MB) saves into `uploads/` in the app folder (not web-served; not in git; **not in
+  the DB backups** — back it up separately). Records store `/api/files/<token>`; `GET` only
+  serves the uploader and the tenant/landlord of the record (`file_parties`), opened through
+  `/api/docs/link`. Old Cloudinary links were moved with `tools/import_cloudinary_uploads.py`.
+- **Passwords & sessions:** the sign-in token carries `users.session_version`; changing or
+  resetting a password, or "Sign out other devices", bumps it so every other sign-in ends
+  (`set_password`). Reset links are stored hashed, expire in 1 hour, one email per 2 minutes.
+  Locally, `scripts/dev.sh` prints emails (with their links) in its window instead of sending.
 
 ## Running it locally
 

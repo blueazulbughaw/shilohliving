@@ -2,8 +2,6 @@
 // GLOBALS & API
 // ═══════════════════════════════════════════════
 const API = '/api';
-const CLOUDINARY_CLOUD = 'dyyi3mtm0';
-const CLOUDINARY_PRESET = 'UploadPresetShiloh';
 
 let token = localStorage.getItem('shiloh_token');
 let currentUser = null;
@@ -751,6 +749,7 @@ async function resendReceipt(pid) {
   catch (e) { alert(e.message); }
 }
 function openDoc(url) {
+  if (url && url.startsWith('/api/files/')) { openPdf(url); return; }
   if (!url || !/^https:\/\//.test(url)) { alert('No document available'); return; }
   window.open(url, '_blank', 'noopener,noreferrer');
 }
@@ -775,20 +774,47 @@ new MutationObserver(muts => {
 }).observe(document.body, { childList: true, subtree: true });
 
 // ═══════════════════════════════════════════════
-// CLOUDINARY UPLOAD
+// FILE UPLOADS — to our own server (POST /api/files); files stay private to the record's
+// tenant and landlord. kind: payment_proof | contract | repair_proof
 // ═══════════════════════════════════════════════
-function cloudinaryUpload(opts = {}) {
-  return new Promise((resolve, reject) => {
-    if (typeof cloudinary === 'undefined') { reject(new Error('The upload tool could not load. Check your connection.')); return; }
-    const widget = cloudinary.createUploadWidget({
-      cloudName: CLOUDINARY_CLOUD, uploadPreset: CLOUDINARY_PRESET,
-      sources: ['local', 'camera'], multiple: false, maxFileSize: 10000000, resourceType: 'auto', ...opts
-    }, (error, result) => {
-      if (error) { reject(error); return; }
-      if (result && result.event === 'success') resolve({ url: result.info.secure_url, public_id: result.info.public_id });
-    });
-    widget.open();
+const UPLOAD_ACCEPT = 'image/jpeg,image/png,image/webp,image/heic,image/heif,application/pdf';
+// Opens the phone's file / camera picker. Must run straight from a tap.
+function pickFile(accept) {
+  return new Promise(resolve => {
+    const input = document.createElement('input');
+    input.type = 'file'; input.accept = accept; input.style.display = 'none';
+    input.onchange = () => { resolve(input.files[0] || null); input.remove(); };
+    document.body.append(input);
+    input.click();
   });
+}
+// Phone photos are often 4–8 MB; shrink big JPG/PNG/WEBP to at most 2000px before sending.
+async function shrinkImage(file) {
+  if (!/^image\/(jpeg|png|webp)$/.test(file.type) || file.size < 1.5 * 1024 * 1024 || !window.createImageBitmap) return file;
+  try {
+    const img = await createImageBitmap(file);
+    const scale = Math.min(1, 2000 / Math.max(img.width, img.height));
+    const canvas = document.createElement('canvas');
+    canvas.width = Math.round(img.width * scale); canvas.height = Math.round(img.height * scale);
+    canvas.getContext('2d').drawImage(img, 0, 0, canvas.width, canvas.height);
+    const blob = await new Promise(r => canvas.toBlob(r, 'image/jpeg', 0.85));
+    return blob && blob.size < file.size ? new File([blob], file.name.replace(/\.\w+$/, '') + '.jpg', { type: 'image/jpeg' }) : file;
+  } catch (_) { return file; }
+}
+// Returns { url } or null if nothing was chosen. statusEl (optional) shows progress.
+async function uploadFile(kind, accept, statusEl) {
+  const file = await pickFile(accept || UPLOAD_ACCEPT);
+  if (!file) return null;
+  if (statusEl) statusEl.textContent = 'Uploading…';
+  const body = new FormData();
+  body.append('kind', kind);
+  body.append('file', await shrinkImage(file));
+  const res = await fetch(API + '/files', { method: 'POST', headers: { Authorization: `Bearer ${token}` }, body });
+  let json = {};
+  try { json = await res.json(); } catch (_) { }
+  if (statusEl) statusEl.textContent = '';
+  if (!res.ok) throw new Error(json.message || 'Upload failed. Please try again.');
+  return json.data;
 }
 
 // ═══════════════════════════════════════════════
@@ -1390,8 +1416,9 @@ async function submitCreateContract() {
 }
 async function uploadContractDoc(contractId) {
   try {
-    const result = await cloudinaryUpload({ sources: ['local'], resourceType: 'auto', clientAllowedFormats: ['pdf', 'jpg', 'jpeg', 'png'], maxFileSize: 10000000 });
-    await apiFetch('/contracts/' + contractId + '/upload-doc', { method: 'POST', body: JSON.stringify({ contract_doc_url: result.url, public_id: result.public_id }) });
+    const result = await uploadFile('contract', 'application/pdf,image/jpeg,image/png');
+    if (!result) return;
+    await apiFetch('/contracts/' + contractId + '/upload-doc', { method: 'POST', body: JSON.stringify({ contract_doc_url: result.url }) });
     alert('✅ Contract uploaded! Tenant has been notified.');
     loadContracts();
   } catch (e) { if (e && e.message) alert('Upload failed: ' + e.message); }
@@ -1448,7 +1475,8 @@ async function showMoveOutChecklist(contractId) {
 }
 async function uploadMoveOutProof() {
   try {
-    const result = await cloudinaryUpload({ sources: ['local', 'camera'], maxFileSize: 10000000, resourceType: 'auto' });
+    const result = await uploadFile('repair_proof', UPLOAD_ACCEPT, document.getElementById('ch-proof-status'));
+    if (!result) return;
     document.getElementById('ch-proof-url').value = result.url;
     document.getElementById('ch-proof-status').textContent = '✅ Uploaded';
   } catch (e) { if (e && e.message) alert('Upload failed: ' + e.message); }
@@ -2185,7 +2213,7 @@ function showSubmitPayment(billId) {
       <div class="upload-area" id="m-pay-proof-box">
         <div id="m-pay-proof-placeholder">
           <div style="font-size:24px;margin-bottom:8px">📸</div>
-          <div class="muted-text" style="margin-bottom:10px">Upload a screenshot or photo of your payment receipt</div>
+          <div class="muted-text" style="margin-bottom:10px">Upload a screenshot, photo or PDF of your payment receipt</div>
           <button class="btn btn-outline" type="button" onclick="uploadPaymentProof()">Choose File</button>
         </div>
         <div id="m-pay-proof-done" style="display:none">
@@ -2194,7 +2222,7 @@ function showSubmitPayment(billId) {
           <button class="btn btn-sm btn-outline" style="margin-top:8px" type="button" onclick="uploadPaymentProof()">Change</button>
         </div>
       </div>
-      <input type="hidden" id="m-pay-proof-url"/><input type="hidden" id="m-pay-proof-pid"/>
+      <input type="hidden" id="m-pay-proof-url"/>
     </div>
     <p class="err-msg" id="m-pay-err"></p>`,
     `<button class="btn btn-outline" onclick="closeModalDirect()">Cancel</button>
@@ -2202,16 +2230,17 @@ function showSubmitPayment(billId) {
 }
 async function uploadPaymentProof() {
   try {
-    const result = await cloudinaryUpload({ sources: ['local', 'camera'], clientAllowedFormats: ['jpg', 'jpeg', 'png', 'webp', 'heic'], maxFileSize: 8000000, resourceType: 'image' });
+    const box = document.getElementById('m-pay-proof-placeholder').querySelector('.muted-text');
+    const result = await uploadFile('payment_proof', UPLOAD_ACCEPT, box);
+    if (!result) return;
     document.getElementById('m-pay-proof-url').value = result.url;
-    document.getElementById('m-pay-proof-pid').value = result.public_id;
     document.getElementById('m-pay-proof-placeholder').style.display = 'none';
     document.getElementById('m-pay-proof-done').style.display = 'block';
   } catch (e) { if (e && e.message) alert('Upload failed: ' + e.message); }
 }
 async function submitTenantPayment(billId) {
   const proof_url = document.getElementById('m-pay-proof-url').value || '';
-  const body = { bill_id: billId, amount_paid: document.getElementById('m-pay-amt').value, proof_url, proof_public_id: document.getElementById('m-pay-proof-pid').value || '' };
+  const body = { bill_id: billId, amount_paid: document.getElementById('m-pay-amt').value, proof_url };
   const errEl = document.getElementById('m-pay-err'); errEl.textContent = '';
   if (!body.amount_paid) { errEl.textContent = 'Amount required'; return; }
   if (!proof_url) { errEl.textContent = 'Please upload proof of payment'; return; }
@@ -2364,7 +2393,52 @@ function accountCardHtml(roleLabel) {
         <button class="btn btn-outline" onclick="showChangeEmail()">✉️ Change Email Address</button>
         <button class="btn btn-outline" onclick="logout()">Sign Out</button>
       </div>
+    </div>
+    <div class="card">
+      <div class="card-header"><h3>🔒 Password &amp; Security</h3></div>
+      <p class="muted-text">Changing your password signs you out on every other phone or computer.</p>
+      <div class="btn-group" style="margin-top:12px">
+        <button class="btn btn-brand" onclick="showChangePassword()">Change Password</button>
+        <button class="btn btn-outline" onclick="signOutOthers()">Sign Out Other Devices</button>
+      </div>
+      <p class="hint" style="margin-top:10px">Forgot it? Sign out and tap <em>Forgot your password?</em> to get a reset link by email.</p>
     </div>`;
+}
+function showChangePassword() {
+  openModal('Change Password', `
+    <form onsubmit="event.preventDefault();submitChangePassword()">
+      <div class="form-group"><label>Current Password</label><input type="password" id="m-cp-current" autocomplete="current-password"/></div>
+      <div class="form-group"><label>New Password</label><input type="password" id="m-cp-new" autocomplete="new-password"/>
+        <small class="hint">At least 8 characters with uppercase, lowercase, a number and a symbol.</small></div>
+      <div class="form-group"><label>Confirm New Password</label><input type="password" id="m-cp-confirm" autocomplete="new-password"/></div>
+      <button type="submit" hidden></button>
+    </form>
+    <p class="err-msg" id="m-cp-err"></p>`,
+    `<button class="btn btn-outline" onclick="closeModalDirect()">Cancel</button>
+     <button class="btn btn-brand" id="m-cp-btn" onclick="submitChangePassword()">Change Password</button>`);
+}
+async function submitChangePassword() {
+  const v = id => document.getElementById(id).value;
+  const errEl = document.getElementById('m-cp-err'); errEl.textContent = '';
+  const pwErr = validatePasswordStrength(v('m-cp-new'));
+  if (!v('m-cp-current')) { errEl.textContent = 'Enter your current password'; return; }
+  if (pwErr) { errEl.textContent = pwErr; return; }
+  if (v('m-cp-new') !== v('m-cp-confirm')) { errEl.textContent = 'New passwords do not match'; return; }
+  const btn = document.getElementById('m-cp-btn'); btn.disabled = true;
+  try {
+    const d = await apiFetch('/auth/change-password', { method: 'POST', body: JSON.stringify({ current_password: v('m-cp-current'), new_password: v('m-cp-new') }) });
+    saveSession({ token: d.token, user: currentUser });   // this device stays signed in
+    closeModalDirect();
+    alert('✅ Password changed. You were signed out on your other devices.');
+  } catch (e) { errEl.textContent = e.message; btn.disabled = false; }
+}
+async function signOutOthers() {
+  if (!confirm('Sign out on all your other phones and computers? This device stays signed in.')) return;
+  try {
+    const d = await apiFetch('/auth/sign-out-others', { method: 'POST' });
+    saveSession({ token: d.token, user: currentUser });
+    alert('✅ Signed out on your other devices.');
+  } catch (e) { alert(e.message); }
 }
 async function loadTenantSettings() {
   const pg = document.getElementById('page-t-settings'); pg.innerHTML = loadingHtml;

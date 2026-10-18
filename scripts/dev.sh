@@ -6,7 +6,8 @@
 #
 # Uses WAMP's MariaDB as a private server for this project only: data in .localdb/, port 3310,
 # root with no password, nothing installed as a Windows service. Emails are not sent. Sign-in
-# accounts are printed on first run (see scripts/seed_local.py). Ctrl+C stops everything.
+# accounts are printed on first run (see scripts/seed_local.py). Emails (e.g. password reset
+# links) are printed in this window instead. Ctrl+C stops everything.
 set -euo pipefail
 cd "$(dirname "$0")/.."
 
@@ -38,7 +39,7 @@ if [ ! -d .venv ]; then
 fi
 
 export DB_HOST=127.0.0.1 DB_PORT=$PORT DB_USER=root DB_PASSWORD= DB_NAME=shiloh_local
-export SMTP_PASSWORD= APP_URL=http://localhost:5000
+export SMTP_PASSWORD= APP_URL=http://localhost:5000 DEV_SHOW_EMAILS=1
 if ! "${SQL[@]}" -e "SELECT 1 FROM shiloh_local.users LIMIT 0" >/dev/null 2>&1; then
   echo "==> Loading the app's tables and sample data"
   "${SQL[@]}" -e "DROP DATABASE IF EXISTS shiloh_local; CREATE DATABASE shiloh_local CHARACTER SET utf8mb4 COLLATE utf8mb4_unicode_ci"
