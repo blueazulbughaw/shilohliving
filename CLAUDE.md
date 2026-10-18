@@ -71,6 +71,11 @@ Don't edit files directly on the server — the next deploy would overwrite them
   big deletes make you type the name). Accounts and properties are soft-deleted into the admin's
   **Recycle Bin** (`users.deleted_at`, `properties.deleted_at`, restorable); records are never
   erased. Blocked while there are active contracts (`user_delete_info` / `property_delete_info`).
+  The admin can **erase** an account in the Recycle Bin for good (test data, privacy requests):
+  `erase_from_bin` deletes it with its contracts, bills, payments, properties (landlord), messages
+  and its uploaded files, in one transaction; the admin must type the email. Tables without a
+  foreign key to `users` (support_chats, invites, `*_by` columns) are cleared there by hand — add
+  any new such column to it.
 - **Tenant records:** landlords have no Contracts, Payments or Bills pages — contracts (create,
   extend, signed copy), bills (+ Add Bill), payments (approve/reject, receipts) and every file live
   on the tenant's profile; payments waiting for review are on the Dashboard. Old links to those

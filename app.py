@@ -3411,6 +3411,106 @@ def restore_from_bin():
     log_action('RESTORE_' + data['type'].upper(), 'users' if data['type'] == 'user' else 'properties', rid)
     return ok(msg='Restored')
 
+# ── Permanent erase (Recycle Bin only): for test data and privacy requests ──
+def erase_scope(uid):
+    """The account in the Recycle Bin and every record that goes with it (ids), or None."""
+    u = query("SELECT id, full_name, email, role FROM users WHERE id=%s AND deleted_at IS NOT NULL AND role IN ('tenant','landlord')",
+              (uid,), fetchone=True)
+    if not u:
+        return None
+    ids = lambda sql, args: [r['id'] for r in query(sql, args)]
+    if u['role'] == 'tenant':
+        tp = query("SELECT id FROM tenant_profiles WHERE user_id=%s", (uid,), fetchone=True)
+        contracts = ids("SELECT id FROM contracts WHERE tenant_id=%s", (tp['id'] if tp else 0,))
+        props = units = []
+    else:
+        lp = query("SELECT id FROM landlord_profiles WHERE user_id=%s", (uid,), fetchone=True)
+        props = ids("SELECT id FROM properties WHERE landlord_id=%s", (lp['id'] if lp else 0,))
+        units = ids(f"SELECT id FROM units WHERE property_id IN ({','.join(['%s'] * len(props))})", tuple(props)) if props else []
+        contracts = ids(f"SELECT id FROM contracts WHERE unit_id IN ({','.join(['%s'] * len(units))})", tuple(units)) if units else []
+    bills = ids(f"SELECT id FROM bills WHERE contract_id IN ({','.join(['%s'] * len(contracts))})", tuple(contracts)) if contracts else []
+    payments = ids(f"SELECT id FROM payments WHERE bill_id IN ({','.join(['%s'] * len(bills))})", tuple(bills)) if bills else []
+    files = query("SELECT token, mime FROM files WHERE owner_user_id=%s", (uid,))
+    threads = query("SELECT COUNT(*) AS n FROM message_threads WHERE landlord_id=%s OR tenant_id=%s OR started_by=%s",
+                    (uid, uid, uid), fetchone=True)['n']
+    return {'user': u, 'properties': props, 'units': units, 'contracts': contracts, 'bills': bills,
+            'payments': payments, 'files': files, 'threads': threads}
+
+def erase_info(sc):
+    u = sc['user']
+    effects = []
+    if u['role'] == 'landlord':
+        effects.append(f"{len(sc['properties'])} property(ies) and {len(sc['units'])} unit(s), with their water sessions")
+        effects.append(f"{len(sc['contracts'])} contract(s) with tenants, {len(sc['bills'])} bill(s), {len(sc['payments'])} payment(s) — "
+                       "gone from those tenants' records too")
+        effects.append('Their announcements, reminders and checklists')
+    else:
+        effects.append(f"{len(sc['contracts'])} contract(s), {len(sc['bills'])} bill(s), {len(sc['payments'])} payment(s) — "
+                       "gone from their landlords' records too")
+        effects.append('Their move-in checklist and move-out records')
+    effects += [f"{sc['threads']} message conversation(s), their notifications and support chats",
+                f"{len(sc['files'])} uploaded file(s) they own, deleted from the server",
+                "This can't be undone"]
+    return {'type': 'user', 'id': u['id'], 'role': u['role'], 'name': u['full_name'], 'email': u['email'], 'effects': effects}
+
+@app.route('/api/admin/recycle-bin/erase-preview/<int:uid>', methods=['GET'])
+@require_auth('admin')
+def erase_preview(uid):
+    sc = erase_scope(uid)
+    return ok(erase_info(sc)) if sc else err('Not in the Recycle Bin', 404)
+
+@app.route('/api/admin/recycle-bin/erase', methods=['POST'])
+@require_auth('admin')
+def erase_from_bin():
+    """Deletes an account from the Recycle Bin for good, with everything listed by erase_info,
+    in one transaction. Typing the email is required (the UI asks for it too)."""
+    data = request.get_json() or {}
+    sc = erase_scope(int(data.get('id') or 0))
+    if not sc: return err('Not in the Recycle Bin', 404)
+    u = sc['user']
+    if (data.get('confirm') or '').strip().lower() != (u['email'] or '').lower():
+        return err('Type the email address to confirm', 400)
+    uid = u['id']
+    def inl(xs): return ','.join(['%s'] * len(xs))
+    conn = get_conn()
+    try:
+        cur = conn.cursor()
+        run = lambda sql, args=(): cur.execute(sql, args)
+        if sc['payments']: run(f"DELETE FROM payments WHERE id IN ({inl(sc['payments'])})", tuple(sc['payments']))
+        if sc['bills']: run(f"DELETE FROM bills WHERE id IN ({inl(sc['bills'])})", tuple(sc['bills']))
+        if sc['contracts']:
+            c = tuple(sc['contracts'])
+            run(f"DELETE FROM move_out_checklists WHERE contract_id IN ({inl(c)})", c)
+            run(f"DELETE FROM contracts WHERE id IN ({inl(c)})", c)
+        if sc['properties']:
+            run(f"DELETE FROM properties WHERE id IN ({inl(sc['properties'])})", tuple(sc['properties']))   # units, water, rules cascade
+        # References without a foreign key
+        run("DELETE FROM support_chats WHERE user_id=%s", (uid,))
+        run("DELETE FROM email_verifications WHERE user_id=%s", (uid,))
+        run("UPDATE invites SET used_by=NULL WHERE used_by=%s", (uid,))
+        run("UPDATE contract_offboarding SET done_by=NULL WHERE done_by=%s", (uid,))
+        run("UPDATE tenant_requirements SET reviewed_by=NULL WHERE reviewed_by=%s", (uid,))
+        run("UPDATE users SET deleted_by=NULL WHERE deleted_by=%s", (uid,))
+        run("UPDATE properties SET deleted_by=NULL WHERE deleted_by=%s", (uid,))
+        run("DELETE FROM files WHERE owner_user_id=%s", (uid,))
+        run("DELETE FROM users WHERE id=%s", (uid,))   # profiles, threads, notifications... cascade
+        conn.commit()
+    except Exception as e:
+        conn.rollback()
+        log.error("Erase of user %s failed: %s", uid, e)
+        return err('Could not erase this account. Nothing was changed.', 500)
+    finally:
+        conn.close()
+    for f in sc['files']:
+        try:
+            os.remove(os.path.join(UPLOAD_DIR, f['token'] + FILE_EXT.get(f['mime'], '')))
+        except OSError:
+            pass
+    # No name or email in the log: the point of erasing is that they're gone
+    log_action('ERASE_USER', 'users', uid, f"{u['role']} erased: {len(sc['contracts'])} contracts, {len(sc['bills'])} bills, "
+                                          f"{len(sc['payments'])} payments, {len(sc['files'])} files")
+    return ok(msg=f"{u['full_name']} was erased")
+
 @app.route('/api/admin/audit-logs', methods=['GET'])
 @require_auth('admin')
 def audit_logs():

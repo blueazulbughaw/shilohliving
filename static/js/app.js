@@ -977,12 +977,15 @@ async function loadAdminBin() {
     const by = r => r.deleted_by_name ? ` by ${esc(r.deleted_by_name)}` : '';
     pg.innerHTML = `<div class="card"><div class="card-header"><h3>🗑️ Recycle Bin</h3></div>
         <p class="muted-text">Deleted accounts and properties. Their records were kept; restore brings them back.
-          Restored tenants rejoin their landlord with the landlord's code.</p></div>
+          Restored tenants rejoin their landlord with the landlord's code. <strong>Erase</strong> removes an account and all its
+          records for good — for test accounts and privacy requests.</p></div>
       <div class="card"><div class="card-header"><h3>Accounts (${d.users.length})</h3></div>
         ${!d.users.length ? '<p class="muted-text">Nothing here.</p>' : d.users.map(u => `<div class="record">
           <div class="record-top"><strong>${esc(u.name)}</strong>${badge(u.role)}</div>
           <div class="record-meta">${esc(u.email)} · deleted ${fmtDateTime(u.deleted_at)}${by(u)}</div>
-          <button class="btn btn-sm btn-brand" style="margin-top:6px" onclick="restoreItem('user', ${parseInt(u.id)}, ${jsArg(u.name)})">↩ Restore</button></div>`).join('')}
+          <div class="btn-group" style="margin-top:6px">
+            <button class="btn btn-sm btn-brand" onclick="restoreItem('user', ${parseInt(u.id)}, ${jsArg(u.name)})">↩ Restore</button>
+            <button class="btn btn-sm btn-red" onclick="eraseUser(${parseInt(u.id)})">Erase permanently</button></div></div>`).join('')}
       </div>
       <div class="card"><div class="card-header"><h3>Properties (${d.properties.length})</h3></div>
         ${!d.properties.length ? '<p class="muted-text">Nothing here.</p>' : d.properties.map(p => `<div class="record">
@@ -991,6 +994,16 @@ async function loadAdminBin() {
           <button class="btn btn-sm btn-brand" style="margin-top:6px" onclick="restoreItem('property', ${parseInt(p.id)}, ${jsArg(p.name)})">↩ Restore</button></div>`).join('')}
       </div>`;
   } catch (e) { pg.innerHTML = errHtml(e); }
+}
+async function eraseUser(id) {
+  try {
+    const info = await apiFetch('/admin/recycle-bin/erase-preview/' + id);
+    if (!await confirmAction({ title: `Erase ${info.name} permanently?`, okText: 'Erase forever',
+        message: `This ${info.role} account (${info.email}) and everything below are deleted for good:`,
+        effects: info.effects, typeToConfirm: info.email })) return;
+    await apiFetch('/admin/recycle-bin/erase', { method: 'POST', body: JSON.stringify({ id, confirm: info.email }) });
+    refreshView();
+  } catch (e) { alert(e.message); }
 }
 async function restoreItem(type, id, name) {
   if (!await confirmAction({ title: `Restore ${name}?`, message: type === 'user' ? 'They can sign in again.' : 'It shows up again for its landlord.', okText: 'Restore', danger: false })) return;
