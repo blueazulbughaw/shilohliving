@@ -115,6 +115,9 @@ code{background:var(--bg);padding:2px 6px;border-radius:4px;font-size:12px}
   min-height:56px;display:flex;align-items:center;justify-content:space-between;position:sticky;top:0;z-index:100}
 .topbar-left{display:flex;align-items:center;gap:12px;min-width:0}
 .menu-btn{display:none;background:none;border:none;font-size:22px;color:var(--text);padding:6px 8px;margin-left:-8px}
+.back-btn{background:var(--surface);border:1px solid var(--border);border-radius:var(--radius);color:var(--text);
+  font-weight:700;font-size:13px;padding:6px 10px 6px 8px;flex-shrink:0}
+.back-btn:hover{border-color:var(--brand)}
 .topbar h2{font-size:18px;font-weight:700;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
 .topbar-right{display:flex;align-items:center;gap:10px}
 @media(max-width:768px){
@@ -172,6 +175,9 @@ code{background:var(--bg);padding:2px 6px;border-radius:4px;font-size:12px}
 .doc-row{margin-top:12px;padding:10px;background:var(--bg);border-radius:8px;display:flex;align-items:center;justify-content:space-between;flex-wrap:wrap;gap:8px;font-size:13px}
 .quick-actions{display:flex;flex-direction:column;gap:10px}
 .section-title{font-size:14px;font-weight:600;margin:16px 0 10px}
+.feature-tags{display:flex;flex-wrap:wrap;gap:4px;margin-top:4px}
+.feature-tags span{font-size:10.5px;padding:2px 6px;border-radius:3px;background:var(--light);color:#4c6650;font-weight:600}
+.pref-label .hint{font-weight:400}
 
 /* ── TABLES ── */
 .table-wrap{overflow-x:auto;-webkit-overflow-scrolling:touch;max-width:100%}

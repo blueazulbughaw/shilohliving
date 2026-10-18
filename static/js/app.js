@@ -535,7 +535,9 @@ function launchApp() {
   document.getElementById('sidebar-name').textContent = currentUser.full_name;
   document.getElementById('sidebar-role').textContent = currentUser.role;
   document.getElementById('sidebar-avatar').textContent = (currentUser.full_name || 'U')[0].toUpperCase();
+  _navEntries = []; _navIdx = -1;
   buildNav();
+  if (currentUser.role === 'landlord') refreshPropertyFeatureNav();
   loadNotifications();
   clearInterval(window._notifTimer);
   window._notifTimer = setInterval(loadNotifications, 60000);
@@ -594,11 +596,43 @@ function buildNav() {
 // Opens a page by id (sidebar, notifications, quick actions)
 function goPage(id) {
   const item = NAV[id];
-  if (!item) return;
-  setPage(id);
-  item.fn();
+  if (item) showView(id, item.fn);
+}
+
+// ── BACK BUTTON ──
+// Every screen the person moves to (a page, or a view inside one like a property's units) is a
+// browser history entry, so the topbar ← and the phone's own back button/gesture both step back.
+// An open pop-up is an entry too: back closes it first.
+let _navEntries = [];   // index -> { page, render }
+let _navIdx = -1;
+let _modalEntry = false;
+function showView(page, render) {
+  _navEntries = _navEntries.slice(0, _navIdx + 1);
+  _navEntries.push({ page, render });
+  _navIdx = _navEntries.length - 1;
+  if (_navIdx === 0) history.replaceState({ nav: 0 }, '');
+  else history.pushState({ nav: _navIdx }, '');
+  renderView();
+}
+function renderView() {
+  const en = _navEntries[_navIdx];
+  setPage(en.page);
+  en.render();
+  document.getElementById('back-btn').hidden = _navIdx <= 0;
   window.scrollTo(0, 0);
 }
+function goBack() {
+  if (_navIdx > 0) history.back();
+}
+window.addEventListener('popstate', e => {
+  if (document.getElementById('modal-overlay').classList.contains('open')) { closeModalDirect(true); return; }
+  const idx = e.state && typeof e.state.nav === 'number' ? e.state.nav : null;
+  if (!currentUser || idx === null || !_navEntries[idx]) return;
+  // Landing on the screen already shown (the leftover entry of a closed pop-up): keep going
+  if (idx === _navIdx) { if (idx > 0) history.back(); return; }
+  _navIdx = idx;
+  renderView();
+});
 function setPage(id) {
   document.querySelectorAll('.page').forEach(p => p.classList.remove('active'));
   const pg = document.getElementById('page-' + id); if (pg) pg.classList.add('active');
@@ -634,13 +668,18 @@ function openModal(title, body, footer = '') {
   document.getElementById('modal-title').textContent = title;
   document.getElementById('modal-body').innerHTML = body;
   document.getElementById('modal-footer').innerHTML = footer;
+  if (!_modalEntry && currentUser) { history.pushState({ nav: _navIdx, modal: true }, ''); _modalEntry = true; }
   document.getElementById('modal-overlay').classList.add('open');
   document.body.classList.add('modal-open');
 }
 function closeModal(e) { if (!e || e.target === document.getElementById('modal-overlay')) closeModalDirect(); }
-function closeModalDirect() {
+// fromBack: closed by the back button/gesture. Otherwise the pop-up's history entry is left as
+// a copy of the current screen, which the back handler skips over.
+function closeModalDirect(fromBack) {
   document.getElementById('modal-overlay').classList.remove('open');
   document.body.classList.remove('modal-open');
+  if (_modalEntry && fromBack !== true) history.replaceState({ nav: _navIdx }, '');
+  _modalEntry = false;
 }
 document.addEventListener('keydown', e => { if (e.key === 'Escape') closeModalDirect(); });
 
@@ -861,40 +900,68 @@ async function loadLandlordDashboard() {
 // PROPERTIES
 // ═══════════════════════════════════════════════
 let _props = [];
+let _featureDefs = null;   // [{key, label, help, default}] from /property-features
+async function featureDefs() {
+  if (!_featureDefs) _featureDefs = await apiFetch('/property-features');
+  return _featureDefs;
+}
+const hasFeature = (prop, key) => !!(prop && prop.features && prop.features[key]);
+// Water Billing only shows in the menu when at least one property uses it
+async function refreshPropertyFeatureNav(props) {
+  try {
+    if (!props) props = await apiFetch('/properties');
+    _props = props;
+    const water = document.getElementById('nav-water');
+    if (water) water.hidden = props.length > 0 && !props.some(p => hasFeature(p, 'water_billing'));
+  } catch (_) { }
+}
 async function loadProperties() {
   const pg = document.getElementById('page-properties'); pg.innerHTML = loadingHtml;
   try {
-    _props = await apiFetch('/properties');
+    const [props, defs] = await Promise.all([apiFetch('/properties'), featureDefs()]);
+    refreshPropertyFeatureNav(props);
     pg.innerHTML = `<div class="card"><div class="card-header"><h3>Properties (${_props.length})</h3>
-      <button class="btn btn-brand" onclick="showAddProperty()">+ Add Property</button></div>
+      <button class="btn btn-brand" onclick="showPropertySetup()">+ Add Property</button></div>
       ${!_props.length ? '<div class="empty-state"><div class="icon">🏢</div><p>No properties yet</p></div>' :
         `<div class="table-wrap"><table><thead><tr><th>Name</th><th>Address</th><th>Units</th><th>Occupied</th><th>Actions</th></tr></thead><tbody>
-        ${_props.map(p => `<tr><td><strong>${esc(p.name)}</strong></td><td>${esc(p.address)}${p.city ? ', ' + esc(p.city) : ''}</td><td>${esc(p.unit_count || 0)}</td><td>${esc(p.occupied || 0)}/${esc(p.unit_count || 0)}</td>
-          <td><div class="btn-group"><button class="btn btn-sm btn-outline" onclick="loadUnitsForProperty(${parseInt(p.id)})">Units</button>
+        ${_props.map(p => `<tr><td><strong>${esc(p.name)}</strong>
+            <div class="feature-tags">${defs.filter(f => hasFeature(p, f.key)).map(f => `<span>${esc(f.label)}</span>`).join('')}</div></td>
+          <td>${esc(p.address)}${p.city ? ', ' + esc(p.city) : ''}</td><td>${esc(p.unit_count || 0)}</td><td>${esc(p.occupied || 0)}/${esc(p.unit_count || 0)}</td>
+          <td><div class="btn-group"><button class="btn btn-sm btn-brand" onclick="showPropertySetup(${parseInt(p.id)})">⚙️ Setup</button>
+          <button class="btn btn-sm btn-outline" onclick="openPropertyUnits(${parseInt(p.id)})">Units</button>
           <button class="btn btn-sm btn-red" onclick="deleteProperty(${parseInt(p.id)})">Delete</button></div></td></tr>`).join('')}
         </tbody></table></div>`}
     </div>`;
   } catch (e) { pg.innerHTML = errHtml(e); }
 }
-function showAddProperty() {
-  openModal('Add Property', `
-    <div class="form-group"><label>Name</label><input type="text" id="m-prop-name"/></div>
-    <div class="form-group"><label>Address</label><input type="text" id="m-prop-addr"/></div>
-    <div class="grid-2"><div class="form-group"><label>City</label><input type="text" id="m-prop-city"/></div>
-    <div class="form-group"><label>Country</label><input type="text" id="m-prop-country" value="Philippines"/></div></div>
+// Add a property, or change one's details and which features it uses
+async function showPropertySetup(propId) {
+  let defs;
+  try { defs = await featureDefs(); } catch (e) { alert(e.message); return; }
+  const p = _props.find(x => x.id === propId) || { features: Object.fromEntries(defs.map(f => [f.key, f.default])), country: 'Philippines' };
+  openModal(propId ? `Setup — ${p.name}` : 'Add Property', `
+    <div class="form-group"><label>Name</label><input type="text" id="m-prop-name" maxlength="255" value="${esc(p.name || '')}"/></div>
+    <div class="form-group"><label>Address</label><input type="text" id="m-prop-addr" value="${esc(p.address || '')}"/></div>
+    <div class="grid-2"><div class="form-group"><label>City</label><input type="text" id="m-prop-city" value="${esc(p.city || '')}"/></div>
+    <div class="form-group"><label>Country</label><input type="text" id="m-prop-country" value="${esc(p.country || '')}"/></div></div>
+    <h4 class="section-title">What this property uses</h4>
+    <p class="hint" style="margin:-4px 0 6px">Turn off what you don't need here — it's hidden for this property and its tenants' bills.</p>
+    ${defs.map(f => `<div class="pref-row"><span class="pref-label"><strong>${esc(f.label)}</strong><small class="hint">${esc(f.help)}</small></span>
+      <label class="toggle"><input type="checkbox" class="m-prop-feature" data-key="${esc(f.key)}" ${hasFeature(p, f.key) ? 'checked' : ''}/><span class="toggle-slider"></span></label></div>`).join('')}
     <p class="err-msg" id="m-prop-err"></p>`,
     `<button class="btn btn-outline" onclick="closeModalDirect()">Cancel</button>
-     <button class="btn btn-brand" onclick="submitAddProperty()">Add</button>`);
+     <button class="btn btn-brand" onclick="savePropertySetup(${propId ? parseInt(propId) : 'null'})">${propId ? 'Save' : 'Add Property'}</button>`);
 }
-async function submitAddProperty() {
-  const name = document.getElementById('m-prop-name').value.trim();
-  const address = document.getElementById('m-prop-addr').value.trim();
-  document.getElementById('m-prop-err').textContent = '';
-  if (!name || !address) { document.getElementById('m-prop-err').textContent = 'Name and address are required'; return; }
+async function savePropertySetup(propId) {
+  const v = id => document.getElementById(id).value.trim();
+  const body = { name: v('m-prop-name'), address: v('m-prop-addr'), city: v('m-prop-city'), country: v('m-prop-country'), features: {} };
+  document.querySelectorAll('.m-prop-feature').forEach(cb => { body.features[cb.dataset.key] = cb.checked; });
+  const errEl = document.getElementById('m-prop-err'); errEl.textContent = '';
+  if (!body.name || !body.address) { errEl.textContent = 'Name and address are required'; return; }
   try {
-    await apiFetch('/properties', { method: 'POST', body: JSON.stringify({ name, address, city: document.getElementById('m-prop-city').value, country: document.getElementById('m-prop-country').value }) });
+    await apiFetch(propId ? '/properties/' + propId : '/properties', { method: propId ? 'PATCH' : 'POST', body: JSON.stringify(body) });
     closeModalDirect(); loadProperties();
-  } catch (e) { document.getElementById('m-prop-err').textContent = e.message; }
+  } catch (e) { errEl.textContent = e.message; }
 }
 async function deleteProperty(id) {
   if (!confirm('Delete this property? Its units will be hidden and its invite code will stop working.')) return;
@@ -919,14 +986,15 @@ async function loadUnits() {
     </div>`;
   } catch (e) { pg.innerHTML = errHtml(e); }
 }
+function openPropertyUnits(propId) { showView('units', () => loadUnitsForProperty(propId)); }
 async function loadUnitsForProperty(propId) {
-  setPage('units'); const pg = document.getElementById('page-units'); pg.innerHTML = loadingHtml;
+  const pg = document.getElementById('page-units'); pg.innerHTML = loadingHtml;
   try {
     const [units, props] = await Promise.all([apiFetch('/units?property_id=' + propId), apiFetch('/properties')]);
     _props = props;
     const prop = props.find(p => p.id === propId) || {};
     pg.innerHTML = `<div class="card"><div class="card-header"><h3>Units — ${esc(prop.name)}</h3>
-      <div class="btn-group"><button class="btn btn-outline" onclick="loadUnits()">← All</button>
+      <div class="btn-group"><button class="btn btn-outline" onclick="goPage('units')">All Units</button>
       <button class="btn btn-brand" onclick="showAddUnit(${parseInt(propId)})">+ Add Unit</button></div></div>
       ${!units.length ? '<div class="empty-state"><p>No units</p></div>' :
         `<div class="table-wrap"><table><thead><tr><th>Unit</th><th>Floor</th><th>Beds</th><th>Rent</th><th>Status</th></tr></thead><tbody>
@@ -1196,13 +1264,13 @@ async function generateMonthly() {
 }
 async function showCreateBill() {
   let contracts;
-  try { contracts = await apiFetch('/contracts'); } catch (e) { alert(e.message); return; }
+  try { [contracts, _props] = await Promise.all([apiFetch('/contracts'), apiFetch('/properties')]); } catch (e) { alert(e.message); return; }
   const active = contracts.filter(c => c.status === 'active' || c.status === 'move_out_pending');
   if (!active.length) { alert('Create a contract first.'); return; }
   const now = new Date();
   openModal('Create Bill', `
-    <div class="form-group"><label>Contract</label><select id="m-b-contract"><option value="">— Select —</option>
-      ${active.map(c => `<option value="${parseInt(c.id)}">${esc(c.tenant_name)} — ${esc(c.property_name)} Unit ${esc(c.unit_number)}</option>`).join('')}</select></div>
+    <div class="form-group"><label>Contract</label><select id="m-b-contract" onchange="billTypesForContract()"><option value="">— Select —</option>
+      ${active.map(c => `<option value="${parseInt(c.id)}" data-prop="${parseInt(c.property_id)}">${esc(c.tenant_name)} — ${esc(c.property_name)} Unit ${esc(c.unit_number)}</option>`).join('')}</select></div>
     <div class="form-group"><label>Bill Type</label><select id="m-b-type">
       <option value="rent">Rent</option><option value="electricity">Electricity</option><option value="water">Water</option><option value="other">Other</option></select></div>
     <div class="grid-2"><div class="form-group"><label>Month</label><select id="m-b-month">
@@ -1214,6 +1282,14 @@ async function showCreateBill() {
     <p class="err-msg" id="m-b-err"></p>`,
     `<button class="btn btn-outline" onclick="closeModalDirect()">Cancel</button>
      <button class="btn btn-brand" onclick="submitCreateBill()">Create</button>`);
+}
+const BILL_TYPES = [['rent', 'Rent', null], ['electricity', 'Electricity', 'electricity_billing'], ['water', 'Water', 'water_billing'], ['other', 'Other', 'other_charges']];
+function billTypesForContract() {
+  const opt = document.getElementById('m-b-contract').selectedOptions[0];
+  const prop = _props.find(p => p.id === parseInt(opt && opt.dataset.prop));
+  const sel = document.getElementById('m-b-type'); const cur = sel.value;
+  sel.innerHTML = BILL_TYPES.filter(([, , need]) => !need || !prop || hasFeature(prop, need))
+    .map(([v, l]) => `<option value="${v}" ${v === cur ? 'selected' : ''}>${l}</option>`).join('');
 }
 async function submitCreateBill() {
   const v = id => document.getElementById(id).value;
@@ -1415,22 +1491,23 @@ async function loadWaterBilling() {
     _props = props;
     pg.innerHTML = `<div class="card"><div class="card-header"><h3>Water Billing Sessions</h3>
       <button class="btn btn-brand" onclick="showNewWaterSession()">+ New Session</button></div>
-      <div class="info-box">Enter monthly water meter readings per property. The app calculates each unit's bill.</div>
+      <div class="info-box">Enter monthly water meter readings per property. The app calculates each unit's bill. Only properties with Water billing turned on in their Setup are listed.</div>
       ${!sessions.length ? '<div class="empty-state"><div class="icon">💧</div><p>No sessions yet</p></div>' :
         `<div class="table-wrap"><table><thead><tr><th>Property</th><th>Month</th><th>Main Bill</th><th>Rate/Cubic</th><th>Status</th><th>Actions</th></tr></thead><tbody>
         ${sessions.map(s => `<tr><td><strong>${esc(s.property_name)}</strong></td>
           <td>${MONTHS[s.session_month - 1]} ${esc(s.session_year)}</td>
           <td>₱${fmt(s.total_bill)}</td><td>₱${fmt(s.price_per_cubic)}</td><td>${badge(s.status)}</td>
-          <td><button class="btn btn-sm btn-brand" onclick="openWaterSession(${parseInt(s.id)})">${s.status === 'draft' ? 'Enter Readings' : 'View'}</button></td></tr>`).join('')}
+          <td><button class="btn btn-sm btn-brand" onclick="viewWaterSession(${parseInt(s.id)})">${s.status === 'draft' ? 'Enter Readings' : 'View'}</button></td></tr>`).join('')}
         </tbody></table></div>`}
     </div>`;
   } catch (e) { pg.innerHTML = errHtml(e); }
 }
 function showNewWaterSession() {
   if (!_props.length) { alert('Add a property first.'); return; }
+  if (!_props.some(p => hasFeature(p, 'water_billing'))) { alert("No property has Water billing turned on. Turn it on in a property's Setup."); return; }
   const now = new Date();
   openModal('New Water Billing Session', `
-    <div class="form-group"><label>Property</label><select id="m-w-prop">${_props.map(p => `<option value="${parseInt(p.id)}">${esc(p.name)}</option>`).join('')}</select></div>
+    <div class="form-group"><label>Property</label><select id="m-w-prop">${_props.filter(p => hasFeature(p, 'water_billing')).map(p => `<option value="${parseInt(p.id)}">${esc(p.name)}</option>`).join('')}</select></div>
     <div class="grid-2"><div class="form-group"><label>Month</label><select id="m-w-month">
       ${MONTHS.map((m, i) => `<option value="${i + 1}" ${i === now.getMonth() ? 'selected' : ''}>${m}</option>`).join('')}</select></div>
     <div class="form-group"><label>Year</label><input type="number" id="m-w-year" value="${now.getFullYear()}"/></div></div>
@@ -1465,12 +1542,13 @@ async function submitNewWaterSession() {
   };
   const errEl = document.getElementById('m-w-err'); errEl.textContent = '';
   if (!body.prev_reading_date || !body.curr_reading_date || !body.total_bill || !body.overall_consumption) { errEl.textContent = 'All fields required'; return; }
-  try { const d = await apiFetch('/water/sessions', { method: 'POST', body: JSON.stringify(body) }); closeModalDirect(); openWaterSession(d.session_id); }
+  try { const d = await apiFetch('/water/sessions', { method: 'POST', body: JSON.stringify(body) }); closeModalDirect(); viewWaterSession(d.session_id); }
   catch (e) { errEl.textContent = e.message; }
 }
 let _water = null;   // { session, units }
+function viewWaterSession(sid) { showView('water', () => openWaterSession(sid)); }
 async function openWaterSession(sid) {
-  setPage('water'); const pg = document.getElementById('page-water'); pg.innerHTML = loadingHtml;
+  const pg = document.getElementById('page-water'); pg.innerHTML = loadingHtml;
   try {
     const d = await apiFetch('/water/sessions/' + sid); const s = d.session; const readings = d.readings || [];
     const units = await apiFetch('/units?property_id=' + s.property_id);
@@ -1481,7 +1559,7 @@ async function openWaterSession(sid) {
     pg.innerHTML = `<div class="card">
       <div class="card-header"><div><h3>💧 ${esc(s.property_name)} — ${MONTHS[s.session_month - 1]} ${esc(s.session_year)}</h3>
         <div class="muted-text" style="margin-top:4px">${fmtDate(s.prev_reading_date)} → ${fmtDate(s.curr_reading_date)}</div></div>
-        <button class="btn btn-outline" onclick="loadWaterBilling()">← Back</button></div>
+</div>
       <div class="water-calc">
         <div class="row"><span>Total Main Bill</span><span>₱${fmt(s.total_bill)}</span></div>
         <div class="row"><span>Overall Consumption</span><span>${esc(s.overall_consumption)} cu</span></div>
@@ -2166,7 +2244,7 @@ async function loadAdminChat() {
     const chats = await apiFetch('/support-chat');
     const open = chats.filter(c => c.status === 'open');
     const other = chats.filter(c => c.status !== 'open');
-    const item = c => `<div class="thread-list-item ${c.unread_count > 0 ? 'unread' : ''}" onclick="adminOpenChat(${parseInt(c.id)})">
+    const item = c => `<div class="thread-list-item ${c.unread_count > 0 ? 'unread' : ''}" onclick="showView('admin-chat', () => adminOpenChat(${parseInt(c.id)}))">
         <div class="thread-avatar">${esc((c.user_name || '?')[0].toUpperCase())}</div>
         <div class="thread-info">
           <div class="tname">${esc(c.user_name)} <span class="badge badge-gray">${esc(c.user_role)}</span> ${c.status !== 'open' ? badge(c.status) : ''} ${c.unread_count > 0 ? `<span class="badge badge-red">${parseInt(c.unread_count)}</span>` : ''}</div>
@@ -2194,7 +2272,6 @@ async function adminOpenChat(chatId) {
         <div class="card-header">
           <div><h3>💬 ${esc(chat.subject)}</h3><div class="muted-text" style="margin-top:2px">From: <strong>${esc(chat.user_name)}</strong> (${esc(chat.user_email)}) ${badge(chat.status)}</div></div>
           <div class="btn-group">
-            <button class="btn btn-outline btn-sm" onclick="loadAdminChat()">← Back</button>
             ${!closed ? `<button class="btn btn-sm btn-warn" onclick="showConvertToTicket(${parseInt(chatId)})">→ Make Ticket</button>
             <button class="btn btn-sm btn-red" onclick="adminCloseChat(${parseInt(chatId)})">Close Chat</button>` : ''}
           </div>

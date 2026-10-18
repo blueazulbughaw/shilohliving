@@ -42,6 +42,13 @@ Don't edit files directly on the server — the next deploy would overwrite them
   or scanning its QR (`/api/join/CODE/qr.png`). There are no per-property codes: the
   landlord assigns the unit with a contract. A tenant can join several landlords and rent
   several units (`tenant_landlords`, one row per landlord).
+- **Property Setup (modules):** each property switches features on/off (`PROPERTY_FEATURES` in
+  `app.py`, saved as JSON in `properties.features`; missing keys use the default). To add a
+  module, add it there, then check it where it matters (`property_features(...)[key]` on the
+  server, `hasFeature(prop, key)` in the UI). The app is meant to grow into a CRM this way.
+- **Back button:** screens are opened with `goPage(id)` or `showView(page, render)` (for views
+  inside a page), which add a browser history entry — so the topbar ‹ Back and the phone's back
+  gesture work. Pop-ups are history entries too (back closes them).
 - **Notifications:** always go through `push_notification()` in `app.py` — it saves the bell
   notification *and* sends a phone push (Web Push, VAPID keys in `.env`). Don't insert into
   `notifications` directly or from DB triggers (the old bill/payment triggers were dropped

@@ -1113,6 +1113,47 @@ def resolve_ticket(tid):
 # PROPERTIES
 # ════════════════════════════════════════════════════════════
 
+# What a property uses, chosen in its Setup. Add new modules here (key, label, help, default);
+# properties saved before a module existed get its default. Stored as JSON in properties.features.
+PROPERTY_FEATURES = [
+    ('rent_billing', 'Monthly rent bills',
+     'Included when you tap "Generate Monthly Rent".', True),
+    ('water_billing', 'Water billing (sub-meters)',
+     'Read each unit\'s water meter every month and split the main water bill (with pump fee).', True),
+    ('electricity_billing', 'Electricity bills',
+     'Bill tenants for electricity.', True),
+    ('other_charges', 'Other charges',
+     'Parking, internet, association dues and other one-off bills.', True),
+]
+FEATURE_KEYS = {k for k, _, _, _ in PROPERTY_FEATURES}
+# Which feature a bill type needs (rent is always allowed for manual bills)
+BILL_TYPE_FEATURE = {'water': 'water_billing', 'electricity': 'electricity_billing', 'other': 'other_charges'}
+
+def property_features(raw):
+    """Saved JSON (or NULL) -> {feature_key: bool} with defaults filled in."""
+    try:
+        saved = json.loads(raw) if raw else {}
+    except (TypeError, ValueError):
+        saved = {}
+    return {k: bool(saved.get(k, default)) for k, _, _, default in PROPERTY_FEATURES}
+
+def property_has(property_id, feature):
+    p = query("SELECT features FROM properties WHERE id=%s", (property_id,), fetchone=True)
+    return bool(p) and property_features(p['features'])[feature]
+
+def clean_features(data, current=None):
+    """Merges {feature_key: bool} from a request into the current settings, ignoring unknown keys."""
+    merged = dict(current or property_features(None))
+    for k, v in (data or {}).items():
+        if k in FEATURE_KEYS:
+            merged[k] = bool(v)
+    return json.dumps(merged)
+
+@app.route('/api/property-features', methods=['GET'])
+@require_auth('landlord')
+def list_property_features():
+    return ok([{'key': k, 'label': label, 'help': help_, 'default': d} for k, label, help_, d in PROPERTY_FEATURES])
+
 @app.route('/api/properties', methods=['GET'])
 @require_auth('landlord')
 def list_properties():
@@ -1120,6 +1161,8 @@ def list_properties():
     props = query("""SELECT p.*,COUNT(u.id) AS unit_count,SUM(u.status='occupied') AS occupied,SUM(u.status='vacant') AS vacant
         FROM properties p LEFT JOIN units u ON u.property_id=p.id
         WHERE p.landlord_id=%s AND p.is_active=1 GROUP BY p.id ORDER BY p.created_at DESC""", (lp['id'],))
+    for p in props:
+        p['features'] = property_features(p['features'])
     return ok(props)
 
 @app.route('/api/properties', methods=['POST'])
@@ -1128,21 +1171,27 @@ def create_property():
     lp=get_landlord_profile(g.current_user['id']); data=request.get_json() or {}
     name=(data.get('name') or '').strip(); address=(data.get('address') or '').strip()
     if not name or not address: return err('Name and address required')
-    pid,_=execute("INSERT INTO properties (landlord_id,name,address,city,country) VALUES (%s,%s,%s,%s,%s)",
-                  (lp['id'],name,address,data.get('city',''),data.get('country','')))
+    pid,_=execute("INSERT INTO properties (landlord_id,name,address,city,country,features) VALUES (%s,%s,%s,%s,%s,%s)",
+                  (lp['id'],name[:255],address,data.get('city',''),data.get('country',''),clean_features(data.get('features'))))
     return ok({'id':pid,'name':name},status=201)
 
 @app.route('/api/properties/<int:pid>', methods=['PATCH'])
 @require_auth('landlord')
 def update_property(pid):
+    """Property Setup: details and which features it uses."""
     lp=get_landlord_profile(g.current_user['id']); data=request.get_json() or {}
-    p=query("SELECT id FROM properties WHERE id=%s AND landlord_id=%s",(pid,lp['id']),fetchone=True)
+    p=query("SELECT id, features FROM properties WHERE id=%s AND landlord_id=%s AND is_active=1",(pid,lp['id']),fetchone=True)
     if not p: return err('Not found',404)
-    fields={k:v for k,v in data.items() if k in ('name','address','city','country')}
+    fields={k:(v or '').strip() for k,v in data.items() if k in ('name','address','city','country')}
+    if ('name' in fields and not fields['name']) or ('address' in fields and not fields['address']):
+        return err('Name and address are required')
+    if isinstance(data.get('features'), dict):
+        fields['features'] = clean_features(data['features'], property_features(p['features']))
     if not fields: return err('No fields')
     set_clause=', '.join(f"{k}=%s" for k in fields)
     execute(f"UPDATE properties SET {set_clause} WHERE id=%s",(*fields.values(),pid))
-    return ok(msg='Updated')
+    log_action('UPDATE_PROPERTY', 'properties', pid, ', '.join(fields))
+    return ok(msg='Saved')
 
 @app.route('/api/properties/<int:pid>', methods=['DELETE'])
 @require_auth('landlord')
@@ -1210,7 +1259,7 @@ def list_contracts():
         lp = get_landlord_profile(u['id'])
         contracts = query("""
             SELECT c.*,u.full_name AS tenant_name,u.email AS tenant_email,
-                   un.unit_number,p.name AS property_name
+                   un.unit_number,p.name AS property_name,p.id AS property_id
             FROM contracts c
             JOIN tenant_profiles tp ON tp.id=c.tenant_id
             JOIN users u ON u.id=tp.user_id
@@ -1534,9 +1583,12 @@ def create_bill():
     if not all([contract_id,description,due_date]): return err('All fields required')
     if amount is None: return err('Amount must be more than 0')
     if bill_type not in ('rent','water','electricity','other'): bill_type='other'
-    c=query("""SELECT c.id, c.tenant_id FROM contracts c JOIN units un ON un.id=c.unit_id JOIN properties p ON p.id=un.property_id
+    c=query("""SELECT c.id, c.tenant_id, p.features, p.name AS property_name FROM contracts c JOIN units un ON un.id=c.unit_id JOIN properties p ON p.id=un.property_id
                WHERE c.id=%s AND p.landlord_id=%s""",(contract_id,lp['id']),fetchone=True)
     if not c: return err('Contract not found',404)
+    need = BILL_TYPE_FEATURE.get(bill_type)
+    if need and not property_features(c['features'])[need]:
+        return err(f'{bill_type.title()} bills are turned off for {c["property_name"]}. Turn them on in the property\'s Setup.')
     bid,_=execute("INSERT INTO bills (contract_id,description,bill_type,bill_month,bill_year,amount,due_date) VALUES (%s,%s,%s,%s,%s,%s,%s)",
                   (contract_id,description[:255],bill_type,bill_month,bill_year,amount,due_date))
     notify_new_bill(contract_id, description, amount, due_date)
@@ -1549,15 +1601,16 @@ def generate_monthly_bills():
     that doesn't have one yet. Due on the 7th, or today if that's already past."""
     lp=get_landlord_profile(g.current_user['id'])
     today=date.today()
-    contracts=query("""SELECT c.id, c.monthly_rent FROM contracts c
+    contracts=query("""SELECT c.id, c.monthly_rent, p.features FROM contracts c
         JOIN units un ON un.id=c.unit_id JOIN properties p ON p.id=un.property_id
-        WHERE p.landlord_id=%s AND c.status='active' AND c.start_date <= CURDATE()
+        WHERE p.landlord_id=%s AND p.is_active=1 AND c.status='active' AND c.start_date <= CURDATE()
           AND (c.end_date IS NULL OR c.end_date >= CURDATE())
           AND NOT EXISTS (SELECT 1 FROM bills b WHERE b.contract_id=c.id AND b.bill_type='rent'
                           AND ((b.bill_month=%s AND b.bill_year=%s)
                                OR (b.bill_month IS NULL AND b.description LIKE 'Monthly Rent%%'
                                    AND YEAR(b.created_at)=%s AND MONTH(b.created_at)=%s)))""",
         (lp['id'], today.month, today.year, today.year, today.month))
+    contracts=[c for c in contracts if property_features(c['features'])['rent_billing']]
     due=max(today, today.replace(day=7)).isoformat()
     description=f"Monthly Rent — {today.strftime('%B %Y')}"
     for c in contracts:
@@ -1747,8 +1800,10 @@ def create_water_session():
         return err('Amounts must be numbers')
     if not all([property_id,session_month,session_year,prev_reading_date,curr_reading_date,total_bill,overall_consumption]):
         return err('All fields required')
-    p=query("SELECT id FROM properties WHERE id=%s AND landlord_id=%s",(property_id,lp['id']),fetchone=True)
+    p=query("SELECT id, name, features FROM properties WHERE id=%s AND landlord_id=%s AND is_active=1",(property_id,lp['id']),fetchone=True)
     if not p: return err('Property not found',404)
+    if not property_features(p['features'])['water_billing']:
+        return err(f"Water billing is turned off for {p['name']}. Turn it on in the property's Setup.")
     if overall_consumption<=0: return err('Consumption must be > 0')
     price_per_cubic=total_bill/overall_consumption
     pump_per_unit=pump_total/number_of_units if number_of_units>0 else 0
