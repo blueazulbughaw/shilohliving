@@ -60,10 +60,10 @@ code{background:var(--bg);padding:2px 6px;border-radius:4px;font-size:12px}
 .form-group{margin-bottom:14px}
 .form-group label{display:block;font-size:12px;font-weight:600;color:var(--muted);
   margin-bottom:5px;text-transform:uppercase;letter-spacing:.5px}
-.form-group input,.form-group select,.form-group textarea,.modal textarea,.chat-compose textarea{
+.form-group input,.form-group select,.form-group textarea,.modal textarea,.chat-compose textarea,.rem-row select,.myrem-day input[type=number]{
   width:100%;padding:10px 12px;border:1.5px solid var(--border);border-radius:var(--radius);
   outline:none;transition:border-color .2s;background:var(--surface);color:var(--text)}
-.form-group input:focus,.form-group select:focus,.form-group textarea:focus,.modal textarea:focus,.chat-compose textarea:focus{border-color:var(--brand)}
+.rem-row select:focus,.myrem-day input:focus,.form-group input:focus,.form-group select:focus,.form-group textarea:focus,.modal textarea:focus,.chat-compose textarea:focus{border-color:var(--brand)}
 .form-group input[type=checkbox]{width:18px;height:18px;padding:0}
 .check-box{background:var(--bg);padding:12px;border-radius:8px}
 .check-box label,.check-list label{display:flex;align-items:center;gap:10px;cursor:pointer;text-transform:none;font-size:14px;color:var(--text);letter-spacing:0;margin:0}
@@ -94,6 +94,8 @@ code{background:var(--bg);padding:2px 6px;border-radius:4px;font-size:12px}
 .sidebar-logo h2{font-size:17px;font-weight:700}
 .sidebar-logo p{font-size:11px;opacity:.7;margin-top:3px}
 .sidebar-nav{flex:1;padding:12px 0;overflow-y:auto}
+.sidebar-nav-bottom{padding:8px 0;border-top:1px solid rgba(255,255,255,.1)}
+.sidebar-nav-bottom[hidden]{display:none}
 .nav-item{display:flex;align-items:center;gap:10px;margin:1px 10px;padding:10px 12px;font-size:14px;font-weight:500;border-radius:var(--radius);
   color:#c5d1c4;cursor:pointer;transition:all .15s}
 .nav-item:hover{background:rgba(255,255,255,.07);color:#fff}
@@ -423,3 +425,18 @@ tr:hover td{background:#fbfbf8}
 @media(max-width:768px){
   input,select,textarea,.form-group input,.form-group select,.form-group textarea{font-size:16px}
 }
+
+/* Bill reminders to tenants + My Reminders */
+.rem-prop{border:1px solid var(--border);border-radius:var(--radius);padding:10px 12px;margin-top:10px}
+.rem-prop summary{cursor:pointer;display:flex;flex-direction:column;gap:2px}
+.rem-row{display:grid;grid-template-columns:110px repeat(3,minmax(0,1fr));gap:10px;align-items:end;padding:10px 0;border-top:1px solid var(--border)}
+.rem-row:first-of-type{margin-top:8px}
+.rem-row label{display:flex;flex-direction:column;gap:4px;font-size:12px;color:var(--muted)}
+.rem-row select{width:100%}
+.rem-type{font-weight:700;align-self:center}
+.rem-check{display:flex !important;flex-direction:row !important;align-items:center;gap:8px;font-size:13.5px !important;color:var(--text) !important}
+.rem-check input{width:18px;height:18px;flex-shrink:0}
+.myrem-row{display:flex;flex-wrap:wrap;align-items:center;justify-content:space-between;gap:8px;padding:10px 0;border-bottom:1px solid var(--border)}
+.myrem-day{display:flex;align-items:center;gap:8px;font-size:13px;color:var(--muted)}
+.myrem-day input{width:72px !important;padding:8px 10px !important}
+@media(max-width:640px){.rem-row{grid-template-columns:1fr 1fr}.rem-type{grid-column:1/-1}}

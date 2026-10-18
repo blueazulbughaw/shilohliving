@@ -597,13 +597,12 @@ function buildNav() {
       { id: 'gen-rent', icon: '🏠', label: 'Monthly Rent', fn: loadGenerateRent },
       { id: 'water', icon: '💧', label: 'Water Bills', fn: loadWaterBilling },
     ] },
-    { id: 'announcements', icon: '📣', label: 'Announcements', fn: loadLandlordAnnouncements },
+    { id: 'announcements', icon: '📣', label: 'Announcements & Reminders', fn: loadLandlordAnnouncements },
     { id: 'messages', icon: '💬', label: 'Messages', fn: loadMessages },
-    { id: 'reminders', icon: '🔔', label: 'Reminders', fn: loadReminders },
-    { id: 'support', icon: '🎫', label: 'Support', fn: () => loadSupport('landlord') },
-    { id: 'l-settings', icon: '⚙️', label: 'Settings', fn: loadLandlordSettings },
-    { id: 'account', icon: '👤', label: 'Account', fn: loadAccount },
-    { id: 'billing', icon: '🧾', label: 'Billing & Plan', fn: loadBillingPlan },
+    { id: 'l-settings', icon: '⚙️', label: 'Settings', fn: loadLandlordSettings, bottom: true },
+    { id: 'account', icon: '👤', label: 'Account', fn: loadAccount, bottom: true },
+    { id: 'billing', icon: '🧾', label: 'Billing & Plan', fn: loadBillingPlan, bottom: true },
+    { id: 'support', icon: '🎫', label: 'Help & Support', fn: () => loadSupport('landlord'), under: 'l-settings' },
   ];
   else if (role === 'tenant') items = [
     { id: 't-dashboard', icon: '📊', label: 'My Home', fn: loadTenantDashboard },
@@ -612,9 +611,9 @@ function buildNav() {
     { id: 't-bills', icon: '💰', label: 'My Bills', fn: loadTenantBills },
     { id: 't-announcements', icon: '📣', label: 'Announcements', fn: loadTenantAnnouncements },
     { id: 't-messages', icon: '💬', label: 'Messages', fn: loadTenantMessages },
-    { id: 't-settings', icon: '⚙️', label: 'Settings', fn: loadTenantSettings },
-    { id: 'account', icon: '👤', label: 'Account', fn: loadAccount },
-    { id: 't-support', icon: '🎫', label: 'Support', fn: () => loadSupport('tenant') },
+    { id: 't-settings', icon: '⚙️', label: 'Settings', fn: loadTenantSettings, bottom: true },
+    { id: 'account', icon: '👤', label: 'Account', fn: loadAccount, bottom: true },
+    { id: 't-support', icon: '🎫', label: 'Help & Support', fn: () => loadSupport('tenant'), under: 't-settings' },
   ];
   else if (role === 'admin') items = [
     { id: 'admin-stats', icon: '📊', label: 'Overview', fn: loadAdminStats },
@@ -626,7 +625,7 @@ function buildNav() {
     { id: 'admin-chat', icon: '💬', label: 'Live Chat', fn: loadAdminChat },
     { id: 'admin-audit', icon: '📝', label: 'Audit Log', fn: loadAdminAudit },
     { id: 'admin-bin', icon: '🗑️', label: 'Recycle Bin', fn: loadAdminBin },
-    { id: 'account', icon: '👤', label: 'Account', fn: loadAccount },
+    { id: 'account', icon: '👤', label: 'Account', fn: loadAccount, bottom: true },
   ];
   NAV = {};
   const navItem = (item, parent) => {
@@ -637,8 +636,12 @@ function buildNav() {
     el.onclick = () => { goPage(item.id); closeSidebar(); };
     return el;
   };
+  // Settings / Account / Billing sit at the bottom; pages opened from inside another page
+  // (e.g. Help & Support from Settings) have no menu entry of their own (`under`)
+  const bottom = document.getElementById('sidebar-nav-bottom'); bottom.innerHTML = '';
   items.forEach(item => {
-    if (!item.group) { nav.appendChild(navItem(item)); return; }
+    if (item.under) { NAV[item.id] = item; return; }
+    if (!item.group) { (item.bottom ? bottom : nav).appendChild(navItem(item)); return; }
     // A group (e.g. Generate Bills): tap to open its sub-menu
     const wrap = document.createElement('div');
     wrap.className = 'nav-group-wrap'; wrap.id = 'navgroup-' + item.group;
@@ -651,7 +654,8 @@ function buildNav() {
     wrap.append(head, kids);
     nav.appendChild(wrap);
   });
-  items = items.flatMap(i => i.group ? i.children : [i]);
+  bottom.hidden = !bottom.children.length;
+  items = items.flatMap(i => i.group ? i.children : i.under ? [] : [i]);
   // A tapped notification wins, then the page in the address (refresh), then the first page
   const opened = PENDING_OPEN_PAGE && NAV[PENDING_OPEN_PAGE];
   if (opened) goPage(PENDING_OPEN_PAGE);
@@ -660,7 +664,7 @@ function buildNav() {
 }
 // Opens a page by id (sidebar, notifications, quick actions)
 // Pages that moved (old notifications and bookmarks still point at them)
-const MOVED_PAGES = { payments: 'dashboard', contracts: 'tenants', units: 'properties', bills: 'tenants' };
+const MOVED_PAGES = { payments: 'dashboard', contracts: 'tenants', units: 'properties', bills: 'tenants', reminders: 'l-settings' };
 function goPage(id) {
   const item = NAV[id] || NAV[MOVED_PAGES[id]];
   if (!NAV[id] && item) id = MOVED_PAGES[id];
@@ -727,7 +731,8 @@ function setPage(id) {
   document.querySelectorAll('.page').forEach(p => p.classList.remove('active'));
   const pg = document.getElementById('page-' + id); if (pg) pg.classList.add('active');
   document.querySelectorAll('.nav-item').forEach(n => n.classList.remove('active'));
-  const ni = document.getElementById('nav-' + id); if (ni) ni.classList.add('active');
+  const ni = document.getElementById('nav-' + id) || (NAV[id] && NAV[id].under && document.getElementById('nav-' + NAV[id].under));
+  if (ni) ni.classList.add('active');
   const grp = ni && ni.closest('.nav-group-wrap'); if (grp) grp.classList.add('open');
   const labels = { 't-dashboard': 'My Home', 'admin-stats': 'Platform Overview', 'admin-chat': 'Live Support Chat' };
   document.getElementById('topbar-title').textContent = labels[id] || (NAV[id] && NAV[id].label) || '';
@@ -1145,8 +1150,9 @@ async function loadLandlordDashboard() {
   try {
     const d = await apiFetch('/landlord/dashboard'); const s = d.summary || {};
     const remBanners = (d.due_reminders || []).map(r =>
-      `<div class="reminder-banner"><span style="font-size:20px">🔔</span>
-        <div><strong>${esc(r.title)}</strong><div style="font-size:12px;color:var(--warn);margin-top:2px">Due today</div></div></div>`).join('');
+      `<div class="reminder-banner"><span style="font-size:20px">⏰</span>
+        <div style="flex:1"><strong>${esc(r.title)}</strong><div style="font-size:12px;color:var(--warn);margin-top:2px">Today</div></div>
+        ${r.page && r.page !== 'dashboard' ? `<button class="btn btn-sm btn-brand" onclick="goPage(${jsArg(r.page)})">Open</button>` : ''}</div>`).join('');
     const stat = (v, label, page) => `<div class="stat-card"${page ? ` onclick="goPage('${page}')" role="button"` : ''}><div class="value">${esc(v)}</div><div class="label">${label}</div></div>`;
     pg.innerHTML = `${remBanners}
       <div class="stats-grid">
@@ -1164,11 +1170,7 @@ async function loadLandlordDashboard() {
       </div>
       <div class="card invite-card"><div class="card-header"><h3>👋 Invite Tenants</h3></div>
         <p class="muted-text">Tenants join you with your code, link or QR code — they can't register on their own.</p>
-        <div class="code-card">${esc(d.landlord_code || '—')}</div>
-        <div class="btn-group">
-          <button class="btn btn-brand" onclick="showLandlordInvite()">📱 QR Code &amp; Share Link</button>
-          <button class="btn btn-outline" onclick="copyText(joinUrl(${jsArg(d.landlord_code)}), 'Join link copied!')">📋 Copy Join Link</button>
-        </div>
+        <button class="btn btn-brand" style="margin-top:10px" onclick="showLandlordInvite()">📱 QR Code &amp; Share Link</button>
       </div>
       <div class="grid-2">
         <div class="card"><div class="card-header"><h3>Recent Payments</h3></div>
@@ -1451,6 +1453,19 @@ function toggleProfileSort(section) {
   _profile.sort[section] = _profile.sort[section] === 'desc' ? 'asc' : 'desc';
   document.getElementById('ps-' + section).innerHTML = profileSection(section);
 }
+async function deleteBill(id) {
+  const b = _profile.data.bills.find(x => x.id === id); if (!b) return;
+  const effects = ['The tenant gets a notification that it was removed.'];
+  if (b.bill_type === 'water') effects.unshift('Its water reading goes back to the water session, which reopens so you can fix the reading and generate the bill again.');
+  if (b.payment_status === 'pending') {
+    await confirmAction({ title: "This bill can't be deleted yet", blocked: 'A payment for it is waiting for your review. Reject the payment first, then delete the bill.' });
+    return;
+  }
+  if (!await confirmAction({ title: 'Delete this bill?', okText: 'Delete bill', effects,
+      message: `${b.description} — ₱${fmt(b.amount)}, due ${fmtDate(b.due_date)}. Use this for a bill made by mistake.` })) return;
+  try { await apiFetch('/bills/' + id, { method: 'DELETE' }); refreshView(); }
+  catch (e) { alert(e.message); }
+}
 function setBillType(t) { _profile.billType = t; document.getElementById('ps-bills').innerHTML = profileSection('bills'); }
 const step = (label, d, done) => `<span class="tl-step ${done ? 'done' : ''}">${label}${d ? ' · ' + fmtDate(d) : ''}</span>`;
 function profileSection(section) {
@@ -1476,6 +1491,7 @@ function profileSection(section) {
           <div class="btn-group" style="margin-top:6px">
             <button class="btn btn-sm btn-outline" onclick="openPdf('/api/bills/${parseInt(b.id)}/pdf')">🧾 Statement PDF</button>
             ${approved ? `<button class="btn btn-sm btn-outline" onclick="openPdf('/api/payments/${parseInt(b.payment_id)}/receipt.pdf')">✅ Receipt ${esc(b.receipt_no || '')}</button>` : ''}
+            ${b.status !== 'paid' && !approved ? `<button class="btn btn-sm btn-red" onclick="deleteBill(${parseInt(b.id)})">🗑 Delete</button>` : ''}
           </div></div>`; }).join('') : '<p class="muted-text">No bills of this type.</p>'}`;
   }
   if (section === 'payments') {
@@ -1898,9 +1914,9 @@ async function submitReject(id) {
 async function loadLandlordAnnouncements() {
   const pg = document.getElementById('page-announcements'); pg.innerHTML = loadingHtml;
   try {
-    const [announcements, props] = await Promise.all([apiFetch('/announcements'), apiFetch('/properties')]);
-    _props = props;
-    pg.innerHTML = `<div class="card"><div class="card-header"><h3>Announcements (${announcements.length})</h3>
+    const [announcements, props, rules] = await Promise.all([apiFetch('/announcements'), apiFetch('/properties'), apiFetch('/tenant-reminders')]);
+    _props = props; _tenantRules = rules;
+    pg.innerHTML = `<div class="card"><div class="card-header"><h3>📣 Announcements (${announcements.length})</h3>
       <button class="btn btn-brand" onclick="showCreateAnnouncement()">+ New Announcement</button></div>
       <div class="info-box">Send announcements to tenants — maintenance updates, payment reminders, or general notices. Tenants get a phone notification if they turned them on.</div>
       ${!announcements.length ? '<div class="empty-state"><div class="icon">📣</div><p>No announcements yet</p></div>' :
@@ -1917,8 +1933,74 @@ async function loadLandlordAnnouncements() {
               <span>📅 ${fmtDate(a.created_at)}</span>
             </div>
           </div>`).join('')}
-    </div>`;
+    </div>
+    ${tenantRemindersCardHtml(rules)}`;
   } catch (e) { pg.innerHTML = errHtml(e); }
+}
+
+// ── Bill reminders to tenants (per property, per bill type) ──
+let _tenantRules = [];
+const RULE_TYPES = { rent: 'Rent', water: 'Water', electricity: 'Electricity', other: 'Other charges' };
+const daysOpt = (list, cur, word) => `<option value="">Off</option>` + list.map(n =>
+  `<option value="${n}" ${cur === n ? 'selected' : ''}>${n} ${word}${n === 1 ? '' : 's'}</option>`).join('');
+function ruleSummary(t) {
+  const parts = [];
+  if (t.days_before) parts.push(`${t.days_before}d before`);
+  if (t.on_due_day) parts.push('on due date');
+  if (t.overdue_every) parts.push(t.overdue_every === 1 ? 'daily if late' : `every ${t.overdue_every}d if late`);
+  return parts.length ? parts.join(', ') : 'off';
+}
+function tenantRemindersCardHtml(rules) {
+  return `<div class="card"><div class="card-header"><h3>🔔 Bill Reminders to Tenants</h3></div>
+    <p class="muted-text">Tenants get a phone notification about unpaid bills — set it for each property and type of bill.
+      Reminders go out from 8 AM. Bills with a payment waiting for your review are skipped.</p>
+    ${!rules.length ? '<p class="muted-text">Add a property first.</p>' : rules.map((p, i) => `
+      <details class="rem-prop" id="rem-prop-${parseInt(p.property_id)}" ${i === 0 ? 'open' : ''}>
+        <summary><strong>🏢 ${esc(p.name)}</strong>
+          <span class="muted-text small">${p.types.map(t => `${RULE_TYPES[t.bill_type]}: ${ruleSummary(t)}`).join(' · ') || 'No bills turned on'}</span></summary>
+        ${!p.types.length ? '<p class="muted-text">No bill types are turned on in this property\'s Setup.</p>' : p.types.map(t => `
+          <div class="rem-row" data-type="${esc(t.bill_type)}">
+            <div class="rem-type">${RULE_TYPES[t.bill_type]}</div>
+            <label>Before the due date<select class="rr-before">${daysOpt([1, 2, 3, 5, 7, 10], t.days_before, 'day')}</select></label>
+            <label class="rem-check"><input type="checkbox" class="rr-due" ${t.on_due_day ? 'checked' : ''}/> On the due date</label>
+            <label>If still unpaid, every<select class="rr-every">${daysOpt([1, 2, 3, 7, 14], t.overdue_every, 'day')}</select></label>
+          </div>`).join('')}
+        ${p.types.length ? `<div class="btn-group" style="margin-top:10px">
+          <button class="btn btn-sm btn-brand" onclick="saveTenantRules(${parseInt(p.property_id)})">Save</button>
+          ${rules.length > 1 ? `<button class="btn btn-sm btn-outline" onclick="copyTenantRules(${parseInt(p.property_id)})">Use for all properties</button>` : ''}
+          <span class="small-msg" id="rem-msg-${parseInt(p.property_id)}"></span></div>` : ''}
+      </details>`).join('')}
+  </div>`;
+}
+function readTenantRules(pid) {
+  return [...document.querySelectorAll(`#rem-prop-${pid} .rem-row`)].map(r => ({
+    bill_type: r.dataset.type, days_before: r.querySelector('.rr-before').value || null,
+    on_due_day: r.querySelector('.rr-due').checked, overdue_every: r.querySelector('.rr-every').value || null }));
+}
+async function saveTenantRules(pid) {
+  const msg = document.getElementById('rem-msg-' + pid);
+  try {
+    await apiFetch('/tenant-reminders/' + pid, { method: 'PUT', body: JSON.stringify({ types: readTenantRules(pid) }) });
+    msg.className = 'small-msg ok'; msg.textContent = '✅ Saved';
+    _tenantRules = await apiFetch('/tenant-reminders');
+    const p = _tenantRules.find(x => x.property_id === pid);
+    if (p) document.querySelector(`#rem-prop-${pid} summary .muted-text`).textContent =
+      p.types.map(t => `${RULE_TYPES[t.bill_type]}: ${ruleSummary(t)}`).join(' · ');
+  } catch (e) { msg.className = 'small-msg bad'; msg.textContent = e.message; }
+}
+async function copyTenantRules(pid) {
+  const src = readTenantRules(pid); const from = _tenantRules.find(p => p.property_id === pid);
+  const others = _tenantRules.filter(p => p.property_id !== pid);
+  if (!await confirmAction({ title: 'Use these reminders for all properties?', danger: false, okText: 'Apply to all',
+      message: `The reminder settings of ${from.name} replace those of:`, effects: others.map(p => p.name) })) return;
+  try {
+    for (const p of others) {
+      const types = p.types.map(t => src.find(x => x.bill_type === t.bill_type)).filter(Boolean);
+      if (types.length) await apiFetch('/tenant-reminders/' + p.property_id, { method: 'PUT', body: JSON.stringify({ types }) });
+    }
+    await saveTenantRules(pid);
+    loadLandlordAnnouncements();
+  } catch (e) { alert(e.message); }
 }
 function showCreateAnnouncement() {
   openModal('New Announcement', `
@@ -2053,7 +2135,8 @@ async function loadWaterBilling() {
         ${sessions.map(s => `<tr><td><strong>${esc(s.property_name)}</strong></td>
           <td>${MONTHS[s.session_month - 1]} ${esc(s.session_year)}</td>
           <td>₱${fmt(s.total_bill)}</td><td>₱${fmt(s.price_per_cubic)}</td><td>${badge(s.status)}</td>
-          <td><button class="btn btn-sm btn-brand" onclick="viewWaterSession(${parseInt(s.id)})">${s.status === 'draft' ? 'Enter Readings' : 'View'}</button></td></tr>`).join('')}
+          <td><div class="btn-group"><button class="btn btn-sm btn-brand" onclick="viewWaterSession(${parseInt(s.id)})">${s.status === 'draft' ? 'Enter Readings' : 'View'}</button>
+            ${s.status === 'billed' ? `<button class="btn btn-sm btn-outline" onclick="openPdf('/api/water/sessions/${parseInt(s.id)}/bills.pdf')">🖨 Print bills</button>` : ''}</div></td></tr>`).join('')}
         </tbody></table></div>`}
     </div>`;
   } catch (e) { pg.innerHTML = errHtml(e); }
@@ -2111,11 +2194,12 @@ async function openWaterSession(sid) {
     _water = { session: s, units };
     const billed = s.status === 'billed';
     const readingMap = {}; readings.forEach(r => readingMap[r.unit_id] = r);
-    const dis = billed ? 'disabled' : '';
+    const anyBill = readings.some(r => r.bill_id);
     pg.innerHTML = `<div class="card">
       <div class="card-header"><div><h3>💧 ${esc(s.property_name)} — ${MONTHS[s.session_month - 1]} ${esc(s.session_year)}</h3>
         <div class="muted-text" style="margin-top:4px">${fmtDate(s.prev_reading_date)} → ${fmtDate(s.curr_reading_date)}</div></div>
-</div>
+        ${anyBill ? `<button class="btn btn-sm btn-outline" onclick="openPdf('/api/water/sessions/${parseInt(sid)}/bills.pdf')">🖨 Print all bills</button>` : ''}
+      </div>
       <div class="water-calc">
         <div class="row"><span>Total Main Bill</span><span>₱${fmt(s.total_bill)}</span></div>
         <div class="row"><span>Overall Consumption</span><span>${esc(s.overall_consumption)} cu</span></div>
@@ -2123,10 +2207,12 @@ async function openWaterSession(sid) {
         <div class="row"><span>Pump Fee per Unit</span><span>₱${parseFloat(s.pump_per_unit).toFixed(4)}</span></div>
       </div></div>
       <div class="card"><div class="card-header"><h3>Unit Readings</h3></div>
-      ${billed ? '<div class="info-box">Bills generated. View them in the Bills tab.</div>' : ''}
+      ${billed ? `<div class="info-box">Bills generated and sent to the tenants. “Print all bills” gives one page per unit.
+          To fix a wrong bill, delete it on the tenant's profile — this session reopens so you can correct the reading.</div>`
+        : anyBill ? '<div class="info-box">Units marked 🔒 are already billed. Fix the others, then Generate Bills for the rest.</div>' : ''}
       <div class="table-wrap"><table><thead><tr><th>Unit</th><th>Owner?</th><th>Previous cu</th><th>Current cu</th><th>Consumption</th><th>Water Bill</th><th>Pump</th><th>Total</th></tr></thead><tbody>
-      ${units.map(u => { const r = readingMap[u.id] || {}; const id = parseInt(u.id); return `<tr>
-        <td><strong>${esc(u.unit_number)}</strong></td>
+      ${units.map(u => { const r = readingMap[u.id] || {}; const id = parseInt(u.id); const dis = billed || r.bill_id ? 'disabled' : ''; return `<tr>
+        <td><strong>${esc(u.unit_number)}</strong>${r.bill_id ? ' 🔒' : ''}</td>
         <td><input type="checkbox" id="owner-${id}" ${r.is_owner_unit ? 'checked' : ''} ${dis}/></td>
         <td><input type="number" class="cell-input" inputmode="decimal" id="prev-${id}" value="${esc(r.prev_reading ?? '')}" oninput="recalcRow(${id})" ${dis}/></td>
         <td><input type="number" class="cell-input" inputmode="decimal" id="curr-${id}" value="${esc(r.curr_reading ?? '')}" oninput="recalcRow(${id})" ${dis}/></td>
@@ -2156,7 +2242,7 @@ function recalcRow(unitId) {
   }
 }
 async function saveWaterReadings(sid) {
-  const readings = _water.units.map(u => ({
+  const readings = _water.units.filter(u => !document.getElementById('curr-' + u.id)?.disabled).map(u => ({
     unit_id: u.id, prev_reading: parseFloat(document.getElementById('prev-' + u.id)?.value || 0),
     curr_reading: parseFloat(document.getElementById('curr-' + u.id)?.value || 0),
     is_owner_unit: document.getElementById('owner-' + u.id)?.checked ? 1 : 0
@@ -2181,48 +2267,76 @@ async function submitGenerateWaterBills(sid) {
 }
 
 // ═══════════════════════════════════════════════
-// REMINDERS
+// MY REMINDERS (landlord, in Settings)
 // ═══════════════════════════════════════════════
-async function loadReminders() {
-  const pg = document.getElementById('page-reminders'); pg.innerHTML = loadingHtml;
+// Monthly reminders to yourself: a phone notification on the day (from 8 AM) and a Dashboard banner.
+const MY_REMINDERS = [
+  { type: 'water_reading', label: 'Read the water meters', day: 25 },
+  { type: 'water_bills', label: 'Generate water bills', day: 27 },
+  { type: 'bill_generation', label: 'Generate monthly rent', day: 1 },
+];
+let _myRems = [];
+function myRemindersHtml() {
+  const preset = t => _myRems.find(r => r.reminder_type === t);
+  const custom = _myRems.filter(r => !MY_REMINDERS.some(m => m.type === r.reminder_type));
+  return MY_REMINDERS.map(m => { const r = preset(m.type) || {}; const on = r.id && r.is_active; return `
+      <div class="myrem-row">
+        <label class="rem-check"><input type="checkbox" id="myrem-on-${m.type}" ${on ? 'checked' : ''} onchange="saveMyReminder('${m.type}')"/> <strong>${m.label}</strong></label>
+        <label class="myrem-day">every month on day <input type="number" min="1" max="28" id="myrem-day-${m.type}" value="${esc(r.day_of_month || m.day)}" onchange="saveMyReminder('${m.type}')"/></label>
+      </div>`; }).join('') + custom.map(r => `
+      <div class="myrem-row">
+        <label class="rem-check"><input type="checkbox" ${r.is_active ? 'checked' : ''} onchange="toggleMyReminder(${parseInt(r.id)}, this.checked)"/> <strong>${esc(r.title)}</strong></label>
+        <span class="myrem-day">every month on day ${esc(r.day_of_month)}
+          <button class="btn btn-sm btn-red" onclick="deleteReminder(${parseInt(r.id)})">Delete</button></span>
+      </div>`).join('');
+}
+async function reloadMyReminders() {
+  _myRems = await apiFetch('/reminders');
+  document.getElementById('myrem-list').innerHTML = myRemindersHtml();
+}
+function myRemMsg(text, good) {
+  const m = document.getElementById('myrem-msg'); if (!m) return;
+  m.className = 'small-msg ' + (good ? 'ok' : 'bad'); m.textContent = text;
+}
+async function saveMyReminder(type) {
+  const on = document.getElementById('myrem-on-' + type).checked;
+  const day = document.getElementById('myrem-day-' + type).value;
+  const r = _myRems.find(x => x.reminder_type === type);
   try {
-    const reminders = await apiFetch('/reminders'); const today = new Date().getDate();
-    pg.innerHTML = `<div class="card"><div class="card-header"><h3>Reminders</h3>
-      <button class="btn btn-brand" onclick="showAddReminder()">+ Add Reminder</button></div>
-      <div class="info-box">Reminders appear on your dashboard on the day you set every month.</div>
-      ${!reminders.length ? '<div class="empty-state"><div class="icon">🔔</div><p>No reminders yet</p></div>' :
-        `<div class="table-wrap"><table><thead><tr><th>Title</th><th>Type</th><th>Day</th><th>Actions</th></tr></thead><tbody>
-        ${reminders.map(r => `<tr><td><strong>${esc(r.title)}</strong></td><td>${badge(r.reminder_type)}</td>
-          <td>Every ${esc(r.day_of_month)}${r.day_of_month === today ? ' 🔔 Today' : ''}</td>
-          <td><button class="btn btn-sm btn-red" onclick="deleteReminder(${parseInt(r.id)})">Delete</button></td></tr>`).join('')}
-        </tbody></table></div>`}
-    </div>`;
-  } catch (e) { pg.innerHTML = errHtml(e); }
+    if (r) await apiFetch('/reminders/' + r.id, { method: 'PATCH', body: JSON.stringify({ is_active: on, day_of_month: day }) });
+    else if (on) await apiFetch('/reminders', { method: 'POST', body: JSON.stringify({ reminder_type: type, day_of_month: day }) });
+    else return;
+    await reloadMyReminders(); myRemMsg('✅ Saved', true);
+  } catch (e) { myRemMsg(e.message, false); }
+}
+async function toggleMyReminder(id, on) {
+  try { await apiFetch('/reminders/' + id, { method: 'PATCH', body: JSON.stringify({ is_active: on }) }); myRemMsg('✅ Saved', true); }
+  catch (e) { myRemMsg(e.message, false); }
 }
 function showAddReminder() {
-  openModal('Add Reminder', `
-    <div class="form-group"><label>Title</label><input type="text" id="m-rem-title" maxlength="255" placeholder="Read water meters…"/></div>
-    <div class="form-group"><label>Type</label><select id="m-rem-type">
-      <option value="water_reading">Water Meter Reading</option><option value="bill_generation">Bill Generation</option>
-      <option value="payment_collection">Payment Collection</option><option value="custom">Custom</option></select></div>
-    <div class="form-group"><label>Day of Month (1–28)</label><input type="number" id="m-rem-day" min="1" max="28" placeholder="1"/>
-      <small class="hint">Appears on your dashboard on this day every month</small></div>
+  openModal('Add a Reminder', `
+    <div class="form-group"><label>Remind me to</label><input type="text" id="m-rem-title" maxlength="255" placeholder="e.g. Pay the main water bill"/></div>
+    <div class="form-group"><label>Day of the month (1–28)</label><input type="number" id="m-rem-day" min="1" max="28" placeholder="1"/>
+      <small class="hint">You get a phone notification on this day every month, and it shows on your Dashboard.</small></div>
     <p class="err-msg" id="m-rem-err"></p>`,
     `<button class="btn btn-outline" onclick="closeModalDirect()">Cancel</button>
      <button class="btn btn-brand" onclick="submitAddReminder()">Add</button>`);
 }
 async function submitAddReminder() {
-  const body = { title: document.getElementById('m-rem-title').value.trim(), reminder_type: document.getElementById('m-rem-type').value, day_of_month: document.getElementById('m-rem-day').value };
+  const body = { title: document.getElementById('m-rem-title').value.trim(), reminder_type: 'custom', day_of_month: document.getElementById('m-rem-day').value };
   const errEl = document.getElementById('m-rem-err'); errEl.textContent = '';
-  if (!body.title || !body.day_of_month) { errEl.textContent = 'All fields required'; return; }
-  try { await apiFetch('/reminders', { method: 'POST', body: JSON.stringify(body) }); closeModalDirect(); loadReminders(); }
+  if (!body.title || !body.day_of_month) { errEl.textContent = 'Both fields are required'; return; }
+  try { await apiFetch('/reminders', { method: 'POST', body: JSON.stringify(body) }); closeModalDirect(); reloadMyReminders(); }
   catch (e) { errEl.textContent = e.message; }
 }
 async function deleteReminder(id) {
   if (!await confirmAction({ title: 'Delete this reminder?', okText: 'Delete' })) return;
   try { await apiFetch('/reminders/' + id, { method: 'DELETE' }); } catch (e) { alert(e.message); }
-  loadReminders();
+  reloadMyReminders();
 }
+const supportCardHtml = page => `<div class="card"><div class="card-header"><h3>🎫 Help &amp; Support</h3></div>
+    <p class="muted-text">Questions, or something not working? Chat with us or open a support ticket.</p>
+    <button class="btn btn-brand" style="margin-top:10px" onclick="goPage('${page}')">Open Help &amp; Support</button></div>`;
 
 // ═══════════════════════════════════════════════
 // SUPPORT (Landlord & Tenant)
@@ -2827,10 +2941,18 @@ const REQ_KIND = { document: '📎 Tenant uploads a file', info: '✍️ Tenant 
 async function loadLandlordSettings() {
   const pg = document.getElementById('page-l-settings'); pg.innerHTML = loadingHtml;
   try {
-    const [prefs, st, reqs, outReqs] = await Promise.all([apiFetch('/notification-preferences'), apiFetch('/landlord/settings'),
-      apiFetch('/landlord/requirements?phase=move_in'), apiFetch('/landlord/requirements?phase=move_out')]);
+    const [prefs, st, reqs, outReqs, rems] = await Promise.all([apiFetch('/notification-preferences'), apiFetch('/landlord/settings'),
+      apiFetch('/landlord/requirements?phase=move_in'), apiFetch('/landlord/requirements?phase=move_out'), apiFetch('/reminders')]);
+    _myRems = rems;
     pg.innerHTML = `
       ${pushCardHtml()}
+      <div class="card"><div class="card-header"><h3>⏰ My Reminders</h3>
+          <button class="btn btn-sm btn-brand" onclick="showAddReminder()">+ Add</button></div>
+        <p class="muted-text">Reminders to yourself every month — a phone notification on the day (from 8 AM) and a note on your Dashboard.
+          Reminders to tenants about their bills are on <a href="#" onclick="event.preventDefault();goPage('announcements')">Announcements &amp; Reminders</a>.</p>
+        <div id="myrem-list">${myRemindersHtml()}</div>
+        <span class="small-msg" id="myrem-msg"></span>
+      </div>
       <div class="card"><div class="card-header"><h3>👋 Invite Tenants</h3></div>
         <p class="muted-text">Your join code, link and QR code. Make a new code there if the old one got shared too widely.</p>
         <button class="btn btn-brand" style="margin-top:10px" onclick="showLandlordInvite()">Open Invite</button></div>
@@ -2859,6 +2981,7 @@ async function loadLandlordSettings() {
         ], prefs)}
         <div id="pref-save-msg" class="small-msg ok" style="display:none">✅ Saved</div>
       </div>
+      ${supportCardHtml('support')}
       <p class="hint center">Your name, email and password are on the <a href="#" onclick="event.preventDefault();goPage('account')">Account</a> page.</p>`;
     window._reqs = { move_in: reqs, move_out: outReqs };
     wirePushCard();
@@ -2944,6 +3067,7 @@ async function loadTenantSettings() {
         ], prefs)}
         <div id="pref-save-msg" class="small-msg ok" style="display:none">✅ Saved</div>
       </div>
+      ${supportCardHtml('t-support')}
       <p class="hint center">Your name, email and password are on the <a href="#" onclick="event.preventDefault();goPage('account')">Account</a> page.</p>`;
     wirePushCard();
   } catch (e) { pg.innerHTML = errHtml(e); }

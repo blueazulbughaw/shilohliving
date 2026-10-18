@@ -171,9 +171,27 @@ def _period(bill):
 def bill_pdf(d):
     """Bill statement. d: bill, tenant, landlord, property, unit_number, water (or None),
     payments (approved/pending), paid_total, balance."""
-    b = d['bill']
-    pdf = _Doc('Billing Statement', f"B-{int(b['id']):06d}", d['landlord'])
+    pdf = _Doc('Billing Statement', f"B-{int(d['bill']['id']):06d}", d['landlord'])
     pdf.alias_nb_pages()
+    _bill_page(pdf, d)
+    return bytes(pdf.output())
+
+
+def bills_pdf(docs):
+    """Several bill statements in one file (e.g. a month's water bills), each on its own page."""
+    pdf = _Doc('Billing Statement', f"B-{int(docs[0]['bill']['id']):06d}", docs[0]['landlord'])
+    pdf.alias_nb_pages()
+    pdf.set_title('Billing Statements')
+    for i, d in enumerate(docs):
+        if i:
+            pdf.number = f"B-{int(d['bill']['id']):06d}"
+            pdf.add_page()
+        _bill_page(pdf, d)
+    return bytes(pdf.output())
+
+
+def _bill_page(pdf, d):
+    b = d['bill']
     status = (b.get('status') or 'pending').upper()
     if status == 'PENDING':
         status = 'UNPAID'
@@ -217,7 +235,6 @@ def bill_pdf(d):
                   f"Total {peso(b['amount'])} · Paid {peso(d['paid_total'])}")
     pdf.note('Pay through the Shiloh Living app (My Bills → Pay) and upload your proof of payment. '
              'A receipt is issued once your landlord approves the payment.')
-    return bytes(pdf.output())
 
 
 def deposit_ack_pdf(d):

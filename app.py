@@ -4,7 +4,7 @@ Flask JSON API under /api/* plus the single-page frontend (templates/index.html)
 """
 import os, re, secrets, smtplib, io, json, html, logging, hashlib
 from concurrent.futures import ThreadPoolExecutor
-from datetime import datetime, timedelta, date
+from datetime import datetime, timedelta, date, timezone
 from functools import wraps
 from email.mime.text import MIMEText
 from email.mime.multipart import MIMEMultipart
@@ -53,6 +53,11 @@ TRIAL_DAYS    = int(os.environ.get('TRIAL_DAYS', 7))
 # Charging is only switched on once this is set: until then trials are tracked, never enforced.
 SUBSCRIPTION_PAY_INFO = os.environ.get('SUBSCRIPTION_PAY_INFO', '').strip()
 BILLING_ACTIVE = bool(SUBSCRIPTION_PAY_INFO)
+# Landlords' local time for reminders (the server runs on US time). Philippines = 8, no DST.
+APP_UTC_OFFSET = float(os.environ.get('APP_UTC_OFFSET', 8))
+
+def local_now():
+    return datetime.now(timezone.utc).replace(tzinfo=None, microsecond=0) + timedelta(hours=APP_UTC_OFFSET)
 
 # The SPA is served from the same origin; only the app's own URL may call the API cross-site.
 CORS(app, resources={r"/api/*": {"origins": [APP_URL]}})
@@ -357,7 +362,7 @@ NOTIF_TYPES = {'bill', 'payment', 'message', 'reminder', 'system', 'announcement
 # Which page a notification opens (in the bell and from a phone notification), by role
 NOTIF_PAGES = {
     'landlord': {'bill': 'tenants', 'payment': 'dashboard', 'message': 'messages', 'contract': 'tenants',
-                 'announcement': 'announcements', 'support': 'support', 'system': 'tenants', 'reminder': 'reminders'},
+                 'announcement': 'announcements', 'support': 'support', 'system': 'tenants', 'reminder': 'dashboard'},
     'tenant':   {'bill': 't-bills', 'payment': 't-bills', 'message': 't-messages', 'contract': 't-contract',
                  'announcement': 't-announcements', 'support': 't-support', 'system': 't-dashboard'},
     'admin':    {'support': 'admin-chat', 'system': 'admin-tickets'},
@@ -2098,7 +2103,7 @@ def tenant_profile(tp_id):
 # ── Printable documents (bill statements, receipts) ──
 # Opened in a new tab / the phone's PDF viewer, which can't send the sign-in header, so the app
 # asks /api/docs/link for a 10-minute link that only works for that one document.
-DOC_PATHS = re.compile(r'^/api/(bills/\d+/pdf|payments/\d+/receipt\.pdf|contracts/\d+/deposit-ack\.pdf|files/[A-Za-z0-9_-]{20,64})$')
+DOC_PATHS = re.compile(r'^/api/(bills/\d+/pdf|payments/\d+/receipt\.pdf|contracts/\d+/deposit-ack\.pdf|water/sessions/\d+/bills\.pdf|files/[A-Za-z0-9_-]{20,64})$')
 
 def make_doc_token(user_id, path):
     return pyjwt.encode({'sub': str(user_id), 'scope': 'doc', 'path': path,
@@ -2172,6 +2177,48 @@ def bill_pdf(bid):
     doc = bill_document(bid)
     if not doc or not can_see_bill(doc): return err('Bill not found', 404)
     return pdf_response(pdfs.bill_pdf(doc), f'Bill-B-{bid:06d}.pdf')
+
+@app.route('/api/water/sessions/<int:sid>/bills.pdf', methods=['GET'])
+@require_doc_auth('landlord')
+def water_session_bills_pdf(sid):
+    """Every bill of one water session in one PDF, one bill per page, for printing."""
+    lp = get_landlord_profile(g.current_user['id'])
+    s = query("""SELECT wms.session_month, wms.session_year, p.name FROM water_meter_sessions wms
+                 JOIN properties p ON p.id=wms.property_id WHERE wms.id=%s AND p.landlord_id=%s""",
+              (sid, lp['id']), fetchone=True)
+    if not s: return err('Not found', 404)
+    rows = query("""SELECT wmr.bill_id FROM water_meter_readings wmr JOIN units u ON u.id=wmr.unit_id
+                    WHERE wmr.session_id=%s AND wmr.bill_id IS NOT NULL ORDER BY u.unit_number""", (sid,))
+    docs = [d for d in (bill_document(r['bill_id']) for r in rows) if d]
+    if not docs: return err('No bills in this session yet', 404)
+    name = re.sub(r'[^A-Za-z0-9]+', '-', s['name']).strip('-') or 'Property'
+    return pdf_response(pdfs.bills_pdf(docs), f"Water-Bills-{name}-{s['session_year']}-{int(s['session_month']):02d}.pdf")
+
+@app.route('/api/bills/<int:bid>', methods=['DELETE'])
+@require_auth('landlord')
+def delete_bill(bid):
+    """Removes a bill made by mistake. Not once it has an approved or waiting payment.
+    A water bill's reading goes back to its session, which reopens so it can be fixed and billed again."""
+    lp = get_landlord_profile(g.current_user['id'])
+    b = query("""SELECT b.*, un.unit_number, p.name AS property_name, tu.id AS tenant_user_id, tu.full_name AS tenant_name
+        FROM bills b JOIN contracts c ON c.id=b.contract_id JOIN units un ON un.id=c.unit_id
+        JOIN properties p ON p.id=un.property_id JOIN tenant_profiles tp ON tp.id=c.tenant_id JOIN users tu ON tu.id=tp.user_id
+        WHERE b.id=%s AND p.landlord_id=%s""", (bid, lp['id']), fetchone=True)
+    if not b: return err('Bill not found', 404)
+    statuses = {r['status'] for r in query("SELECT status FROM payments WHERE bill_id=%s", (bid,))}
+    if 'approved' in statuses:
+        return err("This bill has an approved payment, so it can't be deleted.", 409)
+    if 'pending' in statuses:
+        return err('A payment for this bill is waiting for your review. Reject it first, then delete the bill.', 409)
+    reading = query("SELECT session_id FROM water_meter_readings WHERE bill_id=%s", (bid,), fetchone=True)
+    execute("DELETE FROM payments WHERE bill_id=%s AND status='rejected'", (bid,))
+    execute("DELETE FROM bills WHERE id=%s", (bid,))
+    if reading:
+        execute("UPDATE water_meter_sessions SET status='draft' WHERE id=%s", (reading['session_id'],))
+    log_action('delete_bill', 'bills', bid, f"{b['description']} · ₱{float(b['amount']):,.2f} due {b['due_date']} · "
+                                           f"{b['tenant_name']}, {b['property_name']} Unit {b['unit_number']}")
+    push_notification(b['tenant_user_id'], 'Bill removed', f"{b['description']} (₱{float(b['amount']):,.2f}) was removed by your landlord.", 'bill')
+    return ok({'water_session_id': reading['session_id'] if reading else None}, msg='Bill deleted')
 
 def receipt_document(pid):
     p = query("""SELECT py.*, rv.full_name AS reviewer_name FROM payments py
@@ -2715,12 +2762,14 @@ def save_water_readings(sid):
         if r['unit_id'] not in prop_units: return err('Unit not found in this property', 404)
         if r['curr_reading']<r['prev_reading'] or r['prev_reading']<0:
             return err(f"Current reading is lower than previous for unit {r['unit_id']}")
+    billed_units={r['unit_id'] for r in query("SELECT unit_id FROM water_meter_readings WHERE session_id=%s AND bill_id IS NOT NULL",(sid,))}
     saved=[]
     for r in readings:
         unit_id=r['unit_id']; prev_reading=r['prev_reading']
         curr_reading=r['curr_reading']; is_owner_unit=1 if r.get('is_owner_unit') else 0
         consumption=curr_reading-prev_reading; water_bill=price_per_cubic*consumption
         pump_fee=pump_per_unit; total_amount=water_bill+pump_fee
+        if unit_id in billed_units: continue   # already billed: delete that bill first to change it
         execute("DELETE FROM water_meter_readings WHERE session_id=%s AND unit_id=%s",(sid,unit_id))
         execute("""INSERT INTO water_meter_readings (session_id,unit_id,is_owner_unit,prev_reading,curr_reading,consumption,water_bill,pump_fee,total_amount)
             VALUES (%s,%s,%s,%s,%s,%s,%s,%s,%s)""",(sid,unit_id,is_owner_unit,prev_reading,curr_reading,consumption,water_bill,pump_fee,total_amount))
@@ -2738,8 +2787,8 @@ def generate_water_bills(sid):
     if not session: return err('Not found',404)
     if session['status']=='billed': return err('Already billed',409)
     readings=query("""SELECT wmr.*,u.unit_number FROM water_meter_readings wmr JOIN units u ON u.id=wmr.unit_id
-        WHERE wmr.session_id=%s AND wmr.is_owner_unit=0 AND u.property_id=%s""",(sid,session['property_id']))
-    if not readings: return err('No readings. Save readings first.',400)
+        WHERE wmr.session_id=%s AND wmr.is_owner_unit=0 AND wmr.bill_id IS NULL AND u.property_id=%s""",(sid,session['property_id']))
+    if not readings: return err('No readings left to bill. Save readings first.',400)
     month_names=['January','February','March','April','May','June','July','August','September','October','November','December']
     month_name=month_names[int(session['session_month'])-1]; bills_created=0
     for r in readings:
@@ -2759,21 +2808,61 @@ def generate_water_bills(sid):
 # REMINDERS
 # ════════════════════════════════════════════════════════════
 
+# Reminders to the landlord: shown on the dashboard on their day and pushed by the daily job.
+# The built-in kinds open the page where the work is done.
+REMINDER_TYPES = {'water_reading': ('Read the water meters', 'water'),
+                  'water_bills': ('Generate water bills', 'water'),
+                  'bill_generation': ('Generate monthly rent', 'gen-rent'),
+                  'payment_collection': ('Collect payments', 'dashboard'),
+                  'custom': (None, 'dashboard')}
+
+def reminder_day(v):
+    try:
+        d = int(v)
+    except (TypeError, ValueError):
+        return None
+    return d if 1 <= d <= 28 else None
+
 @app.route('/api/reminders', methods=['GET'])
 @require_auth('landlord')
 def list_reminders():
     lp=get_landlord_profile(g.current_user['id'])
-    return ok(query("SELECT * FROM reminders WHERE landlord_id=%s ORDER BY day_of_month",(lp['id'],)))
+    return ok(query("SELECT * FROM reminders WHERE landlord_id=%s ORDER BY day_of_month,id",(lp['id'],)))
 
 @app.route('/api/reminders', methods=['POST'])
 @require_auth('landlord')
 def create_reminder():
     lp=get_landlord_profile(g.current_user['id']); data=request.get_json() or {}
-    title=(data.get('title') or '').strip(); reminder_type=data.get('reminder_type','custom'); day_of_month=data.get('day_of_month')
-    if not title or not day_of_month: return err('Title and day required')
-    if not (1<=int(day_of_month)<=28): return err('Day must be 1–28')
-    rid,_=execute("INSERT INTO reminders (landlord_id,title,reminder_type,day_of_month) VALUES (%s,%s,%s,%s)",(lp['id'],title,reminder_type,day_of_month))
+    reminder_type=data.get('reminder_type') or 'custom'
+    if reminder_type not in REMINDER_TYPES: return err('Unknown reminder type')
+    title=(data.get('title') or REMINDER_TYPES[reminder_type][0] or '').strip()[:255]
+    day=reminder_day(data.get('day_of_month'))
+    if not title: return err('Title required')
+    if not day: return err('Day must be 1–28')
+    rid,_=execute("INSERT INTO reminders (landlord_id,title,reminder_type,day_of_month,is_active) VALUES (%s,%s,%s,%s,%s)",
+                  (lp['id'],title,reminder_type,day,0 if data.get('is_active') is False else 1))
     return ok({'reminder_id':rid},status=201)
+
+@app.route('/api/reminders/<int:rid>', methods=['PATCH'])
+@require_auth('landlord')
+def update_reminder(rid):
+    lp=get_landlord_profile(g.current_user['id']); data=request.get_json() or {}
+    if not query("SELECT 1 FROM reminders WHERE id=%s AND landlord_id=%s",(rid,lp['id']),fetchone=True):
+        return err('Not found',404)
+    sets, vals = [], []
+    if 'day_of_month' in data:
+        day=reminder_day(data['day_of_month'])
+        if not day: return err('Day must be 1–28')
+        sets.append('day_of_month=%s'); vals.append(day)
+    if 'is_active' in data:
+        sets.append('is_active=%s'); vals.append(1 if data['is_active'] else 0)
+    if 'title' in data:
+        title=(data.get('title') or '').strip()[:255]
+        if not title: return err('Title required')
+        sets.append('title=%s'); vals.append(title)
+    if sets:
+        execute(f"UPDATE reminders SET {','.join(sets)} WHERE id=%s",(*vals,rid))
+    return ok(msg='Saved')
 
 @app.route('/api/reminders/<int:rid>', methods=['DELETE'])
 @require_auth('landlord')
@@ -2781,6 +2870,122 @@ def delete_reminder(rid):
     lp=get_landlord_profile(g.current_user['id'])
     execute("DELETE FROM reminders WHERE id=%s AND landlord_id=%s",(rid,lp['id']))
     return ok(msg='Deleted')
+
+
+# ── Bill reminders to tenants: per property and bill type ──
+REMINDER_BILL_TYPES = [('rent', 'rent_billing'), ('water', 'water_billing'),
+                       ('electricity', 'electricity_billing'), ('other', 'other_charges')]
+BEFORE_DAYS = {1, 2, 3, 5, 7, 10}
+OVERDUE_EVERY = {1, 2, 3, 7, 14}
+
+def pick_days(v, allowed):
+    """None/''/0 -> None (off); otherwise one of the allowed day counts (else ValueError)."""
+    if v in (None, '', 0, '0'): return None
+    v = int(v)
+    if v not in allowed: raise ValueError
+    return v
+
+@app.route('/api/tenant-reminders', methods=['GET'])
+@require_auth('landlord')
+def list_tenant_reminders():
+    """Every property with the bill types it uses and the saved rule for each."""
+    lp=get_landlord_profile(g.current_user['id'])
+    props=query("SELECT id,name,features FROM properties WHERE landlord_id=%s AND is_active=1 AND deleted_at IS NULL ORDER BY name",(lp['id'],))
+    rules=query("""SELECT r.* FROM tenant_reminder_rules r JOIN properties p ON p.id=r.property_id
+                   WHERE p.landlord_id=%s""",(lp['id'],))
+    by={(r['property_id'],r['bill_type']):r for r in rules}
+    out=[]
+    for p in props:
+        f=property_features(p['features'])
+        types=[]
+        for t,feat in REMINDER_BILL_TYPES:
+            if not f[feat]: continue
+            r=by.get((p['id'],t)) or {}
+            types.append({'bill_type':t,'days_before':r.get('days_before'),'on_due_day':bool(r.get('on_due_day')),
+                          'overdue_every':r.get('overdue_every')})
+        out.append({'property_id':p['id'],'name':p['name'],'types':types})
+    return ok(out)
+
+@app.route('/api/tenant-reminders/<int:pid>', methods=['PUT'])
+@require_auth('landlord')
+def save_tenant_reminders(pid):
+    lp=get_landlord_profile(g.current_user['id']); data=request.get_json() or {}
+    if not query("SELECT 1 FROM properties WHERE id=%s AND landlord_id=%s AND deleted_at IS NULL",(pid,lp['id']),fetchone=True):
+        return err('Property not found',404)
+    rules=data.get('types')
+    if not isinstance(rules,list): return err('types required')
+    valid=dict(REMINDER_BILL_TYPES)
+    try:
+        rows=[(r['bill_type'],pick_days(r.get('days_before'),BEFORE_DAYS),1 if r.get('on_due_day') else 0,
+               pick_days(r.get('overdue_every'),OVERDUE_EVERY)) for r in rules if r.get('bill_type') in valid]
+    except (ValueError, TypeError, KeyError, AttributeError):
+        return err('Pick the reminder days from the list')
+    for t,before,due,every in rows:
+        execute("""INSERT INTO tenant_reminder_rules (property_id,bill_type,days_before,on_due_day,overdue_every)
+                   VALUES (%s,%s,%s,%s,%s) ON DUPLICATE KEY UPDATE days_before=VALUES(days_before),
+                   on_due_day=VALUES(on_due_day),overdue_every=VALUES(overdue_every)""",(pid,t,before,due,every))
+    return ok(msg='Saved')
+
+
+# ── Daily job (tools/daily_jobs.py, run by cron every hour) ──
+def mark_overdue_bills(today):
+    _, n = execute("UPDATE bills SET status='overdue' WHERE status='pending' AND due_date<%s", (today,))
+    return n
+
+def send_landlord_reminders(now):
+    """Reminders whose day is today, once per day."""
+    sent = 0
+    for r in query("""SELECT r.*, lp.user_id FROM reminders r JOIN landlord_profiles lp ON lp.id=r.landlord_id
+            JOIN users u ON u.id=lp.user_id
+            WHERE r.is_active=1 AND r.day_of_month=%s AND u.deleted_at IS NULL
+              AND (r.last_sent_at IS NULL OR DATE(r.last_sent_at)<%s)""", (now.day, now.date())):
+        _, claimed = execute("UPDATE reminders SET last_sent_at=%s WHERE id=%s AND (last_sent_at IS NULL OR DATE(last_sent_at)<%s)",
+                             (now, r['id'], now.date()))
+        if not claimed:
+            continue   # another run got it
+        page = REMINDER_TYPES.get(r['reminder_type'], (None, 'dashboard'))[1]
+        push_notification(r['user_id'], f"⏰ {r['title']}", 'Your monthly reminder for today.', 'reminder', page)
+        sent += 1
+    return sent
+
+def send_tenant_bill_reminders(today):
+    """Unpaid bills whose property rule says to remind today. Skips bills with a payment
+    waiting for review. One reminder of each kind per bill per day."""
+    sent = 0
+    bills = query("""SELECT b.id, b.description, b.amount, b.due_date, tu.id AS tenant_user_id,
+            r.days_before, r.on_due_day, r.overdue_every
+        FROM bills b JOIN contracts c ON c.id=b.contract_id JOIN units un ON un.id=c.unit_id
+        JOIN properties p ON p.id=un.property_id
+        JOIN tenant_reminder_rules r ON r.property_id=p.id AND r.bill_type=b.bill_type
+        JOIN tenant_profiles tp ON tp.id=c.tenant_id JOIN users tu ON tu.id=tp.user_id
+        WHERE b.status IN ('pending','overdue') AND c.status IN ('active','move_out_pending')
+          AND p.deleted_at IS NULL AND tu.deleted_at IS NULL
+          AND NOT EXISTS (SELECT 1 FROM payments py WHERE py.bill_id=b.id AND py.status='pending')""")
+    for b in bills:
+        days = (b['due_date'] - today).days
+        if b['days_before'] and days == b['days_before']:
+            kind, body = 'before', f"Due in {days} day{'s' if days > 1 else ''}, on {b['due_date']:%b %d}."
+        elif b['on_due_day'] and days == 0:
+            kind, body = 'due', 'Due today.'
+        elif b['overdue_every'] and days < 0 and (-days) % b['overdue_every'] == 0:
+            kind, body = 'overdue', f"Overdue since {b['due_date']:%b %d}. Please pay as soon as you can."
+        else:
+            continue
+        _, new = execute("INSERT IGNORE INTO bill_reminders_sent (bill_id,kind,sent_on) VALUES (%s,%s,%s)", (b['id'], kind, today))
+        if not new:
+            continue
+        push_notification(b['tenant_user_id'], f"Reminder: {b['description']} — ₱{float(b['amount']):,.2f}",
+                          body + ' Tap to pay in the app.', 'bill')
+        sent += 1
+    return sent
+
+def run_daily_jobs(now=None):
+    now = now or local_now()
+    out = {'overdue_marked': mark_overdue_bills(now.date())}
+    if now.hour >= 8:   # nobody gets reminders in the middle of the night
+        out['landlord_reminders'] = send_landlord_reminders(now)
+        out['tenant_reminders'] = send_tenant_bill_reminders(now.date())
+    return out
 
 
 # ════════════════════════════════════════════════════════════
@@ -2864,7 +3069,9 @@ def landlord_dashboard():
     unread_threads=query("SELECT COUNT(*) AS cnt FROM message_threads WHERE landlord_id=%s AND is_read_landlord=0",
                          (g.current_user['id'],),fetchone=True)
     due_reminders=query("SELECT * FROM reminders WHERE landlord_id=%s AND day_of_month=%s AND is_active=1",
-                        (lp['id'],datetime.now().day))
+                        (lp['id'],local_now().day))
+    for r in due_reminders:
+        r['page']=REMINDER_TYPES.get(r['reminder_type'],(None,'dashboard'))[1]
     ann=query("SELECT COUNT(*) AS cnt FROM announcements WHERE landlord_id=%s AND is_active=1", (lp['id'],), fetchone=True)
     return ok({'summary':summary,'recent_payments':recent_payments,'to_review':to_review,'landlord_code':lp['landlord_code'],
                'due_reminders':due_reminders,

@@ -63,6 +63,11 @@ fi
 echo "==> Restarting app"
 ssh "${SSH_OPTS[@]}" "$SSH_HOST" "mkdir -p ~/$APP_ROOT/tmp && touch ~/$APP_ROOT/tmp/restart.txt"
 
+echo "==> Hourly jobs (cron: overdue bills + reminders)"
+# Replaces our own line only; other cron jobs (SSL renewal) are kept
+CRON_LINE='7 * * * * cd $HOME/'"$APP_ROOT"' && $HOME/'"$VENV"'/python tools/daily_jobs.py >> $HOME/'"$APP_ROOT"'/daily_jobs.log 2>&1'
+ssh "${SSH_OPTS[@]}" "$SSH_HOST" "(crontab -l 2>/dev/null | grep -v 'tools/daily_jobs.py'; echo '$CRON_LINE') | crontab -"
+
 echo "==> Health check"
 sleep 3
 curl -fsS -m 30 "$HEALTH_URL" && echo

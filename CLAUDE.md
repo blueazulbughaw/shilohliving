@@ -49,7 +49,19 @@ Don't edit files directly on the server — the next deploy would overwrite them
 - **Menu:** landlords have a "Generate Bills" group (Monthly Rent → `/api/bills/monthly-preview`
   + `generate-monthly` with a month and picked contracts, due on `landlord_profiles.rent_due_day`;
   Water Bills). Units live inside each property on "Properties & Units" (no separate page).
-  "Account" (name, phone, business name, email, password) is separate from "Settings".
+  Settings, Account and Billing & Plan sit at the bottom of the menu (`bottom: true` in `buildNav`);
+  Help & Support opens from Settings (`under:` — in `NAV` but not in the menu).
+- **Reminders:** the landlord's own monthly reminders (`reminders`: read meters, generate water
+  bills, generate rent, custom) are in Settings → My Reminders. Bill reminders to tenants are set
+  per property and bill type on "Announcements & Reminders" (`tenant_reminder_rules`: days before,
+  on the due date, every N days while unpaid). Both are sent by `tools/daily_jobs.py`, which cron
+  runs hourly on the server (installed by `deploy.sh`, log in `~/shilohliving_hub/daily_jobs.log`):
+  it marks unpaid bills past due as `overdue` and, from 8 AM local time (`APP_UTC_OFFSET`, default 8 =
+  Philippines; the server is on US time), sends each reminder once a day (`bill_reminders_sent`).
+- **Deleting a bill** (tenant profile) is for mistakes: refused once a payment is approved or waiting
+  for review. A deleted water bill's reading returns to its session, which reopens (`draft`) so the
+  reading can be fixed and billed again; already-billed readings stay locked. "Print bills" on a
+  water session gives one PDF with a page per bill (`pdfs.bills_pdf`).
 - **Deleting** asks first, always: `confirmAction()` in `app.js` (its own layer above pop-ups;
   big deletes make you type the name). Accounts and properties are soft-deleted into the admin's
   **Recycle Bin** (`users.deleted_at`, `properties.deleted_at`, restorable); records are never
