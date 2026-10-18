@@ -356,7 +356,7 @@ def log_action(action, table_name=None, record_id=None, description=None):
 NOTIF_TYPES = {'bill', 'payment', 'message', 'reminder', 'system', 'announcement', 'contract', 'support'}
 # Which page a notification opens (in the bell and from a phone notification), by role
 NOTIF_PAGES = {
-    'landlord': {'bill': 'bills', 'payment': 'payments', 'message': 'messages', 'contract': 'contracts',
+    'landlord': {'bill': 'bills', 'payment': 'dashboard', 'message': 'messages', 'contract': 'tenants',
                  'announcement': 'announcements', 'support': 'support', 'system': 'tenants', 'reminder': 'reminders'},
     'tenant':   {'bill': 't-bills', 'payment': 't-bills', 'message': 't-messages', 'contract': 't-contract',
                  'announcement': 't-announcements', 'support': 't-support', 'system': 't-dashboard'},
@@ -607,6 +607,7 @@ def login():
     if not user or not check_password(password, user['password_hash']):
         record_failure(email)
         return err('Invalid email or password', 401)
+    if user.get('deleted_at'): return err('This account was deleted. Contact support if this is a mistake.', 403)
     if not user['is_active']: return err('Account suspended', 403)
     if not bool(user.get('email_verified', 0)):
         return err('Please verify your email before logging in. Check your inbox for the verification link.', 403)
@@ -1288,7 +1289,10 @@ def update_property(pid):
 @require_auth('landlord')
 def delete_property(pid):
     lp=get_landlord_profile(g.current_user['id'])
-    execute("UPDATE properties SET is_active=0 WHERE id=%s AND landlord_id=%s",(pid,lp['id']))
+    info=property_delete_info(pid)
+    if not info or info['landlord_id']!=lp['id']: return err('Not found',404)
+    if info['blocked']: return err(info['blocked'],409)
+    delete_property_now(pid)
     return ok(msg='Deleted')
 
 
@@ -1932,7 +1936,9 @@ def tenant_board():
                c.monthly_rent, c.deposit, c.tenant_ack, c.contract_doc_url, c.move_out_date,
                tp.id AS tenant_id, u.id AS user_id, u.full_name, u.email, u.phone,
                (SELECT COALESCE(SUM(b.amount),0) FROM bills b WHERE b.contract_id=c.id AND b.status!='paid') AS unpaid,
-               (SELECT COUNT(*) FROM bills b WHERE b.contract_id=c.id AND b.status='overdue') AS overdue
+               (SELECT COUNT(*) FROM bills b WHERE b.contract_id=c.id AND b.status='overdue') AS overdue,
+               (SELECT COUNT(*) FROM payments py JOIN bills b ON b.id=py.bill_id
+                 WHERE b.contract_id=c.id AND py.status='pending') AS payments_to_review
         FROM contracts c JOIN tenant_profiles tp ON tp.id=c.tenant_id JOIN users u ON u.id=tp.user_id
         JOIN units un ON un.id=c.unit_id JOIN properties p ON p.id=un.property_id
         WHERE p.landlord_id=%s AND c.status IN ('active','move_out_pending') ORDER BY c.start_date""", (lp['id'],))
@@ -1983,7 +1989,8 @@ def tenant_profile(tp_id):
     if not link: return err('Tenant not found', 404)
     scope = """FROM contracts c JOIN units un ON un.id=c.unit_id JOIN properties p ON p.id=un.property_id
                WHERE c.tenant_id=%s AND p.landlord_id=%s"""
-    contracts = query(f"""SELECT c.*, un.unit_number, p.name AS property_name {scope}
+    contracts = query(f"""SELECT c.*, un.unit_number, p.name AS property_name, p.id AS property_id,
+               (SELECT m.repair_proof_url FROM move_out_checklists m WHERE m.contract_id=c.id) AS repair_proof_url {scope}
                           ORDER BY c.start_date DESC""", (tp_id, lp['id']))
     bills = query(f"""SELECT b.*, un.unit_number, p.name AS property_name,
                py.id AS payment_id, py.status AS payment_status, py.amount_paid, py.paid_at,
@@ -1992,6 +1999,7 @@ def tenant_profile(tp_id):
         JOIN contracts c ON c.id=b.contract_id JOIN units un ON un.id=c.unit_id JOIN properties p ON p.id=un.property_id
         WHERE c.tenant_id=%s AND p.landlord_id=%s ORDER BY b.due_date DESC""", (tp_id, lp['id']))
     payments = query(f"""SELECT py.*, b.description AS bill_desc, b.bill_type, b.amount AS bill_amount, b.due_date,
+               b.bill_month, b.bill_year, un.unit_number, p.name AS property_name,
                rv.full_name AS reviewed_by_name
         FROM payments py JOIN bills b ON b.id=py.bill_id
         JOIN contracts c ON c.id=b.contract_id JOIN units un ON un.id=c.unit_id JOIN properties p ON p.id=un.property_id
@@ -2732,12 +2740,19 @@ def landlord_dashboard():
         JOIN tenant_profiles tp ON tp.id=c.tenant_id JOIN users u ON u.id=tp.user_id
         JOIN units un ON un.id=c.unit_id JOIN properties p ON p.id=un.property_id
         WHERE p.landlord_id=%s ORDER BY py.paid_at DESC LIMIT 5""",(lp['id'],))
+    to_review=query("""SELECT py.id,py.amount_paid,py.paid_at,py.proof_url,u.full_name AS tenant_name,tp.id AS tenant_id,
+               b.description AS bill_desc,b.bill_type,b.bill_month,b.bill_year,b.amount AS bill_amount,
+               un.unit_number,p.name AS property_name
+        FROM payments py JOIN bills b ON b.id=py.bill_id JOIN contracts c ON c.id=b.contract_id
+        JOIN tenant_profiles tp ON tp.id=c.tenant_id JOIN users u ON u.id=tp.user_id
+        JOIN units un ON un.id=c.unit_id JOIN properties p ON p.id=un.property_id
+        WHERE p.landlord_id=%s AND py.status='pending' ORDER BY py.paid_at""",(lp['id'],))
     unread_threads=query("SELECT COUNT(*) AS cnt FROM message_threads WHERE landlord_id=%s AND is_read_landlord=0",
                          (g.current_user['id'],),fetchone=True)
     due_reminders=query("SELECT * FROM reminders WHERE landlord_id=%s AND day_of_month=%s AND is_active=1",
                         (lp['id'],datetime.now().day))
     ann=query("SELECT COUNT(*) AS cnt FROM announcements WHERE landlord_id=%s AND is_active=1", (lp['id'],), fetchone=True)
-    return ok({'summary':summary,'recent_payments':recent_payments,'landlord_code':lp['landlord_code'],
+    return ok({'summary':summary,'recent_payments':recent_payments,'to_review':to_review,'landlord_code':lp['landlord_code'],
                'due_reminders':due_reminders,
                'unread_threads':unread_threads['cnt'] if unread_threads else 0,
                'announcement_count': ann['cnt'] if ann else 0})
@@ -2789,8 +2804,8 @@ def tenant_dashboard():
 @require_auth('admin')
 def admin_stats():
     return ok({
-        'total_landlords':  query("SELECT COUNT(*) AS c FROM users WHERE role='landlord'",fetchone=True)['c'],
-        'total_tenants':    query("SELECT COUNT(*) AS c FROM users WHERE role='tenant'",fetchone=True)['c'],
+        'total_landlords':  query("SELECT COUNT(*) AS c FROM users WHERE role='landlord' AND deleted_at IS NULL",fetchone=True)['c'],
+        'total_tenants':    query("SELECT COUNT(*) AS c FROM users WHERE role='tenant' AND deleted_at IS NULL",fetchone=True)['c'],
         'total_properties': query("SELECT COUNT(*) AS c FROM properties WHERE is_active=1",fetchone=True)['c'],
         'total_units':      query("SELECT COUNT(*) AS c FROM units",fetchone=True)['c'],
         'active_contracts': query("SELECT COUNT(*) AS c FROM contracts WHERE status='active'",fetchone=True)['c'],
@@ -2806,7 +2821,7 @@ def admin_landlords():
         COUNT(DISTINCT p.id) AS properties,COUNT(DISTINCT tl.tenant_id) AS tenants
         FROM users u JOIN landlord_profiles lp ON lp.user_id=u.id
         LEFT JOIN properties p ON p.landlord_id=lp.id LEFT JOIN tenant_landlords tl ON tl.landlord_id=lp.id
-        WHERE u.role='landlord'
+        WHERE u.role='landlord' AND u.deleted_at IS NULL
         GROUP BY u.id,lp.landlord_code,lp.business_name,lp.trial_ends_at,lp.paid_until,lp.billing_exempt
         ORDER BY u.created_at DESC""")
     for r in rows:
@@ -2883,7 +2898,7 @@ def admin_tenants():
         FROM users u JOIN tenant_profiles tp ON tp.user_id=u.id
         LEFT JOIN tenant_landlords tl ON tl.tenant_id=tp.id LEFT JOIN landlord_profiles lp ON lp.id=tl.landlord_id
         LEFT JOIN users lu ON lu.id=lp.user_id
-        WHERE u.role='tenant' GROUP BY u.id ORDER BY u.created_at DESC"""))
+        WHERE u.role='tenant' AND u.deleted_at IS NULL GROUP BY u.id ORDER BY u.created_at DESC"""))
 
 @app.route('/api/admin/users/<int:uid>/suspend', methods=['PATCH'])
 @require_auth('admin')
@@ -2894,8 +2909,141 @@ def suspend_user(uid):
 @app.route('/api/admin/users/<int:uid>/activate', methods=['PATCH'])
 @require_auth('admin')
 def activate_user(uid):
-    execute("UPDATE users SET is_active=1 WHERE id=%s",(uid,))
+    execute("UPDATE users SET is_active=1 WHERE id=%s AND deleted_at IS NULL",(uid,))
     return ok(msg='Activated')
+
+
+# ════════════════════════════════════════════════════════════
+# DELETING (Recycle Bin) — accounts and properties
+# ════════════════════════════════════════════════════════════
+# Deleting hides an account or property everywhere and signs the person out; it stays in the
+# admin's Recycle Bin and can be restored. Records (bills, payments, contracts) are never erased.
+# Blocked while there are active contracts, so no unit is left "occupied" by someone deleted.
+
+def property_delete_info(pid):
+    p = query("SELECT id, name, landlord_id FROM properties WHERE id=%s AND is_active=1", (pid,), fetchone=True)
+    if not p:
+        return None
+    counts = query("""SELECT COUNT(DISTINCT un.id) AS units,
+               COUNT(DISTINCT CASE WHEN c.status IN ('active','move_out_pending') THEN c.id END) AS active_contracts,
+               COUNT(DISTINCT CASE WHEN c.status IN ('active','move_out_pending') THEN c.tenant_id END) AS tenants
+        FROM units un LEFT JOIN contracts c ON c.unit_id=un.id WHERE un.property_id=%s""", (pid,), fetchone=True)
+    blocked = (f"{p['name']} still has {counts['active_contracts']} active contract(s). Finish those move-outs first."
+               if counts['active_contracts'] else None)
+    return {'type': 'property', 'id': pid, 'name': p['name'], 'landlord_id': p['landlord_id'],
+            'effects': [f"{counts['units']} unit(s) will be hidden",
+                        'Its bills, payments and contracts stay in your records'],
+            'blocked': blocked}
+
+def delete_property_now(pid):
+    execute("UPDATE properties SET is_active=0, deleted_at=NOW(), deleted_by=%s WHERE id=%s",
+            (g.current_user['id'], pid))
+    log_action('DELETE_PROPERTY', 'properties', pid)
+
+def user_delete_info(uid):
+    u = query("SELECT id, full_name, email, role FROM users WHERE id=%s AND deleted_at IS NULL AND role!='admin'",
+              (uid,), fetchone=True)
+    if not u:
+        return None
+    if u['role'] == 'tenant':
+        c = query("""SELECT COUNT(DISTINCT tl.landlord_id) AS landlords,
+                   (SELECT COUNT(*) FROM contracts c WHERE c.tenant_id=tp.id AND c.status IN ('active','move_out_pending')) AS active,
+                   (SELECT COUNT(*) FROM bills b JOIN contracts c ON c.id=b.contract_id WHERE c.tenant_id=tp.id) AS bills
+            FROM tenant_profiles tp LEFT JOIN tenant_landlords tl ON tl.tenant_id=tp.id AND tl.is_active=1
+            WHERE tp.user_id=%s GROUP BY tp.id""", (uid,), fetchone=True) or {'landlords': 0, 'active': 0, 'bills': 0}
+        effects = ["They're signed out and can't sign in", f"Removed from {c['landlords']} landlord(s)' current tenants",
+                   f"Their {c['bills']} bill(s), payments and contracts stay in their landlords' records"]
+        blocked = (f"{u['full_name']} still has {c['active']} active contract(s). Their landlord has to finish the move-out first."
+                   if c['active'] else None)
+    else:
+        c = query("""SELECT (SELECT COUNT(*) FROM properties p WHERE p.landlord_id=lp.id AND p.is_active=1) AS props,
+                   (SELECT COUNT(*) FROM tenant_landlords tl WHERE tl.landlord_id=lp.id AND tl.is_active=1) AS tenants,
+                   (SELECT COUNT(*) FROM contracts c JOIN units un ON un.id=c.unit_id JOIN properties p ON p.id=un.property_id
+                     WHERE p.landlord_id=lp.id AND c.status IN ('active','move_out_pending')) AS active
+            FROM landlord_profiles lp WHERE lp.user_id=%s""", (uid,), fetchone=True) or {'props': 0, 'tenants': 0, 'active': 0}
+        effects = ["They're signed out and can't sign in", f"Their {c['props']} property(ies) are hidden",
+                   f"{c['tenants']} linked tenant(s) lose access to this landlord"]
+        blocked = (f"{u['full_name']} still has {c['active']} active contract(s). Suspend the account instead, "
+                   "or have them finish those move-outs first." if c['active'] else None)
+    return {'type': 'user', 'id': uid, 'role': u['role'], 'name': u['full_name'], 'email': u['email'],
+            'effects': effects, 'blocked': blocked}
+
+@app.route('/api/properties/<int:pid>/delete-preview', methods=['GET'])
+@require_auth('landlord')
+def property_delete_preview(pid):
+    info = property_delete_info(pid)
+    if not info or info['landlord_id'] != get_landlord_profile(g.current_user['id'])['id']:
+        return err('Not found', 404)
+    return ok(info)
+
+@app.route('/api/admin/delete-preview/<kind>/<int:rid>', methods=['GET'])
+@require_auth('admin')
+def admin_delete_preview(kind, rid):
+    info = property_delete_info(rid) if kind == 'property' else user_delete_info(rid) if kind == 'user' else None
+    return ok(info) if info else err('Not found', 404)
+
+@app.route('/api/admin/users/<int:uid>', methods=['DELETE'])
+@require_auth('admin')
+def admin_delete_user(uid):
+    info = user_delete_info(uid)
+    if not info: return err('Not found', 404)
+    if info['blocked']: return err(info['blocked'], 409)
+    execute("""UPDATE users SET deleted_at=NOW(), deleted_by=%s, is_active=0, session_version=session_version+1
+               WHERE id=%s""", (g.current_user['id'], uid))
+    if info['role'] == 'tenant':
+        execute("""UPDATE tenant_landlords tl JOIN tenant_profiles tp ON tp.id=tl.tenant_id
+                   SET tl.is_active=0, tl.left_at=COALESCE(tl.left_at, NOW()) WHERE tp.user_id=%s AND tl.is_active=1""", (uid,))
+    else:
+        execute("""UPDATE tenant_landlords tl JOIN landlord_profiles lp ON lp.id=tl.landlord_id
+                   SET tl.is_active=0, tl.left_at=COALESCE(tl.left_at, NOW()) WHERE lp.user_id=%s AND tl.is_active=1""", (uid,))
+    execute("DELETE FROM push_subscriptions WHERE user_id=%s", (uid,))
+    log_action('DELETE_USER', 'users', uid, f"{info['role']} {info['email']}")
+    return ok(msg=f"{info['name']} moved to the Recycle Bin")
+
+@app.route('/api/admin/properties', methods=['GET'])
+@require_auth('admin')
+def admin_properties():
+    return ok(query("""SELECT p.id, p.name, p.address, p.city, p.created_at, u.full_name AS landlord_name, lp.business_name,
+               (SELECT COUNT(*) FROM units un WHERE un.property_id=p.id) AS units,
+               (SELECT COUNT(*) FROM contracts c JOIN units un ON un.id=c.unit_id
+                 WHERE un.property_id=p.id AND c.status IN ('active','move_out_pending')) AS active_contracts
+        FROM properties p JOIN landlord_profiles lp ON lp.id=p.landlord_id JOIN users u ON u.id=lp.user_id
+        WHERE p.is_active=1 AND u.deleted_at IS NULL ORDER BY u.full_name, p.name"""))
+
+@app.route('/api/admin/properties/<int:pid>', methods=['DELETE'])
+@require_auth('admin')
+def admin_delete_property(pid):
+    info = property_delete_info(pid)
+    if not info: return err('Not found', 404)
+    if info['blocked']: return err(info['blocked'], 409)
+    delete_property_now(pid)
+    return ok(msg=f"{info['name']} moved to the Recycle Bin")
+
+@app.route('/api/admin/recycle-bin', methods=['GET'])
+@require_auth('admin')
+def recycle_bin():
+    users = query("""SELECT u.id, u.full_name AS name, u.email, u.role, u.deleted_at, d.full_name AS deleted_by_name
+                     FROM users u LEFT JOIN users d ON d.id=u.deleted_by WHERE u.deleted_at IS NOT NULL ORDER BY u.deleted_at DESC""")
+    props = query("""SELECT p.id, p.name, p.address, p.deleted_at, u.full_name AS landlord_name, d.full_name AS deleted_by_name
+                     FROM properties p JOIN landlord_profiles lp ON lp.id=p.landlord_id JOIN users u ON u.id=lp.user_id
+                     LEFT JOIN users d ON d.id=p.deleted_by WHERE p.is_active=0 ORDER BY p.deleted_at DESC""")
+    return ok({'users': users, 'properties': props})
+
+@app.route('/api/admin/recycle-bin/restore', methods=['POST'])
+@require_auth('admin')
+def restore_from_bin():
+    """Brings an account or property back. Tenants who were linked rejoin with the landlord's code."""
+    data = request.get_json() or {}
+    rid = int(data.get('id') or 0)
+    if data.get('type') == 'user':
+        _, n = execute("UPDATE users SET deleted_at=NULL, deleted_by=NULL, is_active=1 WHERE id=%s AND deleted_at IS NOT NULL", (rid,))
+    elif data.get('type') == 'property':
+        _, n = execute("UPDATE properties SET is_active=1, deleted_at=NULL, deleted_by=NULL WHERE id=%s AND is_active=0", (rid,))
+    else:
+        return err('Unknown type')
+    if not n: return err('Not in the Recycle Bin', 404)
+    log_action('RESTORE_' + data['type'].upper(), 'users' if data['type'] == 'user' else 'properties', rid)
+    return ok(msg='Restored')
 
 @app.route('/api/admin/audit-logs', methods=['GET'])
 @require_auth('admin')

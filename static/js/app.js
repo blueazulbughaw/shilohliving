@@ -593,13 +593,11 @@ function buildNav() {
     { id: 'dashboard', icon: '📊', label: 'Dashboard', fn: loadLandlordDashboard },
     { id: 'properties', icon: '🏢', label: 'Properties & Units', fn: loadProperties },
     { id: 'tenants', icon: '👥', label: 'Tenants', fn: loadTenants },
-    { id: 'contracts', icon: '📋', label: 'Contracts', fn: loadContracts },
     { group: 'gen-bills', icon: '⚡', label: 'Generate Bills', children: [
       { id: 'gen-rent', icon: '🏠', label: 'Monthly Rent', fn: loadGenerateRent },
       { id: 'water', icon: '💧', label: 'Water Bills', fn: loadWaterBilling },
     ] },
     { id: 'bills', icon: '💰', label: 'Bills', fn: loadBills },
-    { id: 'payments', icon: '💳', label: 'Payments', fn: loadPayments },
     { id: 'announcements', icon: '📣', label: 'Announcements', fn: loadLandlordAnnouncements },
     { id: 'messages', icon: '💬', label: 'Messages', fn: loadMessages },
     { id: 'reminders', icon: '🔔', label: 'Reminders', fn: loadReminders },
@@ -623,10 +621,12 @@ function buildNav() {
     { id: 'admin-stats', icon: '📊', label: 'Overview', fn: loadAdminStats },
     { id: 'admin-landlords', icon: '🏠', label: 'Landlords', fn: loadAdminLandlords },
     { id: 'admin-tenants', icon: '👥', label: 'Tenants', fn: loadAdminTenants },
+    { id: 'admin-properties', icon: '🏢', label: 'Properties', fn: loadAdminProperties },
     { id: 'admin-invites', icon: '✉️', label: 'Invites', fn: loadAdminInvites },
     { id: 'admin-tickets', icon: '🎫', label: 'Support Tickets', fn: loadAdminTickets },
     { id: 'admin-chat', icon: '💬', label: 'Live Chat', fn: loadAdminChat },
     { id: 'admin-audit', icon: '📝', label: 'Audit Log', fn: loadAdminAudit },
+    { id: 'admin-bin', icon: '🗑️', label: 'Recycle Bin', fn: loadAdminBin },
     { id: 'account', icon: '👤', label: 'Account', fn: loadAccount },
   ];
   NAV = {};
@@ -660,8 +660,11 @@ function buildNav() {
   if (!opened && !restoreRoute() && items[0]) goPage(items[0].id);
 }
 // Opens a page by id (sidebar, notifications, quick actions)
+// Pages that moved (old notifications and bookmarks still point at them)
+const MOVED_PAGES = { payments: 'dashboard', contracts: 'tenants', units: 'properties' };
 function goPage(id) {
-  const item = NAV[id];
+  const item = NAV[id] || NAV[MOVED_PAGES[id]];
+  if (!NAV[id] && item) id = MOVED_PAGES[id];
   if (item) showView(id, item.fn);
 }
 
@@ -681,7 +684,7 @@ function restoreRoute() {
     goPage(r.parent); r.open(parseInt(m[2]));
     return true;
   }
-  if (!NAV[m[1]]) return false;
+  if (!NAV[m[1]] && !NAV[MOVED_PAGES[m[1]]]) return false;
   goPage(m[1]);
   return true;
 }
@@ -883,6 +886,157 @@ async function uploadFile(kind, accept, statusEl) {
 }
 
 // ═══════════════════════════════════════════════
+// CONFIRMATIONS — asked before anything is deleted (and other big actions). Shown above any open
+// pop-up. For big deletes the person types the name first, like HubSpot.
+// ═══════════════════════════════════════════════
+let _confirmDone = null;
+function confirmAction({ title, message = '', effects = [], typeToConfirm = null, okText = 'Delete', danger = true, blocked = null }) {
+  if (_confirmDone) _confirmDone(false);
+  return new Promise(resolve => {
+    const layer = document.getElementById('confirm-overlay');
+    const ok = document.getElementById('confirm-ok');
+    document.getElementById('confirm-title').textContent = title;
+    document.getElementById('confirm-body').innerHTML = `
+      ${message ? `<p>${esc(message)}</p>` : ''}
+      ${effects.length ? `<ul class="confirm-effects">${effects.map(e => `<li>${esc(e)}</li>`).join('')}</ul>` : ''}
+      ${blocked ? `<div class="warn-box">${esc(blocked)}</div>` : ''}
+      ${typeToConfirm && !blocked ? `<div class="form-group" style="margin-top:12px"><label>Type <strong class="no-caps">${esc(typeToConfirm)}</strong> to confirm</label>
+        <input type="text" id="confirm-input" autocomplete="off"/></div>` : ''}`;
+    ok.textContent = okText;
+    ok.className = 'btn ' + (danger ? 'btn-red' : 'btn-brand');
+    ok.hidden = !!blocked;
+    const input = document.getElementById('confirm-input');
+    const matches = () => !typeToConfirm || (input && input.value.trim().toLowerCase() === typeToConfirm.trim().toLowerCase());
+    ok.disabled = !matches();
+    if (input) { input.oninput = () => { ok.disabled = !matches(); }; setTimeout(() => input.focus(), 50); }
+    const done = answer => {
+      layer.classList.remove('open'); _confirmDone = null;
+      ok.onclick = null; document.getElementById('confirm-cancel').onclick = null; layer.onclick = null;
+      resolve(answer);
+    };
+    _confirmDone = done;
+    ok.onclick = () => { if (matches()) done(true); };
+    document.getElementById('confirm-cancel').textContent = blocked ? 'OK' : 'Cancel';
+    document.getElementById('confirm-cancel').onclick = () => done(false);
+    layer.onclick = e => { if (e.target === layer) done(false); };
+    layer.classList.add('open');
+  });
+}
+document.addEventListener('keydown', e => {
+  if (!_confirmDone) return;
+  if (e.key === 'Escape') { e.stopImmediatePropagation(); _confirmDone(false); }
+  if (e.key === 'Enter' && !document.getElementById('confirm-ok').disabled && !document.getElementById('confirm-ok').hidden) document.getElementById('confirm-ok').click();
+}, true);
+// Re-draws the screen that's showing (after an action inside a page, e.g. on a tenant's profile)
+function refreshView() { const en = _navEntries[_navIdx]; if (en) en.render(); }
+
+// ═══════════════════════════════════════════════
+// ADMIN — all properties, deleting, Recycle Bin
+// ═══════════════════════════════════════════════
+async function adminDeleteUser(id) {
+  try {
+    const info = await apiFetch(`/admin/delete-preview/user/${id}`);
+    const ok = await confirmAction({ title: `Delete ${info.role} ${info.name}?`, message: info.email, effects: info.effects,
+      blocked: info.blocked, typeToConfirm: info.name, okText: 'Delete' });
+    if (!ok) return;
+    await apiFetch(`/admin/users/${id}`, { method: 'DELETE' });
+    refreshView();
+  } catch (e) { alert(e.message); }
+}
+async function loadAdminProperties() {
+  const pg = document.getElementById('page-admin-properties'); pg.innerHTML = loadingHtml;
+  try {
+    const rows = await apiFetch('/admin/properties');
+    pg.innerHTML = `<div class="card"><div class="card-header"><h3>Properties (${rows.length})</h3></div>
+      <div class="table-wrap"><table><thead><tr><th>Property</th><th>Landlord</th><th>Units</th><th>Active contracts</th><th>Actions</th></tr></thead><tbody>
+      ${rows.map(r => `<tr><td><strong>${esc(r.name)}</strong><br><small class="muted-text">${esc(r.address)}${r.city ? ', ' + esc(r.city) : ''}</small></td>
+        <td>${esc(r.business_name || r.landlord_name)}</td><td>${esc(r.units)}</td><td>${esc(r.active_contracts)}</td>
+        <td><button class="btn btn-sm btn-red" onclick="adminDeleteProperty(${parseInt(r.id)})">Delete</button></td></tr>`).join('')}
+      </tbody></table></div></div>`;
+  } catch (e) { pg.innerHTML = errHtml(e); }
+}
+async function adminDeleteProperty(id) {
+  try {
+    const info = await apiFetch(`/admin/delete-preview/property/${id}`);
+    if (!await confirmAction({ title: `Delete property ${info.name}?`, effects: info.effects, blocked: info.blocked, typeToConfirm: info.name })) return;
+    await apiFetch(`/admin/properties/${id}`, { method: 'DELETE' });
+    refreshView();
+  } catch (e) { alert(e.message); }
+}
+async function loadAdminBin() {
+  const pg = document.getElementById('page-admin-bin'); pg.innerHTML = loadingHtml;
+  try {
+    const d = await apiFetch('/admin/recycle-bin');
+    const by = r => r.deleted_by_name ? ` by ${esc(r.deleted_by_name)}` : '';
+    pg.innerHTML = `<div class="card"><div class="card-header"><h3>🗑️ Recycle Bin</h3></div>
+        <p class="muted-text">Deleted accounts and properties. Their records were kept; restore brings them back.
+          Restored tenants rejoin their landlord with the landlord's code.</p></div>
+      <div class="card"><div class="card-header"><h3>Accounts (${d.users.length})</h3></div>
+        ${!d.users.length ? '<p class="muted-text">Nothing here.</p>' : d.users.map(u => `<div class="record">
+          <div class="record-top"><strong>${esc(u.name)}</strong>${badge(u.role)}</div>
+          <div class="record-meta">${esc(u.email)} · deleted ${fmtDateTime(u.deleted_at)}${by(u)}</div>
+          <button class="btn btn-sm btn-brand" style="margin-top:6px" onclick="restoreItem('user', ${parseInt(u.id)}, ${jsArg(u.name)})">↩ Restore</button></div>`).join('')}
+      </div>
+      <div class="card"><div class="card-header"><h3>Properties (${d.properties.length})</h3></div>
+        ${!d.properties.length ? '<p class="muted-text">Nothing here.</p>' : d.properties.map(p => `<div class="record">
+          <div class="record-top"><strong>${esc(p.name)}</strong><span class="muted-text small">${esc(p.landlord_name)}</span></div>
+          <div class="record-meta">${esc(p.address)} · deleted ${p.deleted_at ? fmtDateTime(p.deleted_at) : '(before the Recycle Bin)'}${by(p)}</div>
+          <button class="btn btn-sm btn-brand" style="margin-top:6px" onclick="restoreItem('property', ${parseInt(p.id)}, ${jsArg(p.name)})">↩ Restore</button></div>`).join('')}
+      </div>`;
+  } catch (e) { pg.innerHTML = errHtml(e); }
+}
+async function restoreItem(type, id, name) {
+  if (!await confirmAction({ title: `Restore ${name}?`, message: type === 'user' ? 'They can sign in again.' : 'It shows up again for its landlord.', okText: 'Restore', danger: false })) return;
+  try { await apiFetch('/admin/recycle-bin/restore', { method: 'POST', body: JSON.stringify({ type, id }) }); refreshView(); }
+  catch (e) { alert(e.message); }
+}
+
+// ═══════════════════════════════════════════════
+// TENANT RECORDS — payments to review, files
+// ═══════════════════════════════════════════════
+const billPeriod = x => x.bill_month ? `${MONTHS[x.bill_month - 1]} ${x.bill_year}` : '';
+// "Electricity (September 2026)", but just "Monthly Rent — September 2026" when the name already says the month
+const forBill = x => esc(x.bill_desc) + (billPeriod(x) && !String(x.bill_desc || '').includes(billPeriod(x)) ? ' (' + billPeriod(x) + ')' : '');
+function reviewRecord(p, showTenant) {
+  return `<div class="record">
+    <div class="record-top"><strong>${showTenant ? `<span class="link" onclick="openTenantProfile(${parseInt(p.tenant_id)})">${esc(p.tenant_name)}</span> · ` : ''}₱${fmt(p.amount_paid)}</strong>${badge('pending')}</div>
+    <div class="record-meta">For ${forBill(p)} · bill ₱${fmt(p.bill_amount)}
+      · ${esc(p.property_name)} Unit ${esc(p.unit_number)} · sent ${fmtDateTime(p.paid_at)}</div>
+    <div class="btn-group" style="margin-top:6px">
+      ${p.proof_url ? `<button class="btn btn-sm btn-outline" onclick="openDoc(${jsArg(p.proof_url)})">📎 Proof</button>` : ''}
+      <button class="btn btn-sm btn-green" onclick="reviewPayment(${parseInt(p.id)},'approve')">✓ Approve &amp; send receipt</button>
+      <button class="btn btn-sm btn-red" onclick="rejectPaymentModal(${parseInt(p.id)})">✗ Reject</button>
+    </div></div>`;
+}
+// Every file on a tenant's record, newest first: contracts, proofs, receipts, checklist, move-out
+function tenantFiles(data) {
+  const out = [];
+  const place = x => `${esc(x.property_name || '')}${x.unit_number ? ' Unit ' + esc(x.unit_number) : ''}`;
+  data.contracts.forEach(c => {
+    if (c.contract_doc_url) out.push({ kind: 'contract', when: c.doc_uploaded_at || c.created_at, title: 'Signed contract', about: place(c), open: `openDoc(${jsArg(c.contract_doc_url)})` });
+    if (c.repair_proof_url) out.push({ kind: 'moveout', when: c.move_out_date || c.updated_at, title: 'Move-out repair receipts/photos', about: place(c), open: `openDoc(${jsArg(c.repair_proof_url)})` });
+  });
+  data.payments.forEach(p => {
+    const forWhat = `${forBill(p)} · ₱${fmt(p.amount_paid)}`;
+    if (p.proof_url) out.push({ kind: 'proof', when: p.paid_at, title: `Proof of payment${p.status !== 'approved' ? ' — ' + esc(p.status) : ''}`, about: forWhat, open: `openDoc(${jsArg(p.proof_url)})` });
+    if (p.status === 'approved') out.push({ kind: 'receipt', when: p.receipt_sent_at || p.reviewed_at, title: `Receipt ${esc(p.receipt_no || '')}`, about: forWhat, open: `openPdf('/api/payments/${parseInt(p.id)}/receipt.pdf')` });
+  });
+  ((data.checklist || {}).items || []).forEach(i => {
+    if (i.file_url) out.push({ kind: 'movein', when: i.submitted_at || i.reviewed_at, title: esc(i.label), about: 'Move-in checklist · ' + REQ_STATUS[i.status][0], open: `openDoc(${jsArg(i.file_url)})` });
+  });
+  return out;
+}
+const FILE_KINDS = [['all', 'All'], ['contract', 'Contracts'], ['proof', 'Proofs of payment'], ['receipt', 'Receipts'], ['movein', 'Move-in'], ['moveout', 'Move-out']];
+function filesSectionHtml() {
+  const files = sortedBy(tenantFiles(_profile.data).filter(f => _profile.fileKind === 'all' || f.kind === _profile.fileKind), 'when', _profile.sort.files);
+  return `<div class="chip-row">${FILE_KINDS.map(([k, l]) => `<button class="chip ${_profile.fileKind === k ? 'active' : ''}" onclick="setFileKind('${k}')">${l}</button>`).join('')}</div>
+    ${files.length ? files.map(f => `<div class="record clickable" onclick="${f.open}">
+      <div class="record-top"><strong>📄 ${f.title}</strong><span class="muted-text small">${fmtDate(f.when)}</span></div>
+      <div class="record-meta">${f.about}</div></div>`).join('') : '<p class="muted-text">No files.</p>'}`;
+}
+function setFileKind(k) { _profile.fileKind = k; document.getElementById('ps-files').innerHTML = filesSectionHtml(); }
+
+// ═══════════════════════════════════════════════
 // INVITE TENANTS — join code, link, QR (tap to share), printable poster
 // ═══════════════════════════════════════════════
 const joinUrl = code => `${location.origin}/join/${code}`;
@@ -974,7 +1128,7 @@ function printInvite() {
   w.document.close();
 }
 async function regenerateInviteCode() {
-  if (!confirm('Make a new code? The current code, link and any printed QR codes will stop working.')) return;
+  if (!await confirmAction({ title: 'Make a new join code?', message: 'The current code, link and any printed QR codes stop working. Tenants who already joined stay.', okText: 'Make New Code' })) return;
   try {
     const d = await apiFetch('/landlord/join-code', { method: 'POST', body: JSON.stringify({ regenerate: true }) });
     _invite.code = d.code;
@@ -1002,9 +1156,12 @@ async function loadLandlordDashboard() {
         ${stat(s.occupied_units || 0, 'Occupied', 'properties')}
         ${stat(s.vacant_units || 0, 'Vacant', 'properties')}
         ${stat(s.total_tenants || 0, 'Tenants', 'tenants')}
-        ${stat(s.pending_payments || 0, 'Payments to Review', 'payments')}
+        <div class="stat-card" role="button" onclick="document.getElementById('review-card').scrollIntoView({behavior:'smooth'})"><div class="value">${esc(s.pending_payments || 0)}</div><div class="label">Payments to Review</div></div>
         ${stat('₱' + fmt(s.outstanding_amount || 0), 'Unpaid Bills', 'bills')}
         ${stat(d.unread_threads || 0, 'Unread Messages', 'messages')}
+      </div>
+      <div class="card" id="review-card"><div class="card-header"><h3>💳 Payments to review (${(d.to_review || []).length})</h3></div>
+        ${(d.to_review || []).length ? d.to_review.map(p => reviewRecord(p, true)).join('') : '<p class="muted-text">Nothing to review. New proofs of payment show up here.</p>'}
       </div>
       <div class="card invite-card"><div class="card-header"><h3>👋 Invite Tenants</h3></div>
         <p class="muted-text">Tenants join you with your code, link or QR code — they can't register on their own.</p>
@@ -1026,7 +1183,7 @@ async function loadLandlordDashboard() {
             <button class="btn btn-brand" onclick="goPage('announcements')">📣 Send Announcement</button>
             <button class="btn btn-outline" onclick="goPage('messages')">💬 View Messages</button>
             <button class="btn btn-outline" onclick="goPage('bills')">💰 Manage Bills</button>
-            <button class="btn btn-outline" onclick="goPage('payments')">💳 Review Payments</button>
+            <button class="btn btn-outline" onclick="goPage('tenants')">👥 Tenants &amp; Records</button>
           </div>
         </div>
       </div>`;
@@ -1114,8 +1271,11 @@ async function savePropertySetup(propId) {
   } catch (e) { errEl.textContent = e.message; }
 }
 async function deleteProperty(id) {
-  if (!confirm('Delete this property? Its units will be hidden and its invite code will stop working.')) return;
-  try { await apiFetch('/properties/' + id, { method: 'DELETE' }); loadProperties(); } catch (e) { alert(e.message); }
+  try {
+    const info = await apiFetch(`/properties/${id}/delete-preview`);
+    if (!await confirmAction({ title: `Delete ${info.name}?`, effects: info.effects, blocked: info.blocked, typeToConfirm: info.name })) return;
+    await apiFetch('/properties/' + id, { method: 'DELETE' }); loadProperties();
+  } catch (e) { alert(e.message); }
 }
 
 // ═══════════════════════════════════════════════
@@ -1170,7 +1330,7 @@ function renderTenantBoard() {
   const tenantLine = (c) => `
     <details class="row-toggle">
       <summary><span class="row-main"><span class="row-unit">${esc(c._unit)}</span><span class="row-name">${esc(c.full_name)}</span></span>
-        <span class="row-flags">${checklistFlag(c.checklist)}${c.status === 'move_out_pending' ? '<span class="badge badge-orange">Moving out</span>' : ''}
+        <span class="row-flags">${c.payments_to_review > 0 ? `<span class="badge badge-yellow">💳 ${parseInt(c.payments_to_review)} to review</span>` : ''}${checklistFlag(c.checklist)}${c.status === 'move_out_pending' ? '<span class="badge badge-orange">Moving out</span>' : ''}
           ${c.overdue > 0 ? `<span class="badge badge-red">${parseInt(c.overdue)} overdue</span>` : ''}${chevron}</span></summary>
       <div class="row-body">
         <div class="field-grid">
@@ -1244,7 +1404,7 @@ function checklistFlag(cl) {
     <span class="badge ${done ? 'badge-green' : 'badge-gray'}" title="Move-in checklist">✓ ${cl.done}/${cl.total}</span>`;
 }
 async function archiveTenant(tpId) {
-  if (!confirm('Move this tenant to Past Tenants? Their records stay; they can no longer be messaged. They can rejoin with your code.')) return;
+  if (!await confirmAction({ title: 'Move to Past Tenants?', message: 'Their records stay; they can no longer be messaged. They can rejoin with your code.', okText: 'Move to Past Tenants' })) return;
   try { await apiFetch(`/landlord/tenants/${tpId}/archive`, { method: 'POST' }); loadTenants(); }
   catch (e) { alert(e.message); }
 }
@@ -1260,7 +1420,7 @@ async function loadTenantProfile(tpId) {
     const [data, checklist] = await Promise.all([apiFetch(`/landlord/tenants/${tpId}/profile`),
       apiFetch(`/landlord/tenants/${tpId}/checklist`).catch(() => null)]);
     data.checklist = checklist;
-    _profile = { data, sort: { contracts: 'desc', bills: 'desc', payments: 'desc', water: 'desc', threads: 'desc' }, billType: 'all' };
+    _profile = { data, sort: { contracts: 'desc', bills: 'desc', payments: 'desc', water: 'desc', threads: 'desc', files: 'desc' }, billType: 'all', fileKind: 'all' };
     renderTenantProfile();
   } catch (e) { pg.innerHTML = errHtml(e); }
 }
@@ -1284,14 +1444,11 @@ function profileSection(section) {
   if (section === 'checklist') return checklistReviewHtml();
   if (section === 'contracts') {
     const list = sortedBy(data.contracts, 'start_date', sort.contracts);
-    return list.length ? list.map(c => `<div class="record">
-        <div class="record-top"><strong>${esc(c.property_name)} — Unit ${esc(c.unit_number)}</strong>${badge(c.status)}</div>
-        <div class="record-meta">${c.is_open_term ? 'Open term from ' + fmtDate(c.start_date) : fmtDate(c.start_date) + ' → ' + fmtDate(c.end_date)}
-          · ₱${fmt(c.monthly_rent)}/mo · deposit ₱${fmt(c.deposit)}${c.move_out_date ? ' · moved out ' + fmtDate(c.move_out_date) : ''}</div>
-        ${c.contract_doc_url ? `<div class="btn-group" style="margin-top:6px"><button class="btn btn-sm btn-outline" onclick="openDoc(${jsArg(c.contract_doc_url)})">📄 Signed contract</button>
-          <span class="muted-text small">${c.tenant_ack ? 'Acknowledged ' + fmtDate(c.tenant_ack_at) : 'Not yet acknowledged'}</span></div>` : ''}
-      </div>`).join('') : '<p class="muted-text">No contracts.</p>';
+    _contracts = list.map(c => ({ ...c, tenant_name: data.tenant.full_name, tenant_id: data.tenant.tenant_id }));
+    return (data.tenant.is_active ? `<button class="btn btn-sm btn-brand" style="margin-bottom:6px" onclick="showCreateContract(${parseInt(data.tenant.tenant_id)})">+ New Contract</button>` : '')
+      + (list.length ? _contracts.map(c => contractCard(c, true)).join('') : '<p class="muted-text">No contracts.</p>');
   }
+  if (section === 'files') return filesSectionHtml();
   if (section === 'bills') {
     const types = ['all', 'rent', 'water', 'electricity', 'other'];
     const list = sortedBy(data.bills.filter(b => _profile.billType === 'all' || b.bill_type === _profile.billType), 'due_date', sort.bills);
@@ -1309,9 +1466,9 @@ function profileSection(section) {
   }
   if (section === 'payments') {
     const list = sortedBy(data.payments, 'paid_at', sort.payments);
-    return list.length ? list.map(p => `<div class="record">
+    return list.length ? list.map(p => p.status === 'pending' && data.tenant.is_active ? reviewRecord(p, false) : `<div class="record">
         <div class="record-top"><strong>₱${fmt(p.amount_paid)}</strong>${badge(p.status)}</div>
-        <div class="record-meta">${esc(p.bill_desc)} · submitted ${fmtDateTime(p.paid_at)}
+        <div class="record-meta">For ${forBill(p)} · submitted ${fmtDateTime(p.paid_at)}
           ${p.reviewed_at ? ` · ${esc(p.status)} ${fmtDateTime(p.reviewed_at)}${p.reviewed_by_name ? ' by ' + esc(p.reviewed_by_name) : ''}` : ''}
           ${p.receipt_no ? ` · receipt ${esc(p.receipt_no)}${p.receipt_sent_at ? ' sent ' + fmtDateTime(p.receipt_sent_at) : ''}` : ''}
           ${p.notes ? `<br>Note: ${esc(p.notes)}` : ''}</div>
@@ -1365,8 +1522,9 @@ function renderTenantProfile() {
     </div>
     ${data.checklist ? sec('checklist', '✅ Move-in checklist', `${data.checklist.done}/${data.checklist.total}`, data.checklist.done < data.checklist.total || data.checklist.to_review > 0) : ''}
     ${sec('bills', '💰 Bills', data.bills.length, true)}
-    ${sec('payments', '💳 Payments', data.payments.length, false)}
+    ${sec('payments', '💳 Payments', data.payments.length, data.payments.some(p => p.status === 'pending'))}
     ${sec('contracts', '📋 Contracts', data.contracts.length, true)}
+    ${sec('files', '🗂️ Files', tenantFiles(data).length, false)}
     ${sec('water', '💧 Water readings', data.water.length, false)}
     ${sec('threads', '💬 Conversations', data.threads.length, false)}`;
 }
@@ -1375,37 +1533,11 @@ function renderTenantProfile() {
 // CONTRACTS — by property and unit: the current contract, with the unit's history under it
 // ═══════════════════════════════════════════════
 let _contracts = [];
-async function loadContracts() {
-  const pg = document.getElementById('page-contracts'); pg.innerHTML = loadingHtml;
-  try {
-    _contracts = await apiFetch('/contracts');
-    const isCurrent = c => c.status === 'active' || c.status === 'move_out_pending';
-    const props = {};
-    _contracts.forEach(c => {
-      const p = props[c.property_id] = props[c.property_id] || { name: c.property_name, units: {} };
-      (p.units[c.unit_id] = p.units[c.unit_id] || { unit_number: c.unit_number, list: [] }).list.push(c);
-    });
-    const body = Object.values(props).sort((a, b) => a.name.localeCompare(b.name)).map(p => `
-      <div class="card group-card"><div class="group-head"><h3>🏢 ${esc(p.name)}</h3></div>
-        ${Object.values(p.units).sort(byUnit).map(u => {
-          const cur = u.list.filter(isCurrent);
-          const hist = sortedBy(u.list.filter(c => !isCurrent(c)), 'start_date', 'desc');
-          return `<div class="unit-block">
-            <div class="unit-title">Unit ${esc(u.unit_number)} ${cur.length ? '' : '<span class="muted-text">· vacant</span>'}</div>
-            ${cur.map(c => contractCard(c)).join('')}
-            ${hist.length ? `<details class="history"><summary>History (${hist.length}) ${chevron}</summary>${hist.map(c => contractCard(c)).join('')}</details>` : ''}
-          </div>`; }).join('')}
-      </div>`).join('');
-    pg.innerHTML = `<div class="card"><div class="card-header"><h3>Contracts</h3>
-        <button class="btn btn-brand" onclick="showCreateContract()">+ New Contract</button></div>
-        <p class="muted-text">Each contract belongs to a unit. Ended contracts stay in the unit's history.</p></div>
-      ${body || '<div class="card"><div class="empty-state"><p>No contracts yet</p></div></div>'}`;
-  } catch (e) { pg.innerHTML = errHtml(e); }
-}
-function contractCard(c) {
+function contractCard(c, onProfile) {
   const id = parseInt(c.id);
   return `<div class="record">
-    <div class="record-top"><strong class="link" onclick="openTenantProfile(${parseInt(c.tenant_id)})">${esc(c.tenant_name)}</strong>${badge(c.status)}</div>
+    <div class="record-top">${onProfile ? `<strong>${esc(c.property_name)} — Unit ${esc(c.unit_number)}</strong>`
+      : `<strong class="link" onclick="openTenantProfile(${parseInt(c.tenant_id)})">${esc(c.tenant_name)}</strong>`}${badge(c.status)}</div>
     <div class="record-meta">${c.is_open_term ? 'Open term from ' + fmtDate(c.start_date) : fmtDate(c.start_date) + ' → ' + fmtDate(c.end_date)}
       ${c.minimum_months ? ` · min ${esc(c.minimum_months)} mo` : ''} · ₱${fmt(c.monthly_rent)}/mo
       ${c.contract_doc_url ? ` · signed copy ${c.tenant_ack ? '(acknowledged)' : '(awaiting acknowledgement)'}` : ''}</div>
@@ -1469,7 +1601,7 @@ async function submitCreateContract() {
   const errEl = document.getElementById('m-c-err'); errEl.textContent = '';
   if (!body.unit_id || !body.tenant_id || !body.start_date || !body.monthly_rent) { errEl.textContent = 'Tenant, unit, start date and rent are required'; return; }
   if (!is_open_term && !body.end_date) { errEl.textContent = 'End date required for a fixed term'; return; }
-  try { await apiFetch('/contracts', { method: 'POST', body: JSON.stringify(body) }); closeModalDirect(); goPage('contracts'); }
+  try { await apiFetch('/contracts', { method: 'POST', body: JSON.stringify(body) }); closeModalDirect(); refreshView(); }
   catch (e) { errEl.textContent = e.message; }
 }
 async function uploadContractDoc(contractId) {
@@ -1478,7 +1610,7 @@ async function uploadContractDoc(contractId) {
     if (!result) return;
     await apiFetch('/contracts/' + contractId + '/upload-doc', { method: 'POST', body: JSON.stringify({ contract_doc_url: result.url }) });
     alert('✅ Contract uploaded! Tenant has been notified.');
-    loadContracts();
+    refreshView();
   } catch (e) { if (e && e.message) alert('Upload failed: ' + e.message); }
 }
 function showMoveOut(contractId) {
@@ -1495,7 +1627,7 @@ function showMoveOut(contractId) {
 async function submitMoveOut(contractId) {
   const move_out_date = document.getElementById('m-mo-date').value;
   const notes = document.getElementById('m-mo-notes').value;
-  try { await apiFetch('/contracts/' + contractId + '/terminate', { method: 'PATCH', body: JSON.stringify({ move_out_date, notes }) }); closeModalDirect(); loadContracts(); }
+  try { await apiFetch('/contracts/' + contractId + '/terminate', { method: 'PATCH', body: JSON.stringify({ move_out_date, notes }) }); closeModalDirect(); refreshView(); }
   catch (e) { document.getElementById('m-mo-err').textContent = e.message; }
 }
 async function showMoveOutChecklist(contractId) {
@@ -1550,16 +1682,16 @@ async function saveMoveOutChecklist(contractId) {
   };
   try {
     await apiFetch('/contracts/' + contractId + '/move-out', { method: 'PATCH', body: JSON.stringify(body) });
-    closeModalDirect(); loadContracts();
+    closeModalDirect(); refreshView();
   } catch (e) { document.getElementById('ch-err').textContent = e.message; }
 }
 async function completeMoveOut(contractId) {
-  if (!confirm('Complete move-out? This will mark the unit as vacant.')) return;
+  if (!await confirmAction({ title: 'Complete move-out?', message: 'The contract ends and the unit becomes vacant.', okText: 'Complete Move-Out' })) return;
   try {
     const d = await apiFetch('/contracts/' + contractId + '/complete-move-out', { method: 'POST', body: '{}' });
     closeModalDirect();
     alert('✅ Move-out complete. Unit is now vacant.' + (d && d.archived ? ' The tenant is now in Past Tenants — their records are kept.' : ''));
-    loadContracts();
+    refreshView();
   } catch (e) { alert(e.message); }
 }
 function showExtendContract(id) {
@@ -1569,7 +1701,7 @@ function showExtendContract(id) {
 async function submitExtend(id) {
   const end_date = document.getElementById('m-ext-date').value;
   if (!end_date) { document.getElementById('m-ext-err').textContent = 'Required'; return; }
-  try { await apiFetch('/contracts/' + id + '/extend', { method: 'PATCH', body: JSON.stringify({ end_date }) }); closeModalDirect(); loadContracts(); }
+  try { await apiFetch('/contracts/' + id + '/extend', { method: 'PATCH', body: JSON.stringify({ end_date }) }); closeModalDirect(); refreshView(); }
   catch (e) { document.getElementById('m-ext-err').textContent = e.message; }
 }
 
@@ -1641,32 +1773,12 @@ async function submitCreateBill() {
 // ═══════════════════════════════════════════════
 // PAYMENTS
 // ═══════════════════════════════════════════════
-async function loadPayments() {
-  const pg = document.getElementById('page-payments'); pg.innerHTML = loadingHtml;
-  try {
-    const payments = await apiFetch('/payments');
-    pg.innerHTML = `<div class="card"><div class="card-header"><h3>Payments</h3></div>
-      ${!payments.length ? '<div class="empty-state"><p>No payments yet</p></div>' :
-        `<div class="table-wrap"><table><thead><tr><th>Tenant</th><th>Bill</th><th>Type</th><th>Amount</th><th>Status</th><th>Date</th><th>Actions</th></tr></thead><tbody>
-        ${payments.map(p => `<tr><td>${esc(p.tenant_name)}</td><td style="font-size:12px">${esc(p.bill_desc)}</td>
-          <td>${badge(p.bill_type || 'rent')}</td><td>₱${fmt(p.amount_paid)}</td><td>${badge(p.status)}</td>
-          <td style="font-size:12px">${fmtDate(p.paid_at)}</td>
-          <td><div class="btn-group">${p.status === 'pending' ? `
-            <button class="btn btn-sm btn-green" onclick="reviewPayment(${parseInt(p.id)},'approve')">✓ Approve</button>
-            <button class="btn btn-sm btn-red" onclick="rejectPaymentModal(${parseInt(p.id)})">✗ Reject</button>` : ''}
-            ${p.proof_url ? `<button class="btn btn-sm btn-outline" onclick="openDoc(${jsArg(p.proof_url)})">📎 Proof</button>` : ''}
-            ${p.status === 'approved' ? `<button class="btn btn-sm btn-outline" onclick="openPdf('/api/payments/${parseInt(p.id)}/receipt.pdf')">✅ ${esc(p.receipt_no || 'Receipt')}</button>
-              <button class="btn btn-sm btn-outline" onclick="resendReceipt(${parseInt(p.id)})" title="${p.receipt_sent_at ? 'Sent ' + esc(fmtDateTime(p.receipt_sent_at)) : 'Not sent yet'}">✉️ Resend</button>` : ''}</div></td></tr>`).join('')}
-        </tbody></table></div>`}
-    </div>`;
-  } catch (e) { pg.innerHTML = errHtml(e); }
-}
 async function reviewPayment(id, action) {
   try {
     const d = await apiFetch('/payments/' + id + '/' + action, { method: 'PATCH', body: '{}' });
     if (d && d.receipt_no) alert(`✅ Approved. Receipt ${d.receipt_no} was sent to the tenant.`);
   } catch (e) { alert(e.message); }
-  loadPayments();
+  refreshView();
 }
 function rejectPaymentModal(id) {
   openModal('Reject Payment', `<div class="form-group"><label>Reason</label><textarea id="m-reject-notes" rows="3"></textarea></div>`,
@@ -1676,7 +1788,7 @@ function rejectPaymentModal(id) {
 async function submitReject(id) {
   const notes = document.getElementById('m-reject-notes').value;
   try { await apiFetch('/payments/' + id + '/reject', { method: 'PATCH', body: JSON.stringify({ notes }) }); } catch (e) { alert(e.message); }
-  closeModalDirect(); loadPayments();
+  closeModalDirect(); refreshView();
 }
 
 // ═══════════════════════════════════════════════
@@ -1740,7 +1852,7 @@ async function submitCreateAnnouncement() {
   } catch (e) { errEl.textContent = e.message; }
 }
 async function deleteAnnouncement(id) {
-  if (!confirm('Remove this announcement?')) return;
+  if (!await confirmAction({ title: 'Remove this announcement?', message: 'Tenants will no longer see it.', okText: 'Remove' })) return;
   try { await apiFetch('/announcements/' + id, { method: 'DELETE' }); } catch (e) { alert(e.message); }
   loadLandlordAnnouncements();
 }
@@ -2006,7 +2118,7 @@ async function submitAddReminder() {
   catch (e) { errEl.textContent = e.message; }
 }
 async function deleteReminder(id) {
-  if (!confirm('Delete?')) return;
+  if (!await confirmAction({ title: 'Delete this reminder?', okText: 'Delete' })) return;
   try { await apiFetch('/reminders/' + id, { method: 'DELETE' }); } catch (e) { alert(e.message); }
   loadReminders();
 }
@@ -2172,7 +2284,7 @@ async function submitTicketReply(tid) {
   catch (e) { alert(e.message); }
 }
 async function resolveTicket(tid) {
-  if (!confirm('Mark this ticket as resolved?')) return;
+  if (!await confirmAction({ title: 'Mark this ticket as resolved?', okText: 'Resolve', danger: false })) return;
   try { await apiFetch('/tickets/' + tid + '/resolve', { method: 'PATCH' }); closeModalDirect(); afterTicketChange(); }
   catch (e) { alert(e.message); }
 }
@@ -2469,7 +2581,7 @@ async function submitChangePassword() {
   } catch (e) { errEl.textContent = e.message; btn.disabled = false; }
 }
 async function signOutOthers() {
-  if (!confirm('Sign out on all your other phones and computers? This device stays signed in.')) return;
+  if (!await confirmAction({ title: 'Sign out other devices?', message: 'All your other phones and computers are signed out. This device stays signed in.', okText: 'Sign Out Others', danger: false })) return;
   try {
     const d = await apiFetch('/auth/sign-out-others', { method: 'POST' });
     saveSession({ token: d.token, user: currentUser });
@@ -2524,7 +2636,7 @@ function rentPickCount() {
 async function submitGenerateRent() {
   const ids = [...document.querySelectorAll('.rent-pick:checked')].map(cb => parseInt(cb.value));
   if (!ids.length) return;
-  if (!confirm(`Create ${ids.length} rent bill(s) for ${MONTHS[_rentMonth.month - 1]} ${_rentMonth.year} and notify the tenants?`)) return;
+  if (!await confirmAction({ title: `Create ${ids.length} rent bill(s)?`, message: `For ${MONTHS[_rentMonth.month - 1]} ${_rentMonth.year}. Tenants are notified right away.`, okText: 'Generate', danger: false })) return;
   try {
     const d = await apiFetch('/bills/generate-monthly', { method: 'POST', body: JSON.stringify({ ..._rentMonth, contract_ids: ids }) });
     alert(`✅ ${d.bills_generated} rent bill(s) created. Tenants were notified.`);
@@ -2685,7 +2797,7 @@ async function moveRequirement(id, dir) {
   catch (e) { alert(e.message); }
 }
 async function removeRequirement(id) {
-  if (!confirm('Remove this item? Tenants who already sent it keep their records.')) return;
+  if (!await confirmAction({ title: 'Remove this checklist item?', message: 'New tenants won\'t be asked for it. Tenants who already sent it keep their records.', okText: 'Remove' })) return;
   try { await apiFetch(`/landlord/requirements/${id}`, { method: 'DELETE' }); reloadRequirements(); }
   catch (e) { alert(e.message); }
 }
@@ -2874,8 +2986,9 @@ async function loadAdminStats() {
 function adminUserActions(r, role) {
   const id = parseInt(r.id);
   return `<div class="btn-group"><button class="btn btn-sm btn-info" onclick="adminEditUser(${id},'${role}')">✏️ Edit</button>
-    ${r.is_active ? `<button class="btn btn-sm btn-red" onclick="adminToggleUser(${id},'suspend','${role}')">Suspend</button>`
-      : `<button class="btn btn-sm btn-green" onclick="adminToggleUser(${id},'activate','${role}')">Activate</button>`}</div>`;
+    ${r.is_active ? `<button class="btn btn-sm btn-warn" onclick="adminToggleUser(${id},'suspend','${role}')">Suspend</button>`
+      : `<button class="btn btn-sm btn-green" onclick="adminToggleUser(${id},'activate','${role}')">Activate</button>`}
+    <button class="btn btn-sm btn-red" onclick="adminDeleteUser(${id})">Delete</button></div>`;
 }
 async function loadAdminLandlords() {
   const pg = document.getElementById('page-admin-landlords'); pg.innerHTML = loadingHtml;
@@ -2974,7 +3087,7 @@ async function createInvite() {
   } catch (e) { errEl.textContent = e.message; }
 }
 async function revokeInvite(id) {
-  if (!confirm('Revoke this invite? The code will stop working.')) return;
+  if (!await confirmAction({ title: 'Revoke this invite?', message: 'The code will stop working.', okText: 'Revoke' })) return;
   try { await apiFetch('/admin/invites/' + id, { method: 'DELETE' }); } catch (e) { alert(e.message); }
   loadAdminInvites();
 }
@@ -2992,7 +3105,7 @@ async function loadAdminTenants() {
   } catch (e) { pg.innerHTML = errHtml(e); }
 }
 async function adminToggleUser(id, action, role) {
-  if (!confirm(`${action === 'suspend' ? 'Suspend' : 'Activate'} this user?`)) return;
+  if (!await confirmAction({ title: `${action === 'suspend' ? 'Suspend' : 'Activate'} this user?`, message: action === 'suspend' ? 'They can\'t sign in until activated again.' : '', okText: action === 'suspend' ? 'Suspend' : 'Activate', danger: action === 'suspend' })) return;
   try { await apiFetch('/admin/users/' + id + '/' + action, { method: 'PATCH' }); } catch (e) { alert(e.message); }
   if (role === 'landlord') loadAdminLandlords(); else loadAdminTenants();
 }
@@ -3077,7 +3190,7 @@ async function submitConvertToTicket(chatId) {
   } catch (e) { document.getElementById('m-ct-err').textContent = e.message; }
 }
 async function adminCloseChat(chatId) {
-  if (!confirm('Close this chat?')) return;
+  if (!await confirmAction({ title: 'Close this chat?', okText: 'Close Chat', danger: false })) return;
   try { await apiFetch('/support-chat/' + chatId + '/close', { method: 'PATCH' }); loadAdminChat(); }
   catch (e) { alert(e.message); }
 }

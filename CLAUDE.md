@@ -50,6 +50,14 @@ Don't edit files directly on the server — the next deploy would overwrite them
   + `generate-monthly` with a month and picked contracts, due on `landlord_profiles.rent_due_day`;
   Water Bills). Units live inside each property on "Properties & Units" (no separate page).
   "Account" (name, phone, business name, email, password) is separate from "Settings".
+- **Deleting** asks first, always: `confirmAction()` in `app.js` (its own layer above pop-ups;
+  big deletes make you type the name). Accounts and properties are soft-deleted into the admin's
+  **Recycle Bin** (`users.deleted_at`, `properties.deleted_at`, restorable); records are never
+  erased. Blocked while there are active contracts (`user_delete_info` / `property_delete_info`).
+- **Tenant records:** landlords have no Contracts or Payments pages — contracts (create, extend,
+  move out, signed copy), payments (approve/reject, receipts) and every file live on the tenant's
+  profile; payments waiting for review are on the Dashboard. Old links to those pages land on
+  Tenants / Dashboard (`MOVED_PAGES`).
 - **Move-in checklist:** each landlord's list (`onboarding_requirements`, created from
   `DEFAULT_REQUIREMENTS` on first use, edited in Settings); kinds document / info / landlord.
   Tenants send items on "Move-in Checklist"; landlords approve / ask to redo / waive on the

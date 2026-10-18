@@ -82,10 +82,8 @@
     <div id="page-properties"      class="page"></div>
     <div id="page-gen-rent"        class="page"></div>
     <div id="page-tenants"         class="page"></div>
-    <div id="page-contracts"       class="page"></div>
     <div id="page-bills"           class="page"></div>
     <div id="page-water"           class="page"></div>
-    <div id="page-payments"        class="page"></div>
     <div id="page-announcements"   class="page"></div>
     <div id="page-messages"        class="page"></div>
     <div id="page-reminders"       class="page"></div>
@@ -108,7 +106,9 @@
     <div id="page-admin-stats"     class="page"></div>
     <div id="page-admin-landlords" class="page"></div>
     <div id="page-admin-tenants"   class="page"></div>
+    <div id="page-admin-properties" class="page"></div>
     <div id="page-admin-invites"   class="page"></div>
+    <div id="page-admin-bin"       class="page"></div>
     <div id="page-admin-tickets"   class="page"></div>
     <div id="page-admin-chat"      class="page"></div>
     <div id="page-admin-audit"     class="page"></div>
@@ -125,6 +125,18 @@
     </div>
     <div id="modal-body"></div>
     <div class="modal-footer" id="modal-footer"></div>
+  </div>
+</div>
+
+<!-- Confirmation before deleting (above any open pop-up) -->
+<div class="modal-overlay confirm-layer" id="confirm-overlay">
+  <div class="modal confirm-box" role="alertdialog" aria-modal="true" aria-labelledby="confirm-title">
+    <h3 id="confirm-title"></h3>
+    <div id="confirm-body"></div>
+    <div class="modal-footer">
+      <button class="btn btn-outline" id="confirm-cancel">Cancel</button>
+      <button class="btn btn-red" id="confirm-ok">Delete</button>
+    </div>
   </div>
 </div>
 
