@@ -209,6 +209,13 @@ def check_password(pw, hashed):
     try: return bcrypt.checkpw(pw.encode(), hashed.encode())
     except: return False
 
+def password_confirmed():
+    """Big deletes ask for the signed-in person's password (sent as JSON 'password')."""
+    pw = (request.get_json(silent=True) or {}).get('password') or ''
+    return bool(pw) and check_password(pw, g.current_user['password_hash'])
+
+WRONG_PASSWORD = 'Wrong password. Nothing was deleted.'
+
 def validate_password_strength(pw):
     """Returns an error string if weak, else None."""
     if len(pw) < 8:
@@ -1297,6 +1304,7 @@ def delete_property(pid):
     info=property_delete_info(pid)
     if not info or info['landlord_id']!=lp['id']: return err('Not found',404)
     if info['blocked']: return err(info['blocked'],409)
+    if not password_confirmed(): return err(WRONG_PASSWORD, 400)
     delete_property_now(pid)
     return ok(msg='Deleted')
 
@@ -1777,19 +1785,25 @@ def rent_candidates(lp, first):
     last = (first.replace(day=28) + timedelta(days=4)).replace(day=1) - timedelta(days=1)
     rows = query("""SELECT c.id AS contract_id, c.monthly_rent, c.start_date, c.end_date, un.unit_number,
                p.id AS property_id, p.name AS property_name, p.features, u.full_name AS tenant_name,
-               EXISTS (SELECT 1 FROM bills b WHERE b.contract_id=c.id AND b.bill_type='rent'
+               (SELECT b.id FROM bills b WHERE b.contract_id=c.id AND b.bill_type='rent'
                        AND ((b.bill_month=%s AND b.bill_year=%s)
                             OR (b.bill_month IS NULL AND b.description LIKE 'Monthly Rent%%'
-                                AND YEAR(b.created_at)=%s AND MONTH(b.created_at)=%s))) AS billed
+                                AND YEAR(b.created_at)=%s AND MONTH(b.created_at)=%s))
+                       ORDER BY b.id LIMIT 1) AS bill_id
         FROM contracts c JOIN units un ON un.id=c.unit_id JOIN properties p ON p.id=un.property_id
         JOIN tenant_profiles tp ON tp.id=c.tenant_id JOIN users u ON u.id=tp.user_id
         WHERE p.landlord_id=%s AND p.is_active=1 AND c.status IN ('active','move_out_pending')
           AND c.start_date <= %s AND (c.end_date IS NULL OR c.end_date >= %s)
         ORDER BY p.name, un.unit_number""",
         (first.month, first.year, first.year, first.month, lp['id'], last, first))
+    ids = [r['bill_id'] for r in rows if r['bill_id']]
+    locked = {r['bill_id']: r['status'] for r in query(
+        f"SELECT bill_id, status FROM payments WHERE status IN ('approved','pending') AND bill_id IN ({','.join(['%s'] * len(ids))})",
+        tuple(ids))} if ids else {}
     out = []
     for r in rows:
-        r['billed'] = bool(r['billed'])
+        r['billed'] = bool(r['bill_id'])
+        r['payment'] = locked.get(r['bill_id'])   # 'approved' / 'pending' / None
         r['rent_billing'] = property_features(r.pop('features'))['rent_billing']
         out.append(r)
     return out
@@ -2200,25 +2214,60 @@ def delete_bill(bid):
     """Removes a bill made by mistake. Not once it has an approved or waiting payment.
     A water bill's reading goes back to its session, which reopens so it can be fixed and billed again."""
     lp = get_landlord_profile(g.current_user['id'])
-    b = query("""SELECT b.*, un.unit_number, p.name AS property_name, tu.id AS tenant_user_id, tu.full_name AS tenant_name
-        FROM bills b JOIN contracts c ON c.id=b.contract_id JOIN units un ON un.id=c.unit_id
-        JOIN properties p ON p.id=un.property_id JOIN tenant_profiles tp ON tp.id=c.tenant_id JOIN users tu ON tu.id=tp.user_id
-        WHERE b.id=%s AND p.landlord_id=%s""", (bid, lp['id']), fetchone=True)
+    b = landlord_bill(bid, lp['id'])
     if not b: return err('Bill not found', 404)
-    statuses = {r['status'] for r in query("SELECT status FROM payments WHERE bill_id=%s", (bid,))}
-    if 'approved' in statuses:
-        return err("This bill has an approved payment, so it can't be deleted.", 409)
-    if 'pending' in statuses:
-        return err('A payment for this bill is waiting for your review. Reject it first, then delete the bill.', 409)
+    why = bill_locked(bid)
+    if why: return err(why, 409)
     reading = query("SELECT session_id FROM water_meter_readings WHERE bill_id=%s", (bid,), fetchone=True)
-    execute("DELETE FROM payments WHERE bill_id=%s AND status='rejected'", (bid,))
-    execute("DELETE FROM bills WHERE id=%s", (bid,))
+    remove_bill(b)
     if reading:
         execute("UPDATE water_meter_sessions SET status='draft' WHERE id=%s", (reading['session_id'],))
-    log_action('delete_bill', 'bills', bid, f"{b['description']} · ₱{float(b['amount']):,.2f} due {b['due_date']} · "
-                                           f"{b['tenant_name']}, {b['property_name']} Unit {b['unit_number']}")
-    push_notification(b['tenant_user_id'], 'Bill removed', f"{b['description']} (₱{float(b['amount']):,.2f}) was removed by your landlord.", 'bill')
     return ok({'water_session_id': reading['session_id'] if reading else None}, msg='Bill deleted')
+
+def landlord_bill(bid, landlord_id):
+    return query("""SELECT b.*, un.unit_number, p.name AS property_name, tu.id AS tenant_user_id, tu.full_name AS tenant_name
+        FROM bills b JOIN contracts c ON c.id=b.contract_id JOIN units un ON un.id=c.unit_id
+        JOIN properties p ON p.id=un.property_id JOIN tenant_profiles tp ON tp.id=c.tenant_id JOIN users tu ON tu.id=tp.user_id
+        WHERE b.id=%s AND p.landlord_id=%s""", (bid, landlord_id), fetchone=True)
+
+def bill_locked(bid):
+    """Why a bill can't be deleted (a payment approved or waiting), or None."""
+    statuses = {r['status'] for r in query("SELECT status FROM payments WHERE bill_id=%s", (bid,))}
+    if 'approved' in statuses:
+        return "This bill has an approved payment, so it can't be deleted."
+    if 'pending' in statuses:
+        return 'A payment for this bill is waiting for your review. Reject it first, then delete the bill.'
+    return None
+
+def remove_bill(b, notify=True):
+    """Deletes a bill made by mistake (with its rejected payments), logs it and tells the tenant."""
+    execute("DELETE FROM payments WHERE bill_id=%s AND status='rejected'", (b['id'],))
+    execute("DELETE FROM bills WHERE id=%s", (b['id'],))
+    log_action('delete_bill', 'bills', b['id'], f"{b['description']} · ₱{float(b['amount']):,.2f} due {b['due_date']} · "
+                                               f"{b['tenant_name']}, {b['property_name']} Unit {b['unit_number']}")
+    if notify:
+        push_notification(b['tenant_user_id'], 'Bill removed', f"{b['description']} (₱{float(b['amount']):,.2f}) was removed by your landlord.", 'bill')
+
+@app.route('/api/bills/delete-rent-month', methods=['POST'])
+@require_auth('landlord')
+def delete_rent_month():
+    """Undo a month's rent: deletes its rent bills (all, or contract_ids) so they can be generated again.
+    Bills with a payment approved or waiting are kept and listed. Password required."""
+    lp = get_landlord_profile(g.current_user['id'])
+    data = request.get_json(silent=True) or {}
+    try: first = _rent_month(data)
+    except ValueError as e: return err(str(e))
+    if not password_confirmed(): return err(WRONG_PASSWORD, 400)
+    wanted = data.get('contract_ids')
+    rows = [c for c in rent_candidates(lp, first) if c['bill_id'] and (wanted is None or c['contract_id'] in wanted)]
+    deleted, kept = 0, []
+    for c in rows:
+        if bill_locked(c['bill_id']):
+            kept.append(c['tenant_name']); continue
+        b = landlord_bill(c['bill_id'], lp['id'])
+        if b:
+            remove_bill(b); deleted += 1
+    return ok({'deleted': deleted, 'kept': kept})
 
 def receipt_document(pid):
     p = query("""SELECT py.*, rv.full_name AS reviewer_name FROM payments py
@@ -2775,6 +2824,32 @@ def save_water_readings(sid):
             VALUES (%s,%s,%s,%s,%s,%s,%s,%s,%s)""",(sid,unit_id,is_owner_unit,prev_reading,curr_reading,consumption,water_bill,pump_fee,total_amount))
         saved.append({'unit_id':unit_id,'consumption':consumption,'total_amount':round(total_amount,2)})
     return ok({'saved':saved})
+
+@app.route('/api/water/sessions/<int:sid>', methods=['DELETE'])
+@require_auth('landlord')
+def delete_water_session(sid):
+    """Removes a water session made with a mistake, with its readings and bills, so it can be
+    entered again. Not while any of its bills has a payment approved or waiting. Password required."""
+    lp = get_landlord_profile(g.current_user['id'])
+    s_ = query("""SELECT wms.* FROM water_meter_sessions wms JOIN properties p ON p.id=wms.property_id
+                    WHERE wms.id=%s AND p.landlord_id=%s""", (sid, lp['id']), fetchone=True)
+    if not s_: return err('Not found', 404)
+    bills = [r['bill_id'] for r in query("SELECT bill_id FROM water_meter_readings WHERE session_id=%s AND bill_id IS NOT NULL", (sid,))]
+    paid = [b for b in bills if bill_locked(b)]
+    if paid:
+        units = ', '.join(r['unit_number'] for r in query(
+            f"""SELECT u.unit_number FROM water_meter_readings wmr JOIN units u ON u.id=wmr.unit_id
+                WHERE wmr.bill_id IN ({','.join(['%s'] * len(paid))}) ORDER BY u.unit_number""", tuple(paid)))
+        return err(f"Unit(s) {units} already paid or sent a payment for this session's water bill, so the session can't be deleted. "
+                   "Delete the other units' bills on their tenants' profiles instead.", 409)
+    if not password_confirmed(): return err(WRONG_PASSWORD, 400)
+    for bid in bills:
+        b = landlord_bill(bid, lp['id'])
+        if b: remove_bill(b)
+    execute("DELETE FROM water_meter_sessions WHERE id=%s", (sid,))   # readings cascade
+    log_action('delete_water_session', 'water_meter_sessions', sid,
+               f"{s_['session_month']}/{s_['session_year']}, property {s_['property_id']}, {len(bills)} bill(s) removed")
+    return ok({'bills_removed': len(bills)}, msg='Water session deleted')
 
 @app.route('/api/water/sessions/<int:sid>/generate-bills', methods=['POST'])
 @require_auth('landlord')
@@ -3354,6 +3429,7 @@ def admin_delete_user(uid):
     info = user_delete_info(uid)
     if not info: return err('Not found', 404)
     if info['blocked']: return err(info['blocked'], 409)
+    if not password_confirmed(): return err(WRONG_PASSWORD, 400)
     execute("""UPDATE users SET deleted_at=NOW(), deleted_by=%s, is_active=0, session_version=session_version+1
                WHERE id=%s""", (g.current_user['id'], uid))
     if info['role'] == 'tenant':
@@ -3382,6 +3458,7 @@ def admin_delete_property(pid):
     info = property_delete_info(pid)
     if not info: return err('Not found', 404)
     if info['blocked']: return err(info['blocked'], 409)
+    if not password_confirmed(): return err(WRONG_PASSWORD, 400)
     delete_property_now(pid)
     return ok(msg=f"{info['name']} moved to the Recycle Bin")
 
@@ -3463,13 +3540,12 @@ def erase_preview(uid):
 @require_auth('admin')
 def erase_from_bin():
     """Deletes an account from the Recycle Bin for good, with everything listed by erase_info,
-    in one transaction. Typing the email is required (the UI asks for it too)."""
+    in one transaction. The admin's password is required."""
     data = request.get_json() or {}
     sc = erase_scope(int(data.get('id') or 0))
     if not sc: return err('Not in the Recycle Bin', 404)
     u = sc['user']
-    if (data.get('confirm') or '').strip().lower() != (u['email'] or '').lower():
-        return err('Type the email address to confirm', 400)
+    if not password_confirmed(): return err(WRONG_PASSWORD, 400)
     uid = u['id']
     def inl(xs): return ','.join(['%s'] * len(xs))
     conn = get_conn()

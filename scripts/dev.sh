@@ -30,7 +30,8 @@ echo "==> Starting local MariaDB on port $PORT"
   --character-set-server=utf8mb4 --collation-server=utf8mb4_unicode_ci > .localdb/mariadb.log 2>&1 &
 DB_PID=$!
 trap 'kill $DB_PID 2>/dev/null || true' EXIT
-for _ in $(seq 60); do "${SQL[@]}" -e "SELECT 1" >/dev/null 2>&1 && break; sleep 0.5; done
+# --connect-timeout: a client started before the server listens can otherwise hang forever
+for _ in $(seq 60); do "${SQL[@]}" --connect-timeout=2 -e "SELECT 1" >/dev/null 2>&1 && break; sleep 0.5; done
 
 if [ ! -d .venv ]; then
   echo "==> Creating .venv with the app's packages"

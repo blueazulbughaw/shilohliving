@@ -65,10 +65,14 @@ Don't edit files directly on the server — the next deploy would overwrite them
   validated pair (`CHART_COLORS`); keep the hover tooltip and the "Show as table" view.
 - **Deleting a bill** (tenant profile) is for mistakes: refused once a payment is approved or waiting
   for review. A deleted water bill's reading returns to its session, which reopens (`draft`) so the
-  reading can be fixed and billed again; already-billed readings stay locked. "Print bills" on a
+  reading can be fixed and billed again; already-billed readings stay locked. A whole water session
+  can be deleted and entered again ("Delete & redo"), and a month's rent undone per tenant or all at
+  once (Monthly Rent page) — never bills with a payment approved or waiting (`bill_locked`). "Print bills" on a
   water session gives one PDF with a page per bill (`pdfs.bills_pdf`).
-- **Deleting** asks first, always: `confirmAction()` in `app.js` (its own layer above pop-ups;
-  big deletes make you type the name). Accounts and properties are soft-deleted into the admin's
+- **Deleting** asks first, always: `confirmAction()` in `app.js` (its own layer above pop-ups).
+  Big deletes (accounts, properties, erase, a water session, a month's rent) use `askPassword: true`
+  and send `{password}`; the server checks it with `password_confirmed()` (400 if wrong — never 401,
+  which would sign the person out). Accounts and properties are soft-deleted into the admin's
   **Recycle Bin** (`users.deleted_at`, `properties.deleted_at`, restorable); records are never
   erased. Blocked while there are active contracts (`user_delete_info` / `property_delete_info`).
   The admin can **erase** an account in the Recycle Bin for good (test data, privacy requests):

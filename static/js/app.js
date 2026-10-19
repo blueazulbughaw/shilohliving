@@ -897,7 +897,8 @@ async function uploadFile(kind, accept, statusEl) {
 // pop-up. For big deletes the person types the name first, like HubSpot.
 // ═══════════════════════════════════════════════
 let _confirmDone = null;
-function confirmAction({ title, message = '', effects = [], typeToConfirm = null, okText = 'Delete', danger = true, blocked = null }) {
+// askPassword: big deletes ask for the person's password; the promise then resolves with it (false on cancel)
+function confirmAction({ title, message = '', effects = [], askPassword = false, okText = 'Delete', danger = true, blocked = null }) {
   if (_confirmDone) _confirmDone(false);
   return new Promise(resolve => {
     const layer = document.getElementById('confirm-overlay');
@@ -907,13 +908,13 @@ function confirmAction({ title, message = '', effects = [], typeToConfirm = null
       ${message ? `<p>${esc(message)}</p>` : ''}
       ${effects.length ? `<ul class="confirm-effects">${effects.map(e => `<li>${esc(e)}</li>`).join('')}</ul>` : ''}
       ${blocked ? `<div class="warn-box">${esc(blocked)}</div>` : ''}
-      ${typeToConfirm && !blocked ? `<div class="form-group" style="margin-top:12px"><label>Type <strong class="no-caps">${esc(typeToConfirm)}</strong> to confirm</label>
-        <input type="text" id="confirm-input" autocomplete="off"/></div>` : ''}`;
+      ${askPassword && !blocked ? `<div class="form-group" style="margin-top:12px"><label>Your password, to confirm</label>
+        <input type="password" id="confirm-input" autocomplete="current-password"/></div>` : ''}`;
     ok.textContent = okText;
     ok.className = 'btn ' + (danger ? 'btn-red' : 'btn-brand');
     ok.hidden = !!blocked;
     const input = document.getElementById('confirm-input');
-    const matches = () => !typeToConfirm || (input && input.value.trim().toLowerCase() === typeToConfirm.trim().toLowerCase());
+    const matches = () => !askPassword || (input && input.value.length > 0);
     ok.disabled = !matches();
     if (input) { input.oninput = () => { ok.disabled = !matches(); }; setTimeout(() => input.focus(), 50); }
     const done = answer => {
@@ -922,7 +923,7 @@ function confirmAction({ title, message = '', effects = [], typeToConfirm = null
       resolve(answer);
     };
     _confirmDone = done;
-    ok.onclick = () => { if (matches()) done(true); };
+    ok.onclick = () => { if (matches()) done(askPassword ? input.value : true); };
     document.getElementById('confirm-cancel').textContent = blocked ? 'OK' : 'Cancel';
     document.getElementById('confirm-cancel').onclick = () => done(false);
     layer.onclick = e => { if (e.target === layer) done(false); };
@@ -943,10 +944,10 @@ function refreshView() { const en = _navEntries[_navIdx]; if (en) en.render(); }
 async function adminDeleteUser(id) {
   try {
     const info = await apiFetch(`/admin/delete-preview/user/${id}`);
-    const ok = await confirmAction({ title: `Delete ${info.role} ${info.name}?`, message: info.email, effects: info.effects,
-      blocked: info.blocked, typeToConfirm: info.name, okText: 'Delete' });
-    if (!ok) return;
-    await apiFetch(`/admin/users/${id}`, { method: 'DELETE' });
+    const password = await confirmAction({ title: `Delete ${info.role} ${info.name}?`, message: info.email, effects: info.effects,
+      blocked: info.blocked, askPassword: true, okText: 'Delete' });
+    if (!password) return;
+    await apiFetch(`/admin/users/${id}`, { method: 'DELETE', body: JSON.stringify({ password }) });
     refreshView();
   } catch (e) { alert(e.message); }
 }
@@ -965,8 +966,9 @@ async function loadAdminProperties() {
 async function adminDeleteProperty(id) {
   try {
     const info = await apiFetch(`/admin/delete-preview/property/${id}`);
-    if (!await confirmAction({ title: `Delete property ${info.name}?`, effects: info.effects, blocked: info.blocked, typeToConfirm: info.name })) return;
-    await apiFetch(`/admin/properties/${id}`, { method: 'DELETE' });
+    const password = await confirmAction({ title: `Delete property ${info.name}?`, effects: info.effects, blocked: info.blocked, askPassword: true });
+    if (!password) return;
+    await apiFetch(`/admin/properties/${id}`, { method: 'DELETE', body: JSON.stringify({ password }) });
     refreshView();
   } catch (e) { alert(e.message); }
 }
@@ -998,10 +1000,11 @@ async function loadAdminBin() {
 async function eraseUser(id) {
   try {
     const info = await apiFetch('/admin/recycle-bin/erase-preview/' + id);
-    if (!await confirmAction({ title: `Erase ${info.name} permanently?`, okText: 'Erase forever',
+    const password = await confirmAction({ title: `Erase ${info.name} permanently?`, okText: 'Erase forever',
         message: `This ${info.role} account (${info.email}) and everything below are deleted for good:`,
-        effects: info.effects, typeToConfirm: info.email })) return;
-    await apiFetch('/admin/recycle-bin/erase', { method: 'POST', body: JSON.stringify({ id, confirm: info.email }) });
+        effects: info.effects, askPassword: true });
+    if (!password) return;
+    await apiFetch('/admin/recycle-bin/erase', { method: 'POST', body: JSON.stringify({ id, password }) });
     refreshView();
   } catch (e) { alert(e.message); }
 }
@@ -1080,12 +1083,11 @@ function renderInvite() {
       </button>
       <p class="hint">Tap the QR code to share it. Scanning it with a phone camera opens the sign-up page.</p>
       <div class="code-card">${esc(code)}</div>
-      <div class="link-text">${esc(joinUrl(code))}</div>
+      <div class="link-row"><span class="link-text">${esc(joinUrl(code))}</span>
+        <button type="button" class="icon-btn" title="Copy link" aria-label="Copy join link" onclick="copyText(joinUrl(_invite.code), 'Join link copied!')">📋</button></div>
     </div>
     <div class="invite-actions">
       <button class="btn btn-brand" onclick="shareJoinLink()">📤 Share Join Link</button>
-      <button class="btn btn-outline" onclick="copyText(joinUrl(_invite.code), 'Join link copied!')">📋 Copy Link</button>
-      <button class="btn btn-outline" onclick="printInvite()">🖨️ Print Poster</button>
     </div>
     <p class="small-msg" id="invite-msg"></p>
     <details class="danger-zone"><summary>Code shared with the wrong people?</summary>
@@ -1125,20 +1127,6 @@ async function shareInviteQr() {
     setTimeout(() => URL.revokeObjectURL(a.href), 1000);
     say('QR code saved to your Downloads.');
   } catch (_) { say("Couldn't share the QR code. Please try again."); }
-}
-function printInvite() {
-  const { code, title } = _invite;
-  const w = window.open('', '_blank');
-  if (!w) { alert('Allow pop-ups to print the poster.'); return; }
-  w.document.write(`<!doctype html><html><head><meta charset="utf-8"><title>Join ${esc(title)}</title>
-    <style>body{font-family:-apple-system,Segoe UI,sans-serif;text-align:center;padding:40px;color:#1B4332}
-    h1{font-size:30px;margin:0 0 6px}p{font-size:17px;color:#444}img{width:320px;height:320px;margin:20px 0}
-    .code{font:700 34px/1 'Courier New',monospace;letter-spacing:6px;margin:10px 0}.url{font-size:14px;color:#666}</style></head>
-    <body><h1>${esc(title)}</h1><p>Scan with your phone camera to join on <strong>Shiloh Living</strong></p>
-    <img src="${location.origin + qrSrc(code)}" onload="setTimeout(()=>print(),200)"/>
-    <p>Or go to <span class="url">${esc(location.origin)}</span>, tap <em>I'm a tenant</em>, and enter:</p>
-    <div class="code">${esc(code)}</div></body></html>`);
-  w.document.close();
 }
 async function regenerateInviteCode() {
   if (!await confirmAction({ title: 'Make a new join code?', message: 'The current code, link and any printed QR codes stop working. Tenants who already joined stay.', okText: 'Make New Code' })) return;
@@ -1443,8 +1431,9 @@ async function savePropertySetup(propId) {
 async function deleteProperty(id) {
   try {
     const info = await apiFetch(`/properties/${id}/delete-preview`);
-    if (!await confirmAction({ title: `Delete ${info.name}?`, effects: info.effects, blocked: info.blocked, typeToConfirm: info.name })) return;
-    await apiFetch('/properties/' + id, { method: 'DELETE' }); loadProperties();
+    const password = await confirmAction({ title: `Delete ${info.name}?`, effects: info.effects, blocked: info.blocked, askPassword: true });
+    if (!password) return;
+    await apiFetch('/properties/' + id, { method: 'DELETE', body: JSON.stringify({ password }) }); loadProperties();
   } catch (e) { alert(e.message); }
 }
 
@@ -2309,12 +2298,26 @@ async function loadWaterBilling() {
     </div>`;
   } catch (e) { pg.innerHTML = errHtml(e); }
 }
-function showNewWaterSession() {
+async function deleteWaterSession(sid) {
+  const s = _water.session;
+  const label = `${s.property_name} — ${MONTHS[s.session_month - 1]} ${s.session_year}`;
+  const password = await confirmAction({ title: `Delete the water session for ${label}?`, okText: 'Delete session', askPassword: true,
+    message: 'Use this when the main bill or readings were wrong. You can enter the session again right after.',
+    effects: ['Its unit readings are deleted', "Its water bills are removed from the tenants' bills, and they're told",
+      "Not possible if a tenant already paid or sent a payment for this session's bill"] });
+  if (!password) return;
+  try {
+    await apiFetch('/water/sessions/' + sid, { method: 'DELETE', body: JSON.stringify({ password }) });
+    goPage('water');
+    setTimeout(() => showNewWaterSession({ property_id: s.property_id, month: s.session_month, year: s.session_year }), 300);
+  } catch (e) { alert(e.message); }
+}
+function showNewWaterSession(prefill) {
   if (!_props.length) { alert('Add a property first.'); return; }
   if (!_props.some(p => hasFeature(p, 'water_billing'))) { alert("No property has Water billing turned on. Turn it on in a property's Setup."); return; }
-  const now = new Date();
+  const now = prefill && prefill.month ? new Date(prefill.year, prefill.month - 1, 1) : new Date();
   openModal('New Water Billing Session', `
-    <div class="form-group"><label>Property</label><select id="m-w-prop">${_props.filter(p => hasFeature(p, 'water_billing')).map(p => `<option value="${parseInt(p.id)}">${esc(p.name)}</option>`).join('')}</select></div>
+    <div class="form-group"><label>Property</label><select id="m-w-prop">${_props.filter(p => hasFeature(p, 'water_billing')).map(p => `<option value="${parseInt(p.id)}" ${prefill && prefill.property_id === p.id ? 'selected' : ''}>${esc(p.name)}</option>`).join('')}</select></div>
     <div class="grid-2"><div class="form-group"><label>Month</label><select id="m-w-month">
       ${MONTHS.map((m, i) => `<option value="${i + 1}" ${i === now.getMonth() ? 'selected' : ''}>${m}</option>`).join('')}</select></div>
     <div class="form-group"><label>Year</label><input type="number" id="m-w-year" value="${now.getFullYear()}"/></div></div>
@@ -2366,7 +2369,10 @@ async function openWaterSession(sid) {
     pg.innerHTML = `<div class="card">
       <div class="card-header"><div><h3>💧 ${esc(s.property_name)} — ${MONTHS[s.session_month - 1]} ${esc(s.session_year)}</h3>
         <div class="muted-text" style="margin-top:4px">${fmtDate(s.prev_reading_date)} → ${fmtDate(s.curr_reading_date)}</div></div>
-        ${anyBill ? `<button class="btn btn-sm btn-outline" onclick="openPdf('/api/water/sessions/${parseInt(sid)}/bills.pdf')">🖨 Print all bills</button>` : ''}
+        <div class="btn-group">
+          ${anyBill ? `<button class="btn btn-sm btn-outline" onclick="openPdf('/api/water/sessions/${parseInt(sid)}/bills.pdf')">🖨 Print all bills</button>` : ''}
+          <button class="btn btn-sm btn-red" onclick="deleteWaterSession(${parseInt(sid)})">🗑 Delete &amp; redo</button>
+        </div>
       </div>
       <div class="water-calc">
         <div class="row"><span>Total Main Bill</span><span>₱${fmt(s.total_bill)}</span></div>
@@ -2982,7 +2988,8 @@ async function loadGenerateRent() {
   try {
     const d = await apiFetch(`/bills/monthly-preview?month=${_rentMonth.month}&year=${_rentMonth.year}`);
     const todo = d.contracts.filter(c => !c.billed && c.rent_billing);
-    const monthOpts = [-1, 0, 1, 2].map(k => {
+    const undoable = d.contracts.filter(c => c.billed && !c.payment);
+    const monthOpts = [-6, -5, -4, -3, -2, -1, 0, 1, 2].map(k => {
       const x = new Date(now.getFullYear(), now.getMonth() + k, 1);
       const m = x.getMonth() + 1, y = x.getFullYear();
       return `<option value="${y}-${m}" ${m === d.month && y === d.year ? 'selected' : ''}>${MONTHS[m - 1]} ${y}</option>`;
@@ -3001,15 +3008,37 @@ async function loadGenerateRent() {
               <input type="checkbox" class="rent-pick" value="${parseInt(c.contract_id)}" ${!c.billed && c.rent_billing ? 'checked' : 'disabled'} onchange="rentPickCount()"/>
               <span class="rent-who"><strong>${esc(c.tenant_name)}</strong><small class="muted-text">${esc(c.property_name)} · Unit ${esc(c.unit_number)}</small></span>
               <span class="rent-amt">₱${fmt(c.monthly_rent)}
-                ${c.billed ? '<span class="badge badge-green">Billed</span>' : !c.rent_billing ? '<span class="badge badge-gray">Rent billing off</span>' : ''}</span>
+                ${c.payment === 'approved' ? '<span class="badge badge-green">Paid</span>' : c.payment === 'pending' ? '<span class="badge badge-yellow">Payment to review</span>'
+                  : c.billed ? `<span class="badge badge-green">Billed</span><button class="btn btn-sm btn-outline" onclick="event.preventDefault();undoRentBill(${parseInt(c.bill_id)}, ${jsArg(c.tenant_name)})">Undo</button>`
+                  : !c.rent_billing ? '<span class="badge badge-gray">Rent billing off</span>' : ''}</span>
             </label>`).join('')}
         </div>
         <div class="btn-group" style="margin-top:14px">
           <button class="btn btn-brand" id="rent-go" onclick="submitGenerateRent()" ${todo.length ? '' : 'disabled'}>⚡ Generate <span id="rent-count">${todo.length}</span> bill(s)</button>
           <button class="btn btn-outline" onclick="goPage('tenants')">View Tenants</button>
-        </div>`}
+        </div>
+        ${undoable.length ? `<details class="danger-zone"><summary>Made a mistake on this month's rent?</summary>
+          <p class="hint">Deletes the ${undoable.length} rent bill(s) of ${MONTHS[d.month - 1]} ${d.year} that have no payment yet, so you can generate them again.
+            Tenants are told the bill was removed. Use “Undo” on a row for just one tenant.</p>
+          <button class="btn btn-sm btn-red" onclick="deleteRentMonth(${undoable.length})">🗑 Delete this month's rent bills</button></details>` : ''}`}
       </div>`;
   } catch (e) { pg.innerHTML = errHtml(e); }
+}
+async function undoRentBill(billId, name) {
+  if (!await confirmAction({ title: `Undo ${name}'s rent bill?`, okText: 'Delete bill',
+      message: `${MONTHS[_rentMonth.month - 1]} ${_rentMonth.year}. They're told it was removed; you can generate it again here.` })) return;
+  try { await apiFetch('/bills/' + billId, { method: 'DELETE' }); loadGenerateRent(); }
+  catch (e) { alert(e.message); }
+}
+async function deleteRentMonth(n) {
+  const password = await confirmAction({ title: `Delete ${n} rent bill(s) for ${MONTHS[_rentMonth.month - 1]} ${_rentMonth.year}?`, askPassword: true,
+    okText: 'Delete bills', effects: ['Only bills with no payment yet are deleted', "Tenants are told the bill was removed", 'You can generate them again right after'] });
+  if (!password) return;
+  try {
+    const d = await apiFetch('/bills/delete-rent-month', { method: 'POST', body: JSON.stringify({ ..._rentMonth, password }) });
+    alert(`${d.deleted} rent bill(s) deleted.` + (d.kept.length ? ` Kept (already paid or payment waiting): ${d.kept.join(', ')}.` : ''));
+    loadGenerateRent();
+  } catch (e) { alert(e.message); }
 }
 function rentPickCount() {
   const n = document.querySelectorAll('.rent-pick:checked').length;
